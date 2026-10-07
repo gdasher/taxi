@@ -411,6 +411,31 @@ wire eth_gty_rx_clk[GTY_CNT];
 wire eth_gty_rx_rst[GTY_CNT];
 taxi_axis_if #(.DATA_W(MAC_DATA_W), .ID_W(8), .USER_EN(1), .USER_W(1+PTP_TS_W)) eth_gty_axis_rx[GTY_CNT]();
 
+// pipelined copies of the lane resets for the core and the shim, so the
+// reset fan-out into logic far from the transceivers is not timing-critical
+wire core_tx_rst[GTY_CNT];
+wire core_rx_rst[GTY_CNT];
+
+for (genvar n = 0; n < GTY_CNT; n = n + 1) begin : lane_rst
+
+    (* shreg_extract = "no" *)
+    logic [1:0] tx_rst_pipe = 2'b11;
+    (* shreg_extract = "no" *)
+    logic [1:0] rx_rst_pipe = 2'b11;
+
+    always_ff @(posedge eth_gty_tx_clk[n]) begin
+        tx_rst_pipe <= {tx_rst_pipe[0], eth_gty_tx_rst[n]};
+    end
+
+    always_ff @(posedge eth_gty_rx_clk[n]) begin
+        rx_rst_pipe <= {rx_rst_pipe[0], eth_gty_rx_rst[n]};
+    end
+
+    assign core_tx_rst[n] = tx_rst_pipe[1];
+    assign core_rx_rst[n] = rx_rst_pipe[1];
+
+end
+
 // core side of the NAT shim
 taxi_axis_if #(.DATA_W(MAC_DATA_W), .ID_W(8), .USER_EN(1), .USER_W(1)) core_axis_tx[GTY_CNT]();
 taxi_axis_if #(.DATA_W(PTP_TS_W), .KEEP_W(1), .ID_W(8)) core_axis_tx_cpl[GTY_CNT]();
@@ -904,12 +929,12 @@ cndm_inst (
      * Ethernet
      */
     .mac_tx_clk(eth_gty_tx_clk),
-    .mac_tx_rst(eth_gty_tx_rst),
+    .mac_tx_rst(core_tx_rst),
     .mac_axis_tx(core_axis_tx),
     .mac_axis_tx_cpl(core_axis_tx_cpl),
 
     .mac_rx_clk(eth_gty_rx_clk),
-    .mac_rx_rst(eth_gty_rx_rst),
+    .mac_rx_rst(core_rx_rst),
     .mac_axis_rx(core_axis_rx),
 
     /*
@@ -1015,12 +1040,12 @@ natgw_inst (
      * MAC side
      */
     .mac_tx_clk(eth_gty_tx_clk),
-    .mac_tx_rst(eth_gty_tx_rst),
+    .mac_tx_rst(core_tx_rst),
     .m_axis_mac_tx(eth_gty_axis_tx),
     .s_axis_mac_tx_cpl(eth_gty_axis_tx_cpl),
 
     .mac_rx_clk(eth_gty_rx_clk),
-    .mac_rx_rst(eth_gty_rx_rst),
+    .mac_rx_rst(core_rx_rst),
     .s_axis_mac_rx(eth_gty_axis_rx),
 
     /*
