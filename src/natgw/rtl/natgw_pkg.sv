@@ -161,24 +161,36 @@ package natgw_pkg;
 
     // RFC 1624 incremental update of a checksum for up to three changed 16-bit words:
     // HC' = ~(~HC + ~m0 + m0' + ~m1 + m1' + ~m2 + m2')
-    function automatic logic [15:0] csum_update3(
+    // Split into a raw sum and a fold so the two halves can sit in different pipeline stages.
+    function automatic logic [19:0] csum_sum3(
         input logic [15:0] hc,
         input logic [15:0] m0, input logic [15:0] n0,
         input logic [15:0] m1, input logic [15:0] n1,
         input logic [15:0] m2, input logic [15:0] n2
     );
         logic [15:0] nhc, nm0, nm1, nm2;
-        logic [19:0] s;
-        logic [16:0] f;
         // invert at 16 bits before widening
         nhc = ~hc;
         nm0 = ~m0;
         nm1 = ~m1;
         nm2 = ~m2;
-        s = 20'(nhc) + 20'(nm0) + 20'(n0) + 20'(nm1) + 20'(n1) + 20'(nm2) + 20'(n2);
+        return 20'(nhc) + 20'(nm0) + 20'(n0) + 20'(nm1) + 20'(n1) + 20'(nm2) + 20'(n2);
+    endfunction
+
+    function automatic logic [15:0] csum_fold(input logic [19:0] s);
+        logic [16:0] f;
         f = 17'(s[15:0]) + 17'(s[19:16]);
         f = 17'(f[15:0]) + 17'(f[16]);
         return ~f[15:0];
+    endfunction
+
+    function automatic logic [15:0] csum_update3(
+        input logic [15:0] hc,
+        input logic [15:0] m0, input logic [15:0] n0,
+        input logic [15:0] m1, input logic [15:0] n1,
+        input logic [15:0] m2, input logic [15:0] n2
+    );
+        return csum_fold(csum_sum3(hc, m0, n0, m1, n1, m2, n2));
     endfunction
 
 endpackage

@@ -936,6 +936,7 @@ typedef enum logic [1:0] {
 } flr_state_t;
 
 flr_state_t flr_state_reg = FLR_IDLE;
+logic flr_in_reg = 1'b0;    // cfg_flr_in_process[0], registered off the PCIe hard block
 logic flr_done_reg = 1'b0;
 logic [7:0] flr_cnt_reg = '0;
 wire nat_clear_busy;
@@ -944,10 +945,11 @@ assign cfg_flr_done = {3'd0, flr_done_reg};
 
 always_ff @(posedge pcie_clk) begin
     flr_done_reg <= 1'b0;
+    flr_in_reg <= cfg_flr_in_process[0];
 
     case (flr_state_reg)
         FLR_IDLE: begin
-            if (cfg_flr_in_process[0]) begin
+            if (flr_in_reg) begin
                 flr_rst_reg <= 1'b1;
                 flr_cnt_reg <= '0;
                 flr_state_reg <= FLR_RESET;
@@ -971,7 +973,7 @@ always_ff @(posedge pcie_clk) begin
             end
         end
         FLR_DONE: begin
-            if (!cfg_flr_in_process[0]) begin
+            if (!flr_in_reg) begin
                 flr_state_reg <= FLR_IDLE;
             end
         end

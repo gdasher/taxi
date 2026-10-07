@@ -84,6 +84,22 @@ if (m_axis_fwd.DATA_W != DATA_W || m_axis_punt.DATA_W != DATA_W)
 logic    p1_valid_reg = 1'b0;
 result_t p1_res_reg;
 meta_t   p1_meta_reg;
+// raw checksum sums, computed while loading p1 (folded in the p1 -> p2 step)
+logic [19:0] p1_ip_sum_reg;
+logic [19:0] p1_l4_sum_reg;
+
+// checksum sums from the FIFO outputs
+logic [31:0] s_old_ip;
+logic [15:0] s_old_port;
+logic [7:0]  s_proto;
+logic [7:0]  s_nttl;
+
+always_comb begin
+    s_old_ip = s_res.xlate_dst ? s_meta.dip : s_meta.sip;
+    s_old_port = s_res.xlate_dst ? s_meta.dport : s_meta.sport;
+    s_proto = s_meta.tcp ? 8'd6 : 8'd17;
+    s_nttl = s_res.dec_ttl ? s_meta.ttl - 8'd1 : s_meta.ttl;
+end
 
 // stage 2: decision and checksums
 logic        p2_valid_reg = 1'b0;
@@ -121,6 +137,14 @@ always_ff @(posedge clk) begin
         p1_valid_reg <= s_res_valid && s_meta_valid;
         p1_res_reg <= s_res;
         p1_meta_reg <= s_meta;
+        p1_ip_sum_reg <= csum_sum3(s_meta.ip_csum,
+            s_old_ip[31:16], s_res.new_ip[31:16],
+            s_old_ip[15:0], s_res.new_ip[15:0],
+            {s_meta.ttl, s_proto}, {s_nttl, s_proto});
+        p1_l4_sum_reg <= csum_sum3(s_meta.l4_csum,
+            s_old_ip[31:16], s_res.new_ip[31:16],
+            s_old_ip[15:0], s_res.new_ip[15:0],
+            s_old_port, s_res.new_port);
     end
 
     if (rst) begin
@@ -170,16 +194,10 @@ always_comb begin
     d_old_ip = p1_res_reg.xlate_dst ? p1_meta_reg.dip : p1_meta_reg.sip;
     d_old_port = p1_res_reg.xlate_dst ? p1_meta_reg.dport : p1_meta_reg.sport;
 
-    d_ip_csum = csum_update3(p1_meta_reg.ip_csum,
-        d_old_ip[31:16], p1_res_reg.new_ip[31:16],
-        d_old_ip[15:0], p1_res_reg.new_ip[15:0],
-        {p1_meta_reg.ttl, d_proto}, {d_nttl, d_proto});
+    d_ip_csum = csum_fold(p1_ip_sum_reg);
 
     if (p1_meta_reg.tcp || p1_meta_reg.l4_csum != 0) begin
-        d_l4_csum = csum_update3(p1_meta_reg.l4_csum,
-            d_old_ip[31:16], p1_res_reg.new_ip[31:16],
-            d_old_ip[15:0], p1_res_reg.new_ip[15:0],
-            d_old_port, p1_res_reg.new_port);
+        d_l4_csum = csum_fold(p1_l4_sum_reg);
         if (!p1_meta_reg.tcp && d_l4_csum == 16'd0) begin
             d_l4_csum = 16'hffff;
         end

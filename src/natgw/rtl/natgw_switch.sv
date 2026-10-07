@@ -5,7 +5,7 @@ NAT gateway shim: lane switch
 
 Routes whole frames from LANES inputs to LANES outputs by tdest (the egress
 lane), with round-robin arbitration per output. A grant is held until the
-frame's last beat. Each output has a skid register.
+frame's last beat. Each input and output has a skid register.
 
 (Used instead of taxi_axis_switch, whose untyped unpacked-array parameters
 Vivado 2026.1 does not accept.)
@@ -43,13 +43,33 @@ wire [USER_W-1:0]    s_tuser[LANES];
 
 for (genvar i = 0; i < LANES; i = i + 1) begin : in
 
-    assign s_tdata[i] = s_axis[i].tdata;
-    assign s_tkeep[i] = s_axis[i].tkeep;
-    assign s_tvalid[i] = s_axis[i].tvalid;
-    assign s_axis[i].tready = s_tready[i];
-    assign s_tlast[i] = s_axis[i].tlast;
-    assign s_tdest[i] = CL_LANES'(s_axis[i].tdest);
-    assign s_tuser[i] = s_axis[i].tuser;
+    // input skid register: keeps the arbitration and ready paths local
+    taxi_axis_if #(
+        .DATA_W(DATA_W),
+        .KEEP_W(KEEP_W),
+        .DEST_EN(1),
+        .DEST_W(s_axis[0].DEST_W),
+        .USER_EN(1),
+        .USER_W(USER_W)
+    ) in_axis();
+
+    taxi_axis_register #(
+        .REG_TYPE(2)
+    )
+    in_reg_inst (
+        .clk(clk),
+        .rst(rst),
+        .s_axis(s_axis[i]),
+        .m_axis(in_axis)
+    );
+
+    assign s_tdata[i] = in_axis.tdata;
+    assign s_tkeep[i] = in_axis.tkeep;
+    assign s_tvalid[i] = in_axis.tvalid;
+    assign in_axis.tready = s_tready[i];
+    assign s_tlast[i] = in_axis.tlast;
+    assign s_tdest[i] = CL_LANES'(in_axis.tdest);
+    assign s_tuser[i] = in_axis.tuser;
 
 end
 

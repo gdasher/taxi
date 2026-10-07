@@ -264,16 +264,16 @@ logic [3:0] w_evt_reg = '0;     // event type to queue (0 = none)
 wire w_evt_ok = !evt_full;
 assign w_en = w_we_reg && (w_op_reg != OP_SCAN || w_evt_ok);
 
-logic h_valid_reg[1:RAM_PIPE];
-logic [IDX_W-1:0] h_idx_reg[1:RAM_PIPE];
-state_t h_data_reg[1:RAM_PIPE];
+logic h_valid_reg[1:RAM_PIPE+1];
+logic [IDX_W-1:0] h_idx_reg[1:RAM_PIPE+1];
+state_t h_data_reg[1:RAM_PIPE+1];
 
 // forwarding: most recent write wins
 state_t cur;
 
 always_comb begin
     cur = ram_a_dout;
-    for (int k = RAM_PIPE; k >= 1; k--) begin
+    for (int k = RAM_PIPE+1; k >= 1; k--) begin
         if (h_valid_reg[k] && h_idx_reg[k] == p_idx_reg[RAM_PIPE-1]) begin
             cur = h_data_reg[k];
         end
@@ -350,7 +350,7 @@ always_ff @(posedge clk) begin
     h_valid_reg[1] <= w_en;
     h_idx_reg[1] <= w_idx_reg;
     h_data_reg[1] <= w_data_reg;
-    for (int k = 2; k <= RAM_PIPE; k++) begin
+    for (int k = 2; k <= RAM_PIPE+1; k++) begin
         h_valid_reg[k] <= h_valid_reg[k-1];
         h_idx_reg[k] <= h_idx_reg[k-1];
         h_data_reg[k] <= h_data_reg[k-1];
@@ -361,7 +361,7 @@ always_ff @(posedge clk) begin
         w_we_reg <= 1'b0;
         w_evt_reg <= '0;
         host_rvalid_reg <= 1'b0;
-        for (int k = 1; k <= RAM_PIPE; k++) begin
+        for (int k = 1; k <= RAM_PIPE+1; k++) begin
             h_valid_reg[k] <= 1'b0;
         end
     end
