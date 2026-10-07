@@ -1,0 +1,9 @@
+natgw_cndm_micro_pcie_us.sv
+../lib/taxi/src/cndm/rtl/cndm_micro_core.f
+../lib/taxi/src/axis/rtl/taxi_axis_register.sv
+../lib/taxi/src/pcie/rtl/taxi_pcie_us_axil_master.sv
+../lib/taxi/src/pcie/rtl/taxi_pcie_us_msi.sv
+../lib/taxi/src/pcie/rtl/taxi_pcie_us_cfg.sv
+../lib/taxi/src/dma/rtl/taxi_dma_if_pcie_us.f
+../lib/taxi/src/axi/rtl/taxi_axil_interconnect_1s.f
+../lib/taxi/src/axi/rtl/taxi_axil_tie.f
