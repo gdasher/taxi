@@ -62,12 +62,17 @@ class NatRegs:
     async def wr(self, reg, val):
         await self._wr(self.base + reg, val & 0xffffffff)
 
+    async def flush(self):
+        """Read back so that earlier posted writes have taken effect (PCIe writes are posted)."""
+        await self.rd(REG_ID)
+
     async def caps(self):
         v = await self.rd(REG_CAPS)
         return {"idx_w": v & 0xff, "lanes": (v >> 8) & 0xff, "punt_hdr_len": (v >> 16) & 0xff}
 
     async def set_ctrl(self, enable, punt_hdr=False, bypass=0x00, egress_en=0xff):
         await self.wr(REG_CTRL, (1 if enable else 0) | (2 if punt_hdr else 0) | (bypass << 8) | (egress_en << 16))
+        await self.flush()
 
     async def clear(self, poll=None):
         await self.wr(REG_CLEAR, 1)
@@ -100,6 +105,7 @@ class NatRegs:
                 await self.clear_entry(idx)
             else:
                 await self.write_entry(idx, entry)
+        await self.flush()
 
     async def read_entry(self, idx):
         await self.wr(REG_INDEX, idx)
@@ -124,6 +130,7 @@ class NatRegs:
             await self.wr(REG_NH_DATA + 4*k, w)
         await self.wr(REG_NH_INDEX, idx)
         await self.wr(REG_NH_CMD, 1)
+        await self.flush()
 
     async def read_nh(self, idx):
         await self.wr(REG_NH_INDEX, idx)

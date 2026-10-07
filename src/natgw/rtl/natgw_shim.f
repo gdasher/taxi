@@ -7,8 +7,9 @@ natgw_state.sv
 natgw_rewrite.sv
 natgw_regs.sv
 natgw_tx_merge.sv
+natgw_switch.sv
 natgw_shim.sv
 ../lib/taxi/src/axis/rtl/taxi_axis_async_fifo_adapter.f
 ../lib/taxi/src/axis/rtl/taxi_axis_fifo.sv
-../lib/taxi/src/axis/rtl/taxi_axis_switch.f
+../lib/taxi/src/axis/rtl/taxi_axis_register.sv
 ../lib/taxi/src/axis/rtl/taxi_axis_arb_mux.f

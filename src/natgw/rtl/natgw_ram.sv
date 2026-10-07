@@ -18,7 +18,7 @@ module natgw_ram #(
     parameter ADDR_W = 12,
     parameter PIPE = 3,
     /* verilator lint_off UNUSEDPARAM */
-    parameter string RAM_STYLE = "ultra"
+    parameter RAM_STYLE = "ultra"
     /* verilator lint_on UNUSEDPARAM */
 )
 (

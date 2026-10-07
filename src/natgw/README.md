@@ -115,3 +115,22 @@ At each frame's first beat, pops one result and one meta, decides as
 `ShimModel.process()`, and streams the frame to `m_axis_fwd` (rewritten) or
 `m_axis_punt` (unchanged, after a 16-byte punt header when `cfg_punt_hdr` and
 the reason is not BYPASS). The header beat carries the frame's first-beat tuser.
+
+## Notes from implementation
+
+- `RAM_PIPE` must be at least 2.
+- RAM contents survive reset. `natgw_regs` starts a full clear (both entry
+  tables, the next-hop table and all per-entry state) on the first cycle
+  after every reset, so a function-level reset leaves no stale entries.
+  Clear takes max(2^BUCKET_W, 1024) cycles for the tables and 8 << BUCKET_W
+  cycles for the state (2.1 ms at 512k entries).
+- Lookup latency: 8 + RAM_PIPE cycles from key accept to result. Parser
+  descriptor: 3 cycles after the last beat.
+- With the host relocating entries (BFS, depth 6), `CuckooTable` first
+  refuses an insert at about 98% load in the model; plan on 90-95% in
+  practice, i.e. 230k-250k sessions in a 512k-entry table.
+- Ingress, punt and egress clock crossings use Taxi frame FIFOs, so a frame
+  is only ever handed to a MAC whole. A full ingress FIFO drops whole frames
+  and counts them (statistic 16); bad-FCS frames are counted as statistic 17.
+- Forwarded frames to one egress lane wait behind each other in the lane
+  switch; a congested egress lane back-pressures the ingress lanes feeding it.

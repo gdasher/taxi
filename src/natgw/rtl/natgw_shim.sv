@@ -349,7 +349,7 @@ for (genvar n = 0; n < LANES; n = n + 1) begin : lane
     );
 
     // egress: clk, 128 bits -> MAC TX clock, 64 bits; whole frames only, so the MAC never underflows
-    taxi_axis_if #(.DATA_W(m_axis_mac_tx[0].DATA_W), .USER_EN(1), .USER_W(1)) shim_tx_axis();
+    taxi_axis_if #(.DATA_W(m_axis_mac_tx[0].DATA_W), .DEST_W(1), .USER_EN(1), .USER_W(1)) shim_tx_axis();
 
     taxi_axis_async_fifo_adapter #(
         .DEPTH(CDC_DEPTH),
@@ -397,15 +397,8 @@ for (genvar n = 0; n < LANES; n = n + 1) begin : lane
 end
 
 // lane switch: hits to their egress lane (tdest = egress lane)
-taxi_axis_switch #(
-    .S_COUNT(LANES),
-    .M_COUNT(LANES),
-    .AUTO_ADDR(1'b1),
-    .UPDATE_TID(1'b0),
-    .S_REG_TYPE(0),
-    .M_REG_TYPE(2),
-    .ARB_ROUND_ROBIN(1'b1),
-    .ARB_LSB_HIGH_PRIO(1'b1)
+natgw_switch #(
+    .LANES(LANES)
 )
 switch_inst (
     .clk(clk),
