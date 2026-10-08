@@ -420,9 +420,13 @@ static int cndm_dev_configure(struct rte_eth_dev *eth_dev)
 
 static int cndm_dev_stop(struct rte_eth_dev *eth_dev)
 {
+	bool was_started = eth_dev->data->dev_started;
+
 	DRV_LOG(DEBUG, "Dev stop for eth_dev %s", eth_dev->data->name);
 
 	eth_dev->data->dev_started = 0;
+	if (was_started)
+		cndm_natgw_port_started(((struct cndm_priv *)eth_dev->data->dev_private)->cdev, false);
 
 	eth_dev->rx_pkt_burst = rte_eth_pkt_burst_dummy;
 	eth_dev->tx_pkt_burst = rte_eth_pkt_burst_dummy;
@@ -465,6 +469,7 @@ static int cndm_dev_start(struct rte_eth_dev *eth_dev)
 	eth_dev->tx_pkt_burst = cndm_xmit_pkt_burst;
 
 	eth_dev->data->dev_started = 1;
+	cndm_natgw_port_started(((struct cndm_priv *)eth_dev->data->dev_private)->cdev, true);
 
 	return 0;
 fail:
@@ -851,10 +856,41 @@ static int cndm_get_module_eeprom(struct rte_eth_dev *eth_dev, struct rte_dev_ee
 	return 0;
 }
 
+static int cndm_flow_ops_get(struct rte_eth_dev *eth_dev, const struct rte_flow_ops **ops)
+{
+	struct cndm_priv *priv = eth_dev->data->dev_private;
+
+	if (!priv->cdev->natgw)
+		return -ENOTSUP;
+	*ops = natgw_flow_ops();
+	return 0;
+}
+
+static int cndm_xstats_get_names(struct rte_eth_dev *eth_dev, struct rte_eth_xstat_name *names, unsigned int size)
+{
+	struct cndm_priv *priv = eth_dev->data->dev_private;
+
+	if (!priv->cdev->natgw)
+		return 0;
+	return natgw_flow_xstats_get_names(priv->cdev->natgw, names, size);
+}
+
+static int cndm_xstats_get(struct rte_eth_dev *eth_dev, struct rte_eth_xstat *xstats, unsigned int n)
+{
+	struct cndm_priv *priv = eth_dev->data->dev_private;
+
+	if (!priv->cdev->natgw)
+		return 0;
+	return natgw_flow_xstats_get(priv->cdev->natgw, (unsigned)priv->dev_port, xstats, n);
+}
+
 static const struct eth_dev_ops cndm_eth_dev_ops = {
 	.dev_configure		= cndm_dev_configure,
 	.dev_start		= cndm_dev_start,
 	.dev_stop		= cndm_dev_stop,
+	.flow_ops_get		= cndm_flow_ops_get,
+	.xstats_get		= cndm_xstats_get,
+	.xstats_get_names	= cndm_xstats_get_names,
 	.dev_close		= cndm_dev_close,
 	.link_update		= cndm_link_update,
 	.promiscuous_enable	= cndm_promiscuous_mode_enable,

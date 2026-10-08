@@ -1,0 +1,30 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+/*
+ * Symbols of the natgw common driver used by the cndm and natgw_model PMDs.
+ * (Exports are listed here so the shared sources stay buildable outside DPDK.)
+ */
+
+#include <eal_export.h>
+
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_ctx_create)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_ctx_destroy)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_bind_port)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_unbind_port)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_enable)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_ops)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_poll)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_xstats_get_names)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_xstats_get)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_xstats_count)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_count)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_flow_capacity)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_punt_meta_register)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_punt_strip)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_punt_parse)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_model_create)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_model_destroy)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_model_io)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_model_rd)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_model_wr)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_model_rx)
+RTE_EXPORT_INTERNAL_SYMBOL(natgw_model_advance)

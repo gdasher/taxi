@@ -33,19 +33,26 @@ struct natgw_model_out {
 };
 
 /* bucket_w: table geometry (entries = 8 << bucket_w) */
+NATGW_API
 struct natgw_model *natgw_model_create(unsigned bucket_w);
+NATGW_API
 void natgw_model_destroy(struct natgw_model *m);
 
 /* register interface, for natgw_dev_init() */
+NATGW_API
 struct natgw_io natgw_model_io(struct natgw_model *m);
+NATGW_API
 uint32_t natgw_model_rd(struct natgw_model *m, uint32_t off);
+NATGW_API
 void natgw_model_wr(struct natgw_model *m, uint32_t off, uint32_t val);
 
 /* process one frame (no FCS) received on a lane */
+NATGW_API
 int natgw_model_rx(struct natgw_model *m, unsigned lane, const uint8_t *frame, size_t len,
 		   struct natgw_model_out *out);
 
 /* advance the tick counter and run one full aging scan */
+NATGW_API
 void natgw_model_advance(struct natgw_model *m, uint32_t ticks);
 
 #ifdef __cplusplus

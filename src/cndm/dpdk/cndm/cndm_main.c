@@ -210,6 +210,11 @@ static int cndm_common_probe(struct cndm_dev *cdev)
 		cdev->eth_dev[k] = eth_dev;
 	}
 
+	cdev->natgw_punt_hdr = true;
+	ret = cndm_natgw_init(cdev);
+	if (ret)
+		DRV_LOG(ERR, "NAT block disabled: %d", ret);
+
 fail_eth_dev:
 	return 0;
 
@@ -220,6 +225,7 @@ fail:
 
 static void cndm_common_remove(struct cndm_dev *cdev)
 {
+	cndm_natgw_remove(cdev);
 	for (size_t k = 0; k < ARRAY_SIZE(cdev->eth_dev); k++) {
 		if (cdev->eth_dev[k]) {
 			cndm_destroy_eth_dev(cdev->eth_dev[k]);

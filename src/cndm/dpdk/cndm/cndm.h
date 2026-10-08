@@ -46,6 +46,8 @@
 
 #define DRIVER_VERSION "0.1"
 
+#include "natgw_flow.h"
+
 struct cndm_dev {
 	struct rte_pci_device *pdev;
 
@@ -102,6 +104,11 @@ struct cndm_dev {
 	char sn_str[32];
 	struct rte_ether_addr base_mac;
 	int mac_cnt;
+
+	// NAT gateway shim (NULL when the bitstream has none)
+	struct natgw_flow_ctx *natgw;
+	bool natgw_punt_hdr;
+	int natgw_started;
 };
 
 struct cndm_tx_info {
@@ -210,6 +217,11 @@ extern int cndm_logtype_driver;
 int cndm_exec_mbox_cmd(struct cndm_dev *cdev, void *cmd, void *rsp);
 int cndm_exec_cmd(struct cndm_dev *cdev, void *cmd, void *rsp);
 int cndm_access_reg(struct cndm_dev *cdev, __u32 reg, int raw, int write, __u64 *data);
+
+// cndm_natgw.c
+int cndm_natgw_init(struct cndm_dev *cdev);
+void cndm_natgw_remove(struct cndm_dev *cdev);
+void cndm_natgw_port_started(struct cndm_dev *cdev, bool started);
 int cndm_hwid_sn_rd(struct cndm_dev *cdev, int *len, void *data);
 int cndm_hwid_mac_rd(struct cndm_dev *cdev, __u16 index, int *cnt, void *data);
 

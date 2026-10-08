@@ -14,4 +14,7 @@ sources = files(
     'cndm_cq.c',
     'cndm_sq.c',
     'cndm_rq.c',
+    'cndm_natgw.c',
 )
+deps += ['common_natgw']
+cflags += ['-DNATGW_DPDK']

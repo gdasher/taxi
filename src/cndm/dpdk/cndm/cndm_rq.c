@@ -307,6 +307,10 @@ uint16_t cndm_recv_pkt_burst(void *queue, struct rte_mbuf **pkts, uint16_t nb_pk
 			mbuf->pkt_len = len;
 			mbuf->port = rq->priv->port_id;
 
+			// NAT shim punt header: strip it and keep its metadata
+			if (rq->priv->cdev->natgw && rq->priv->cdev->natgw_punt_hdr)
+				natgw_punt_strip(mbuf);
+
 			pkts[pkt_recv] = mbuf;
 			rx_info->mbuf = NULL;
 		}

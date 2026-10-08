@@ -20,6 +20,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef NATGW_DPDK
+#include <rte_compat.h>
+#define NATGW_API __rte_internal
+#else
+#define NATGW_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -186,6 +193,7 @@ uint32_t natgw_key_crc(const struct natgw_key *k, uint32_t seed, uint32_t poly);
 bool natgw_key_eq(const struct natgw_key *a, const struct natgw_key *b);
 
 /* parse a punt header from the first 16 bytes of a punted frame */
+NATGW_API
 int natgw_punt_parse(const uint8_t *buf, size_t len, struct natgw_punt *p);
 
 /* ------------------------------------------------------------------ */
