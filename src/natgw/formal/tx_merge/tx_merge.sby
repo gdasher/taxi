@@ -1,0 +1,25 @@
+[tasks]
+bmc
+cover
+
+[options]
+bmc: mode bmc
+bmc: depth 24
+cover: mode cover
+cover: depth 24
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+read_slang taxi_axis_if.sv taxi_arbiter.sv taxi_penc.sv taxi_axis_arb_mux.sv natgw_tx_merge.sv formal_tx_merge.sv --top formal_tx_merge
+prep -top formal_tx_merge
+
+[files]
+../../lib/taxi/src/axis/rtl/taxi_axis_if.sv
+../../lib/taxi/src/prim/rtl/taxi_arbiter.sv
+../../lib/taxi/src/prim/rtl/taxi_penc.sv
+../../lib/taxi/src/axis/rtl/taxi_axis_arb_mux.sv
+../../rtl/natgw_tx_merge.sv
+formal_tx_merge.sv

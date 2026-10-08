@@ -1,0 +1,28 @@
+[tasks]
+stable
+reloc
+cover
+
+[options]
+stable: mode bmc
+stable: depth 26
+reloc: mode bmc
+reloc: depth 26
+cover: mode cover
+cover: depth 26
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+stable: read_slang natgw_pkg.sv natgw_ram.sv natgw_lookup.sv formal_lookup.sv --top formal_lookup -G RELOC=0
+reloc: read_slang natgw_pkg.sv natgw_ram.sv natgw_lookup.sv formal_lookup.sv --top formal_lookup -G RELOC=1
+cover: read_slang natgw_pkg.sv natgw_ram.sv natgw_lookup.sv formal_lookup.sv --top formal_lookup -G RELOC=0
+prep -top formal_lookup
+
+[files]
+../../rtl/natgw_pkg.sv
+../../rtl/natgw_ram.sv
+../../rtl/natgw_lookup.sv
+formal_lookup.sv

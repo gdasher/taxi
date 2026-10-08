@@ -1,0 +1,17 @@
+[options]
+mode bmc
+depth 18
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+read_slang natgw_pkg.sv natgw_ram.sv natgw_lookup.sv formal_lookup.sv --top formal_lookup -G RELOC=1 -G ACTIVE_LANES=2
+prep -top formal_lookup
+
+[files]
+../../rtl/natgw_pkg.sv
+../../rtl/natgw_ram.sv
+../../rtl/natgw_lookup.sv
+formal_lookup.sv

@@ -1,0 +1,23 @@
+[tasks]
+bmc
+cover
+
+[options]
+bmc: mode bmc
+bmc: depth 24
+cover: mode cover
+cover: depth 24
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+read_slang taxi_axis_if.sv taxi_axis_register.sv natgw_switch.sv formal_switch.sv --top formal_switch
+prep -top formal_switch
+
+[files]
+../../lib/taxi/src/axis/rtl/taxi_axis_if.sv
+../../lib/taxi/src/axis/rtl/taxi_axis_register.sv
+../../rtl/natgw_switch.sv
+formal_switch.sv

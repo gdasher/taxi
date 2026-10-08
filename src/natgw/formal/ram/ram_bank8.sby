@@ -1,0 +1,22 @@
+[tasks]
+bank8_p3
+bank8_p4
+bank8_p5
+
+[options]
+mode bmc
+depth 20
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+bank8_p3: read_slang natgw_ram.sv formal_ram.sv --top formal_ram -G ADDR_W=5 -G BANK_AW=2 -G PIPE=3
+bank8_p4: read_slang natgw_ram.sv formal_ram.sv --top formal_ram -G ADDR_W=5 -G BANK_AW=2 -G PIPE=4
+bank8_p5: read_slang natgw_ram.sv formal_ram.sv --top formal_ram -G ADDR_W=5 -G BANK_AW=2 -G PIPE=5
+prep -top formal_ram
+
+[files]
+../../rtl/natgw_ram.sv
+formal_ram.sv

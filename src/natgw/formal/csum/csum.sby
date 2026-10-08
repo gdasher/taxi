@@ -1,0 +1,15 @@
+[options]
+mode bmc
+depth 1
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+read_slang natgw_pkg.sv formal_csum.sv --top formal_csum
+prep -top formal_csum
+
+[files]
+../../rtl/natgw_pkg.sv
+formal_csum.sv

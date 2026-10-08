@@ -1,0 +1,23 @@
+[tasks]
+bmc
+cover
+
+[options]
+bmc: mode bmc
+bmc: depth 24
+cover: mode cover
+cover: depth 24
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+read_slang natgw_pkg.sv natgw_ram.sv natgw_state.sv formal_state.sv --top formal_state
+prep -top formal_state
+
+[files]
+../../rtl/natgw_pkg.sv
+../../rtl/natgw_ram.sv
+../../rtl/natgw_state.sv
+formal_state.sv
