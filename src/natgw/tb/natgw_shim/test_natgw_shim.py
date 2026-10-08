@@ -586,7 +586,7 @@ def process_f_files(files):
     return list(lst.values())
 
 
-@pytest.mark.parametrize("ram_pipe", [3, 4])
+@pytest.mark.parametrize("ram_pipe", [3, 5])
 @pytest.mark.parametrize("bucket_w", [8])
 def test_natgw_shim(request, bucket_w, ram_pipe):
     dut = "natgw_shim"

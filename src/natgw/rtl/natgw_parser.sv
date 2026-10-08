@@ -52,17 +52,40 @@ end
 // pipeline enable: everything advances unless the output descriptor is held
 wire pipe_en = !m_desc_valid || m_desc_ready;
 
-// passthrough to hold FIFO
-assign m_axis_hold.tdata  = s_axis.tdata;
-assign m_axis_hold.tkeep  = s_axis.tkeep;
-assign m_axis_hold.tstrb  = s_axis.tstrb;
-assign m_axis_hold.tid    = s_axis.tid;
-assign m_axis_hold.tdest  = s_axis.tdest;
-assign m_axis_hold.tuser  = s_axis.tuser;
-assign m_axis_hold.tlast  = s_axis.tlast;
-assign m_axis_hold.tvalid = s_axis.tvalid && pipe_en;
+// passthrough to the hold FIFO, through a skid register: pipe_en can fall
+// while a beat is being offered, and the register (which only captures on a
+// handshake) keeps m_axis_hold within the valid/ready rules
+taxi_axis_if #(
+    .DATA_W(DATA_W),
+    .KEEP_W(KEEP_W),
+    .ID_EN(s_axis.ID_EN),
+    .ID_W(s_axis.ID_W),
+    .DEST_EN(s_axis.DEST_EN),
+    .DEST_W(s_axis.DEST_W),
+    .USER_EN(s_axis.USER_EN),
+    .USER_W(s_axis.USER_W)
+) hold_int();
 
-assign s_axis.tready = m_axis_hold.tready && pipe_en;
+assign hold_int.tdata  = s_axis.tdata;
+assign hold_int.tkeep  = s_axis.tkeep;
+assign hold_int.tstrb  = s_axis.tstrb;
+assign hold_int.tid    = s_axis.tid;
+assign hold_int.tdest  = s_axis.tdest;
+assign hold_int.tuser  = s_axis.tuser;
+assign hold_int.tlast  = s_axis.tlast;
+assign hold_int.tvalid = s_axis.tvalid && pipe_en;
+
+assign s_axis.tready = hold_int.tready && pipe_en;
+
+taxi_axis_register #(
+    .REG_TYPE(2)
+)
+hold_reg_inst (
+    .clk(clk),
+    .rst(rst),
+    .s_axis(hold_int),
+    .m_axis(m_axis_hold)
+);
 
 wire beat = s_axis.tvalid && s_axis.tready;
 
