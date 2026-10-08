@@ -1,0 +1,225 @@
+From b4d0338829df8ca04998b1c59470eb2547c8b1c3 Mon Sep 17 00:00:00 2001
+From: Grant <grant.dasher@gmail.com>
+Date: Thu, 8 Oct 2026 15:49:12 +0000
+Subject: [PATCH 1/2] nat44-ed: session event hooks for hardware offload
+
+Add an exported callback registry for session events (ESTABLISHED,
+ACTIVE after N packets, CLOSING, DELETE, CLEAR), raised on the thread
+that owns the session, plus helpers an offload engine needs: fold
+hardware counters and last-heard time into a session, delete a session
+by index, and the session timeout. SNAT_SESSION_FLAG_OFFLOAD is reserved
+for the callback's bookkeeping. snat_main is exported for lookups.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/nat/nat44-ed/nat44_ed.c         | 60 ++++++++++++++++++++-
+ src/plugins/nat/nat44-ed/nat44_ed.h         | 53 ++++++++++++++++++
+ src/plugins/nat/nat44-ed/nat44_ed_inlines.h |  8 +++
+ 3 files changed, 120 insertions(+), 1 deletion(-)
+
+diff --git a/src/plugins/nat/nat44-ed/nat44_ed.c b/src/plugins/nat/nat44-ed/nat44_ed.c
+index 3c3c51fea..b752cf833 100644
+--- a/src/plugins/nat/nat44-ed/nat44_ed.c
++++ b/src/plugins/nat/nat44-ed/nat44_ed.c
+@@ -28,7 +28,7 @@
+ 
+ #include <vlib/stats/stats.h>
+ 
+-snat_main_t snat_main;
++__clib_export snat_main_t snat_main;
+ 
+ static_always_inline void nat_validate_interface_counters (snat_main_t *sm,
+ 							   u32 sw_if_index);
+@@ -197,6 +197,9 @@ void
+ nat44_ed_free_session_data (snat_main_t *sm, snat_session_t *s,
+ 			    u32 thread_index, u8 is_ha)
+ {
++  if (PREDICT_FALSE (sm->ses_event_cb != 0))
++    sm->ses_event_cb (thread_index, s, NAT44_ED_SES_EV_DELETE);
++
+   per_vrf_sessions_unregister_session (s, thread_index);
+ 
+   if (nat_ed_ses_i2o_flow_hash_add_del (sm, thread_index, s, 0))
+@@ -3348,6 +3351,9 @@ nat44_ed_db_free ()
+   snat_main_t *sm = &snat_main;
+   snat_main_per_thread_data_t *tsm;
+ 
++  if (sm->ses_event_cb)
++    sm->ses_event_cb (~0, 0, NAT44_ED_SES_EV_CLEAR);
++
+   vec_foreach (tsm, sm->per_thread_data)
+     {
+       nat44_ed_worker_db_free (tsm);
+@@ -3356,6 +3362,58 @@ nat44_ed_db_free ()
+   nat44_ed_flow_hash_free ();
+ }
+ 
++__clib_export int
++nat44_ed_register_session_event_cb (nat44_ed_ses_event_cb_t *cb,
++				    u32 active_pkts)
++{
++  snat_main_t *sm = &snat_main;
++
++  if (cb && sm->ses_event_cb && sm->ses_event_cb != cb)
++    return VNET_API_ERROR_VALUE_EXIST;
++  sm->ses_active_pkts = cb ? active_pkts : 0;
++  sm->ses_event_cb = cb;
++  return 0;
++}
++
++__clib_export void
++nat44_ed_session_refresh (u32 thread_index, snat_session_t *s, f64 last_heard,
++			  u64 pkts, u64 bytes)
++{
++  snat_main_t *sm = &snat_main;
++
++  s->total_pkts += pkts;
++  s->total_bytes += bytes;
++  if (last_heard > s->last_heard)
++    {
++      s->last_heard = last_heard;
++      nat44_session_update_lru (sm, s, thread_index);
++    }
++}
++
++__clib_export int
++nat44_ed_del_session_by_index (u32 thread_index, u32 session_index)
++{
++  snat_main_t *sm = &snat_main;
++  snat_main_per_thread_data_t *tsm;
++  snat_session_t *s;
++
++  if (!sm->enabled || thread_index >= vec_len (sm->per_thread_data))
++    return VNET_API_ERROR_NO_SUCH_ENTRY;
++  tsm = vec_elt_at_index (sm->per_thread_data, thread_index);
++  if (pool_is_free_index (tsm->sessions, session_index))
++    return VNET_API_ERROR_NO_SUCH_ENTRY;
++  s = pool_elt_at_index (tsm->sessions, session_index);
++  nat44_ed_free_session_data (sm, s, thread_index, 0);
++  nat_ed_session_delete (sm, s, thread_index, 1);
++  return 0;
++}
++
++__clib_export u32
++nat44_ed_session_timeout (snat_session_t *s)
++{
++  return nat44_session_get_timeout (&snat_main, s);
++}
++
+ void
+ nat44_ed_sessions_clear ()
+ {
+diff --git a/src/plugins/nat/nat44-ed/nat44_ed.h b/src/plugins/nat/nat44-ed/nat44_ed.h
+index 634599f2f..7a5be034b 100644
+--- a/src/plugins/nat/nat44-ed/nat44_ed.h
++++ b/src/plugins/nat/nat44-ed/nat44_ed.h
+@@ -158,6 +158,8 @@ format_function_t format_nat44_ed_tcp_state;
+ #define SNAT_SESSION_FLAG_AFFINITY	     (1 << 6)
+ #define SNAT_SESSION_FLAG_EXACT_ADDRESS	     (1 << 7)
+ #define SNAT_SESSION_FLAG_HAIRPINNING	     (1 << 8)
++/* reserved for the session event callback (offload bookkeeping) */
++#define SNAT_SESSION_FLAG_OFFLOAD	     (1 << 9)
+ 
+ /* NAT interface flags */
+ #define NAT_INTERFACE_FLAG_IS_INSIDE 1
+@@ -464,6 +466,23 @@ typedef struct
+ 
+ struct snat_main_s;
+ 
++/* Session events for offload (natgw). Callbacks run on the thread that owns
++ * the session (or on the main thread holding the worker barrier), in the
++ * datapath; they must be short and may modify only SNAT_SESSION_FLAG_OFFLOAD
++ * in the session flags. */
++typedef enum
++{
++  NAT44_ED_SES_EV_ESTABLISHED, /* TCP handshake complete (or reopened) */
++  NAT44_ED_SES_EV_ACTIVE,      /* packet count reached ses_active_pkts */
++  NAT44_ED_SES_EV_CLOSING,     /* TCP FIN or RST seen */
++  NAT44_ED_SES_EV_DELETE,      /* session about to be freed */
++  NAT44_ED_SES_EV_CLEAR,	     /* every session freed (s is NULL) */
++} nat44_ed_ses_event_t;
++
++typedef void (nat44_ed_ses_event_cb_t) (u32 thread_index,
++					snat_session_t *s,
++					nat44_ed_ses_event_t ev);
++
+ u32 nat44_ed_get_in2out_worker_index (vlib_buffer_t *b, ip4_header_t *ip,
+ 				      u32 rx_fib_index, u8 is_output);
+ u32 nat44_ed_get_out2in_worker_index (vlib_buffer_t *b, ip4_header_t *ip,
+@@ -627,6 +646,10 @@ typedef struct snat_main_s
+   /* nat44 plugin enabled */
+   u8 enabled;
+ 
++  /* session event callback (offload), and the ACTIVE packet threshold */
++  nat44_ed_ses_event_cb_t *ses_event_cb;
++  u32 ses_active_pkts;
++
+   /* TCP session state machine table:
+    *   first dimension is possible states
+    *   second dimension is direction (in2out/out2in)
+@@ -880,6 +903,36 @@ int nat44_ed_del_session (snat_main_t *sm, ip4_address_t *addr, u16 port,
+ void nat44_ed_free_session_data (snat_main_t *sm, snat_session_t *s,
+ 				 u32 thread_index, u8 is_ha);
+ 
++/**
++ * @brief Register the session event callback (one at a time; NULL removes it)
++ *
++ * @param cb          callback, run on the owning thread
++ * @param active_pkts packet count that raises NAT44_ED_SES_EV_ACTIVE, 0: never
++ * @return 0, or VNET_API_ERROR_VALUE_EXIST when another callback is registered
++ */
++int nat44_ed_register_session_event_cb (nat44_ed_ses_event_cb_t *cb,
++					u32 active_pkts);
++
++/**
++ * @brief Fold traffic seen elsewhere (offload) into a session: last heard
++ * time, packet and byte counts, LRU position. Caller must own the session's
++ * thread or hold the worker barrier.
++ */
++void nat44_ed_session_refresh (u32 thread_index, snat_session_t *s,
++			       f64 last_heard, u64 pkts, u64 bytes);
++
++/**
++ * @brief Delete a session by index. Caller must own the session's thread or
++ * hold the worker barrier.
++ * @return 0, or VNET_API_ERROR_NO_SUCH_ENTRY
++ */
++int nat44_ed_del_session_by_index (u32 thread_index, u32 session_index);
++
++/**
++ * @brief Seconds of inactivity after which the session expires
++ */
++u32 nat44_ed_session_timeout (snat_session_t *s);
++
+ /**
+  * @brief Set NAT44 session limit (session limit, vrf id)
+  *
+diff --git a/src/plugins/nat/nat44-ed/nat44_ed_inlines.h b/src/plugins/nat/nat44-ed/nat44_ed_inlines.h
+index 51f28327b..79112340d 100644
+--- a/src/plugins/nat/nat44-ed/nat44_ed_inlines.h
++++ b/src/plugins/nat/nat44-ed/nat44_ed_inlines.h
+@@ -782,6 +782,11 @@ nat44_set_tcp_session_state (snat_main_t *sm, f64 now, snat_session_t *ses,
+   ses->last_lru_update = now;
+   clib_dlist_remove (tsm->lru_pool, ses->lru_index);
+   clib_dlist_addtail (tsm->lru_pool, ses->lru_head_index, ses->lru_index);
++  if (PREDICT_FALSE (sm->ses_event_cb != 0))
++    sm->ses_event_cb (thread_index, ses,
++		      ses->tcp_state == NAT44_ED_TCP_STATE_ESTABLISHED ?
++			NAT44_ED_SES_EV_ESTABLISHED :
++			NAT44_ED_SES_EV_CLOSING);
+ }
+ 
+ always_inline void
+@@ -808,6 +813,9 @@ nat44_session_update_counters (snat_session_t *s, f64 now, uword bytes,
+   s->last_heard = now;
+   s->total_pkts++;
+   s->total_bytes += bytes;
++  if (PREDICT_FALSE (snat_main.ses_event_cb != 0 &&
++		     s->total_pkts == snat_main.ses_active_pkts))
++    snat_main.ses_event_cb (thread_index, s, NAT44_ED_SES_EV_ACTIVE);
+ }
+ 
+ /** \brief Per-user LRU list maintenance */
+-- 
+2.43.0
+

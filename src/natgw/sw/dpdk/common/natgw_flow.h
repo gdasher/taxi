@@ -56,7 +56,9 @@ void natgw_flow_unbind_port(uint16_t port_id);
 __rte_internal
 void natgw_flow_enable(struct natgw_flow_ctx *ctx, bool enable);
 
-/* the rte_flow ops for eth_dev_ops.flow_ops_get */
+/* the rte_flow ops for eth_dev_ops.flow_ops_get; flow create can use tens of
+ * KB of stack (cuckoo searches), so callers on small stacks (e.g. VPP
+ * processes) need a larger one */
 __rte_internal
 const struct rte_flow_ops *natgw_flow_ops(void);
 

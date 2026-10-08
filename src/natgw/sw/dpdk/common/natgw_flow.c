@@ -137,7 +137,9 @@ struct natgw_flow_ctx *natgw_flow_ctx_create(const struct natgw_io *io, const st
 					 socket_id);
 	snprintf(name, sizeof(name), "natgw_flows_%d", __atomic_fetch_add(&ctx_seq, 1, __ATOMIC_RELAXED));
 	hp.name = name;
-	hp.entries = natgw_table_size(ctx->t);
+	/* headroom: a nearly full rte_hash relocates keys (a deep, stack-hungry
+	 * search) and can refuse keys the hardware table still has room for */
+	hp.entries = 2 * natgw_table_size(ctx->t) + 64;
 	ctx->by_key = rte_hash_create(&hp);
 	if (!ctx->by_idx || !ctx->by_key)
 		goto fail;

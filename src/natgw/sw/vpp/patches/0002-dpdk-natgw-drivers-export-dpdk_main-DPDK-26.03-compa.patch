@@ -1,0 +1,69 @@
+From 67a20655cfedf4df182d7c04655193f339135fd7 Mon Sep 17 00:00:00 2001
+From: Grant <grant.dasher@gmail.com>
+Date: Thu, 8 Oct 2026 15:49:13 +0000
+Subject: [PATCH 2/2] dpdk: natgw drivers, export dpdk_main, DPDK 26.03
+ compatibility
+
+Name net_cndm and net_natgw_model ports, export dpdk_main so the natgw
+offload plugin can map interfaces to DPDK ports, and define
+RTE_BUS_DEVICE when building against DPDK older than 26.07.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/plugins/dpdk/device/dpdk.h   | 5 +++++
+ src/plugins/dpdk/device/driver.c | 9 +++++++++
+ src/plugins/dpdk/device/init.c   | 2 +-
+ 3 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/plugins/dpdk/device/dpdk.h b/src/plugins/dpdk/device/dpdk.h
+index 7b0225e5e..0cdc956e6 100644
+--- a/src/plugins/dpdk/device/dpdk.h
++++ b/src/plugins/dpdk/device/dpdk.h
+@@ -30,6 +30,11 @@
+ #include <bus_vmbus_driver.h>
+ #endif /* __linux__ */
+ 
++/* DPDK < 26.07 compatibility */
++#ifndef RTE_BUS_DEVICE
++#define RTE_BUS_DEVICE(dev, type) container_of (dev, type, device)
++#endif
++
+ #include <vnet/devices/devices.h>
+ 
+ #if CLIB_DEBUG > 0
+diff --git a/src/plugins/dpdk/device/driver.c b/src/plugins/dpdk/device/driver.c
+index bb7301aa9..f009b6bfa 100644
+--- a/src/plugins/dpdk/device/driver.c
++++ b/src/plugins/dpdk/device/driver.c
+@@ -20,6 +20,15 @@
+   }
+ 
+ static dpdk_driver_t dpdk_drivers[] = {
++  {
++    .drivers = DPDK_DRIVERS ({ "net_cndm", "Corundum cndm (natgw)" }),
++    .interface_name_prefix = "CndmEthernet",
++  },
++  {
++    .drivers = DPDK_DRIVERS ({ "net_natgw_model", "natgw shim model" }),
++    .interface_name_prefix = "NatgwModel",
++    .interface_number_from_port_id = 1,
++  },
+   {
+     .drivers = DPDK_DRIVERS (
+       { "net_ice", "Intel E810 Family" }, { "net_igc", "Intel I225 2.5G Family" },
+diff --git a/src/plugins/dpdk/device/init.c b/src/plugins/dpdk/device/init.c
+index 1741ce771..854136bac 100644
+--- a/src/plugins/dpdk/device/init.c
++++ b/src/plugins/dpdk/device/init.c
+@@ -36,7 +36,7 @@
+ 
+ #include <dpdk/device/dpdk_priv.h>
+ 
+-dpdk_main_t dpdk_main;
++__clib_export dpdk_main_t dpdk_main;
+ dpdk_config_main_t dpdk_config_main;
+ 
+ #define LINK_STATE_ELOGS	0
+-- 
+2.43.0
+
