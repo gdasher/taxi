@@ -29,6 +29,7 @@ VPP nat44-ed ──session events──▶ natgw_offload plugin (vpp/natgw_offlo
 | `vpp/patches` | VPP patches. nat44-ed gains session event hooks; the dpdk plugin gains driver names, exports `dpdk_main`, and builds against DPDK 26.03. |
 | `vpp/natgw_offload` | VPP plugin that mirrors nat44-ed sessions into the FPGA. |
 | `vpp/setup_vpp.sh` | Applies the patches, links the plugin in, and builds VPP against the system DPDK. |
+| `wanmgr` | WAN manager daemon (Python, `vpp_papi`): DHCP leases, health probes, default-route steering, NAT pool and session flushing, and email and syslog alerts. Includes a systemd unit and an example configuration. |
 
 ## Building
 
@@ -52,6 +53,7 @@ The second option matters for shared builds. A shared DPDK autoloads every mempo
 | libnatgw and C model | `make test` (`tests/test_{layout,table,model,dev}.py`) | <ul><li>Layouts and hashes are bit-exact with the Python model.</li><li>Cuckoo placement matches the Python model write for write, and stays relocation-safe after every write.</li><li>The C model matches the Python ShimModel byte for byte.</li><li>Registers, events, aging and overflow.</li></ul> |
 | DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li></ul> |
 | VPP integration | `pytest vpp/tests` (VPP and passwordless sudo; skipped otherwise) | Kernel TCP/UDP from namespaces on the model's TAP lanes, through VPP and the model. See below. |
+| WAN manager | `pytest wanmgr/tests` | <ul><li>Unit tests against a fake VPP that models routing and NAT for probes: thresholds, flapping, target fallback, steering, flushing, lease changes, restarts, alert rate limiting and SMTP.</li><li>Integration tests with real VPP, the offload plugin, dnsmasq "modems" and an SMTP sink: startup, an ISP outage, all WANs down, and a VPP restart.</li></ul> |
 
 The VPP integration tests run VPP with `net_natgw_model,wire=tap`. Each lane's TAP is moved into a namespace: one LAN and two WANs, each WAN with a server behind it. A test decides whether traffic was offloaded from what it can observe. Once a flow is offloaded, VPP's interface counters stop growing while its session counters keep growing, because they are synced back from the hardware.
 
@@ -70,6 +72,7 @@ Fault-injection checks confirm the suites detect real bugs:
 - libnatgw: mutations of the table code.
 - DPDK: TTL decrement ignored, per-flow age ignored, MACs swapped.
 - VPP plugin: ECMP hash ignored, counter refresh skipped, CLOSING ignored, revalidation skipped.
+- WAN manager: probes not pinned, no flush, steering before a verdict, DOWN after one bad round, and removing a down WAN's pool address.
 
 ## natgw_offload in brief
 
@@ -109,3 +112,18 @@ set interface nat44 out wan2 output-feature
 nat44 add address <wan1 lease> tenant-vrf 0
 nat44 add address <wan2 lease> tenant-vrf 0
 ```
+
+The WAN manager adds the pool addresses: it keeps each WAN's current lease in the pool with `tenant-vrf 0`, so `startup.conf` should not configure them.
+
+## WAN manager in brief
+
+`python3 -m wanmgr -c /etc/natgw/wanmgr.toml` (see `wanmgr/wanmgr.example.toml` and `wanmgr/natgw-wanmgr.service`). Each round (default every 2 s), the manager reconciles VPP with what the WANs' leases and health call for:
+
+- **DHCP clients.** Each WAN interface has a DHCP client. The manager creates any that are missing, and reads the leases with `dhcp_client_dump`.
+- **Pinned probe targets.** Each probe target has a /32 route via its own WAN's gateway, so a ping from VPP tests that WAN only.
+- **Probing.** Each round pings a WAN's targets in order until one replies. A WAN goes DOWN after 3 failed rounds and back UP after 5 good ones. After a start or restart, 1 good round is enough. A WAN that has lost its lease is DOWN at once.
+- **Steering.** The API-sourced default route, which outranks DHCP's, holds the healthy gateways and is always replaced as a whole set. When no WAN is healthy, the override is removed and DHCP's routes over every WAN take over. Nothing is steered until every leased WAN has a verdict.
+- **NAT pool.** Every leased WAN address stays in the pool. VPP's own probes pass through NAT's output feature, so a WAN whose address was removed could never be probed back up.
+- **Flushing.** When a WAN goes down and another WAN is healthy, its sessions and offloaded flows are flushed by removing its address and re-adding it at once. A changed lease replaces the old address, which also deletes the sessions using it.
+- **Alerts.** Email is sent for DOWN and UP changes, lease loss and changes, and VPP disconnects. Mail is rate-limited, and alerts held back are summarised in the next mail. Every alert also goes to syslog.
+- **Recovery after a VPP restart.** The manager reconnects with backoff, relearns the leases quietly, and probes before re-applying anything.

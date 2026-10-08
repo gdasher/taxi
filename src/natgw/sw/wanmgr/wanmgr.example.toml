@@ -1,0 +1,42 @@
+# natgw WAN manager configuration (see wanmgr/config.py)
+
+[vpp]
+api_socket = "/run/vpp/api.sock"
+api_dir = "/usr/share/vpp/api"
+
+[probe]
+interval = 2.0        # seconds between probe rounds
+timeout = 0.5         # per ping (VPP holds its API this long per ping)
+up_rounds = 5         # good rounds before a DOWN WAN is used again
+down_rounds = 3       # failed rounds before a WAN is taken out
+initial_rounds = 1    # good rounds for a first verdict after (re)start
+lease_grace = 30.0    # seconds DHCP may take to bind after (re)start
+
+[nat]
+vrf_id = 0            # pool addresses are added with this tenant VRF
+
+# Two probe targets per WAN, reachable from the internet and owned by no
+# other WAN: each is pinned to its WAN with a /32 route.
+[[wan]]
+name = "wan1"
+interface = "TwentyFiveGigabitEthernet3/0/0.101"
+probe_targets = ["1.1.1.1", "9.9.9.9"]
+weight = 1
+
+[[wan]]
+name = "wan2"
+interface = "TwentyFiveGigabitEthernet3/0/0.102"
+probe_targets = ["1.0.0.1", "149.112.112.112"]
+weight = 1
+
+[alerts]
+smtp_host = "smtp.example.net"
+smtp_port = 587
+starttls = true
+username = "natgw"
+password = "change-me"
+sender = "natgw@example.net"
+recipients = ["ops@example.net"]
+max_per_hour = 10
+syslog = true
+hostname = "natgw"

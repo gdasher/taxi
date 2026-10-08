@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# natgw WAN manager. Install the package directory as /opt/natgw/wanmgr (or
+# adjust PYTHONPATH), the configuration as /etc/natgw/wanmgr.toml.
+[Unit]
+Description=natgw WAN manager (health checks, failover, alerts)
+After=vpp.service
+Wants=vpp.service
+
+[Service]
+Environment=PYTHONPATH=/opt/natgw/wanmgr
+ExecStartPre=/usr/bin/python3 -m wanmgr --check -c /etc/natgw/wanmgr.toml
+ExecStart=/usr/bin/python3 -m wanmgr -c /etc/natgw/wanmgr.toml --status-file /run/natgw-wanmgr.json
+# a stale override route cannot route around new failures: always come back
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

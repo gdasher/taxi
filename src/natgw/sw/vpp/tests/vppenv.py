@@ -68,10 +68,15 @@ class Netns:
         # the model has no offloads: keep the kernel from sending GSO frames
         self.run("ethtool", "-K", newname, "tso", "off", "gso", "off", "gro", "off", check=False)
 
-    def delete(self):
+    def kill_all(self):
+        """kill every process in the namespace (killing a popen() only ends
+        its sudo)"""
         pids = sudo("ip", "netns", "pids", self.name, check=False).stdout.split()
         for pid in pids:
             sudo("kill", "-9", pid, check=False)
+
+    def delete(self):
+        self.kill_all()
         sudo("ip", "netns", "del", self.name, check=False)
 
 
@@ -113,14 +118,18 @@ natgw-offload {{ {offload_conf} }}
             f.write(conf)
         self.console = os.path.join(self.dir, "console.log")
         self._console = open(self.console, "w")
+        self.api = None
+        self._start()
+
+    def _start(self):
         cmd = [VPP_BIN, "-c", self.conf]
         if os.environ.get("VPP_GDB"):
             # debugging aid: a backtrace of every thread in the console on a crash
             cmd = ["gdb", "-q", "-batch", "-ex", "handle SIGUSR1 SIGPIPE nostop noprint", "-ex", "run",
                    "-ex", "thread apply all bt 20", "--args"] + cmd
+        sudo("rm", "-f", self.api_sock, self.cli_sock, check=False)
         self.proc = subprocess.Popen(["sudo", "-n"] + cmd, stdout=self._console,
                                      stderr=subprocess.STDOUT, text=True)
-        self.api = None
         self._connect()
 
     def _connect(self, timeout=30):
@@ -189,17 +198,13 @@ natgw-offload {{ {offload_conf} }}
                 c[k.strip()] = int(v)
         return c
 
-    def stop(self):
-        if self.proc.poll() is not None:
-            # VPP died while the test ran: keep the evidence
-            keep = os.path.join(tempfile.gettempdir(), f"{self.name}-crash-{int(time.time())}.log")
-            shutil.copy(self.console, keep)
-            print(f"VPP exited with {self.proc.returncode}; console saved to {keep}:\n{self.output()}")
+    def _halt(self):
         try:
             if self.api:
                 self.api.disconnect()
         except Exception:
             pass
+        self.api = None
         if self.proc.poll() is None:
             # signal vpp itself: sudo does not relay signals from sudo'ed kill
             kids = subprocess.run(["pgrep", "-P", str(self.proc.pid)], capture_output=True,
@@ -212,6 +217,20 @@ natgw-offload {{ {offload_conf} }}
                     break
                 except subprocess.TimeoutExpired:
                     continue
+
+    def restart(self):
+        """stop and start VPP with the same configuration and sockets (the
+        model's TAP interfaces are recreated)"""
+        self._halt()
+        self._start()
+
+    def stop(self):
+        if self.proc.poll() is not None:
+            # VPP died while the test ran: keep the evidence
+            keep = os.path.join(tempfile.gettempdir(), f"{self.name}-crash-{int(time.time())}.log")
+            shutil.copy(self.console, keep)
+            print(f"VPP exited with {self.proc.returncode}; console saved to {keep}:\n{self.output()}")
+        self._halt()
         self._console.close()
         shutil.rmtree(self.dir, ignore_errors=True)
 
