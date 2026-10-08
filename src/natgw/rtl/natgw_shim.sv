@@ -451,6 +451,30 @@ lookup_inst (
     .clear_busy(lookup_clear_busy)
 );
 
+// hit stream and bubble request cross between the lookup and state blocks
+// through registers, so the two can sit in different SLRs
+logic             hit_valid_reg = 1'b0;
+logic [IDX_W-1:0] hit_idx_reg = '0;
+logic [15:0]      hit_len_reg = '0;
+logic             hit_fin_reg = 1'b0, hit_rst_reg = 1'b0;
+logic             bubble_req_reg = 1'b0;
+wire              bubble_req_state;
+
+always_ff @(posedge clk) begin
+    hit_valid_reg <= hit_valid;
+    hit_idx_reg <= hit_idx;
+    hit_len_reg <= hit_len;
+    hit_fin_reg <= hit_fin;
+    hit_rst_reg <= hit_rst;
+    bubble_req_reg <= bubble_req_state;
+    if (rst) begin
+        hit_valid_reg <= 1'b0;
+        bubble_req_reg <= 1'b0;
+    end
+end
+
+assign bubble_req = bubble_req_reg;
+
 natgw_state #(
     .IDX_W(IDX_W),
     .RAM_PIPE(RAM_PIPE)
@@ -458,12 +482,12 @@ natgw_state #(
 state_inst (
     .clk(clk),
     .rst(rst),
-    .s_hit_valid(hit_valid),
-    .s_hit_idx(hit_idx),
-    .s_hit_len(hit_len),
-    .s_hit_fin(hit_fin),
-    .s_hit_rst(hit_rst),
-    .bubble_req(bubble_req),
+    .s_hit_valid(hit_valid_reg),
+    .s_hit_idx(hit_idx_reg),
+    .s_hit_len(hit_len_reg),
+    .s_hit_fin(hit_fin_reg),
+    .s_hit_rst(hit_rst_reg),
+    .bubble_req(bubble_req_state),
     .host_st_valid(host_st_valid),
     .host_st_ready(host_st_ready),
     .host_st_we(host_st_we),
