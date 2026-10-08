@@ -586,8 +586,9 @@ def process_f_files(files):
     return list(lst.values())
 
 
+@pytest.mark.parametrize("ram_pipe", [3, 4])
 @pytest.mark.parametrize("bucket_w", [8])
-def test_natgw_shim(request, bucket_w):
+def test_natgw_shim(request, bucket_w, ram_pipe):
     dut = "natgw_shim"
     module = os.path.splitext(os.path.basename(__file__))[0]
     toplevel = module
@@ -603,7 +604,7 @@ def test_natgw_shim(request, bucket_w):
 
     parameters = {}
     parameters['BUCKET_W'] = bucket_w
-    parameters['RAM_PIPE'] = 3
+    parameters['RAM_PIPE'] = ram_pipe
     parameters['TICK_DIV_RST'] = 64
 
     extra_env = {f'PARAM_{k}': str(v) for k, v in parameters.items()}

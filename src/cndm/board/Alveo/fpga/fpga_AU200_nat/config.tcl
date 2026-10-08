@@ -76,7 +76,8 @@ dict set params MAC_DATA_W "64"
 set nat_bucket_w 16
 if {[info exists ::env(NAT_BUCKET_W)]} { set nat_bucket_w $::env(NAT_BUCKET_W) }
 dict set params NAT_BUCKET_W $nat_bucket_w
-dict set params NAT_RAM_PIPE "3"
+# 4: one stage for the mux between URAM cascades (natgw_ram CASCADE_HEIGHT)
+dict set params NAT_RAM_PIPE "4"
 
 # PCIe IP core settings
 set pcie [get_ips pcie4_uscale_plus_0]

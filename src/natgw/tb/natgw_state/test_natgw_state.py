@@ -496,7 +496,7 @@ def process_f_files(files):
     return list(lst.values())
 
 
-@pytest.mark.parametrize("ram_pipe", [2, 3])
+@pytest.mark.parametrize("ram_pipe", [2, 3, 4])
 def test_natgw_state(request, ram_pipe):
     dut = "natgw_state"
     module = os.path.splitext(os.path.basename(__file__))[0]

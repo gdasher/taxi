@@ -19,7 +19,10 @@ module natgw_ram #(
     parameter ADDR_W = 12,
     parameter PIPE = 3,
     /* verilator lint_off UNUSEDPARAM */
-    parameter RAM_STYLE = "ultra"
+    parameter RAM_STYLE = "ultra",
+    // longest URAM cascade Vivado may build; deeper memories are split into
+    // several cascades joined by a mux that uses the extra PIPE stages
+    parameter CASCADE_HEIGHT = 8
     /* verilator lint_on UNUSEDPARAM */
 )
 (
@@ -56,7 +59,7 @@ always_ff @(posedge clk) begin
     b_din_reg <= b_din;
 end
 
-(* ram_style = RAM_STYLE *)
+(* ram_style = RAM_STYLE, cascade_height = CASCADE_HEIGHT *)
 logic [DATA_W-1:0] mem[2**ADDR_W];
 
 logic [DATA_W-1:0] a_pipe[PIPE-1];
