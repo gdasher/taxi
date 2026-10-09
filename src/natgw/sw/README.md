@@ -4,6 +4,8 @@ Everything on the host side of the natgw shim, from register access up to VPP.
 Each layer is tested against a software model of the FPGA, and that model is
 checked against the RTL's own scoreboard.
 
+For wiring, addresses and a ready-to-adapt VPP configuration, see the [natgw wiring diagram and config template](https://claude.ai/artifact/ND6dAJem8HD2SyUbQYS8a2).
+
 ```
 VPP nat44-ed ──session events──▶ natgw_offload plugin (vpp/natgw_offload)
                                       │ rte_flow
@@ -100,6 +102,8 @@ Fault-injection checks confirm the suites detect real bugs:
   - Stats segment: `/natgw/offloaded`.
 
 ### VPP NAT configuration for multiple WANs
+
+The [wiring diagram and VPP configuration template](https://claude.ai/artifact/ND6dAJem8HD2SyUbQYS8a2) shows the whole deployment: switch VLANs, U200 lanes, VPP interfaces, and the gateway VM, with every port's IP and MAC address. It also covers the simulation test bed.
 
 This differs from the configuration sketch in the scope of work. With two WANs (ECMP), nat44-ed needs two changes:
 
