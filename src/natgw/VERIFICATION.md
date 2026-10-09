@@ -64,7 +64,7 @@ the property's main check can first fire, from the matching cover trace).
 | `rewrite` | `data` (no stalls) | P3.1–P3.5 | Bounded pass | 8 | forwarded frame at 10 | as above; see note |
 | `lookup` | `stable` (8 lanes), `lookup_stable2` (2 lanes) | P4.1, P4.2 | Bounded pass | 12 | first result at 11; first tracked result at 14 | P4.1 (latency, order, lane tagging, hit stream) checked for keys accepted from cycle 1; P4.2 not reached |
 | `lookup` | `reloc` (8 lanes), `lookup_reloc2` (2 lanes) | P4.1, P4.3 | Bounded pass | 12 | first tracked result at 14 | as above; P4.3 not reached |
-| `state` | `bmc` | P5.1–P5.3 | Bounded pass | 13 | read-back after three hits at 6 | host write, consecutive hits on the tracked index and read-back, with scanner and event traffic interleaved |
+| `state` | `bmc` | P5.1–P5.3 | Bounded pass | 14 | read-back after three hits at 6 | host write, consecutive hits on the tracked index and read-back, with scanner and event traffic interleaved |
 | `switch` | `bmc` | P6.1–P6.4 | Bounded pass | 15 | two frames each way at 8 | several frames through each output with contention |
 | `tx_merge` | `bmc` | P8.1–P8.4 | Bounded pass | 18 | two frames per source at 9 | interleaved core and shim frames, completions |
 | `ram` | 1 bank, PIPE 2 | P9.1–P9.2 | Bounded pass | 13 | – | repeated write/read sequences (a read of a written address completes from cycle 1 + 1 + PIPE) |
@@ -211,6 +211,7 @@ reference model unless stated otherwise.
 | | `run_fifo_full` | Event FIFO full: scanner pauses, FIN/RST losses counted, one overflow marker |
 | | `run_clear` | Clear |
 | | `run_random_mixed` | 6000 cycles of mixed hits, host operations and scanning against an op-level model |
+| `natgw_ram` (1, 8, 32 and 64 banks; every PIPE from the minimum up to two spare stages) | `run_test_random` | 6000 cycles of random port A reads and port B reads and writes, with hot addresses for back-to-back same-address traffic, against a reference memory: read latency, read-before-write ordering and the bank decode and mux tree (small banks: `BANK_AW` 2) |
 | `natgw_rewrite` | `run_test_directed` (18 variants) | SNAT/DNAT × TCP/UDP × VLAN/untagged × TTL decrement, UDP zero checksum, the 0x0000→0xFFFF case, invalid/missing next hop, disabled egress lane, VLAN mismatch, FIN/RST hit and miss, every punt reason; punt header on/off × idle × backpressure patterns |
 | | `run_test_random` (8 variants) | 1500 mixed frames per variant; forwarded frames also checked by scapy |
 | | `run_test_throughput` | 0.999 beats per clock for forwards and punts; one extra beat per header |
@@ -237,12 +238,21 @@ reference model unless stated otherwise.
 ## Not covered
 
 - Hardware: link bring-up, PCIe enumeration on a real host, real line rate.
-- Timing closure of the full 512k-entry build. At commit `1933cd5` the
-  128k-entry build (`NAT_BUCKET_W=14`) meets timing on every clock (WNS
-  +0.015 ns, WHS +0.010 ns). The best 512k-entry build (`NAT_BUCKET_W=16`)
-  places and routes all 640 URAMs but misses timing (WNS -0.718 ns, 7759
-  endpoints), mostly around the PCIe hard block in SLR1 and in the
-  per-entry state update.
+- Timing closure of the 512k-entry build. Build results:
+  - 128k entries (`NAT_BUCKET_W=14`, commit `1933cd5`): meets timing on
+    every clock (WNS +0.015 ns, WHS +0.010 ns).
+  - 256k entries (`NAT_BUCKET_W=15`, the default), commit `42cb336`: meets
+    timing on every clock after an extra post-route `phys_opt_design
+    -directive AggressiveExplore` pass (WNS +0.005 ns, WHS +0.010 ns; -0.020
+    ns before it). What closed it: keeping the Ethernet MAC/PHY in SLR2 next
+    to the transceivers (`natgw_floorplan.xdc`; the first 256k build spread
+    MAC receive logic across the SLR boundary around the URAMs, WNS -0.366
+    ns) and per-bank RAM input registers. The state-stage retiming that
+    followed adds margin; post-route phys_opt is now part of the build.
+  - 512k entries (`NAT_BUCKET_W=16`): places and routes all 640 URAMs but
+    misses timing (best WNS -0.718 ns, 7759 endpoints, before the changes
+    above), mostly around the PCIe hard block in SLR1 and in the per-entry
+    state update.
 - Unbounded proofs for the parser, rewrite, lookup, state, switch, transmit merge and banked RAM (bounded to the depths in the table).
 - Formal checks of the forwarded-frame rewrite (P3.3–P3.5) and of lookup exactness and relocation (P4.2, P4.3): their harnesses are written but the proofs did not reach the depth where these checks fire; simulation covers them.
 - Cross-check of the model against VPP's own NAT (needs the software phase).

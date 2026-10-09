@@ -140,3 +140,6 @@ set_property generic $param_list [get_filesets sources_1]
 
 # implementation: timing-driven strategy (NAT build only)
 set_property strategy Performance_ExtraTimingOpt [get_runs impl_1]
+# and a post-route phys_opt pass (closed the last tens of ps at 256k entries)
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]

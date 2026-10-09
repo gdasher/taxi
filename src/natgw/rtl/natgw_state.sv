@@ -9,6 +9,10 @@ reads its index on port A; the read returns RAM_PIPE cycles later, is
 corrected by forwarding from the writes still in flight, and the op's write
 (if any) is performed one cycle after that on port B.
 
+The pipeline never stalls, so which in-flight write an op will forward from is
+known a cycle before its data arrives: the index compares are registered one
+stage early and the compute stage only selects.
+
 */
 
 `resetall
@@ -92,10 +96,14 @@ logic [EVT_AW:0] evt_rd_ptr_reg = '0;
 logic [63:0] evt_out_reg = '0;
 logic evt_out_valid_reg = 1'b0;
 
-wire [EVT_AW:0] evt_count = evt_wr_ptr_reg - evt_rd_ptr_reg;
-wire evt_full = evt_count[EVT_AW];
-wire evt_empty = evt_count == 0;
+// occupancy kept in a register (not a pointer difference): the full flag
+// gates the state write in the critical compute stage
+logic [EVT_AW:0] evt_count_reg = '0;
+wire [EVT_AW:0] evt_count = evt_count_reg;
+wire evt_full = evt_count_reg[EVT_AW];
+wire evt_empty = evt_count_reg == 0;
 wire [EVT_AW:0] evt_free = (EVT_AW+1)'(2**EVT_AW) - evt_count;
+wire evt_pop = (!evt_out_valid_reg || m_evt_ready) && !evt_empty;
 
 logic evt_push;
 logic [63:0] evt_push_data;
@@ -109,7 +117,9 @@ always_ff @(posedge clk) begin
         evt_wr_ptr_reg <= evt_wr_ptr_reg + 1;
     end
 
-    if ((!evt_out_valid_reg || m_evt_ready) && !evt_empty) begin
+    evt_count_reg <= evt_count_reg + (EVT_AW+1)'(evt_push) - (EVT_AW+1)'(evt_pop);
+
+    if (evt_pop) begin
         evt_out_reg <= evt_mem[evt_rd_ptr_reg[EVT_AW-1:0]];
         evt_out_valid_reg <= 1'b1;
         evt_rd_ptr_reg <= evt_rd_ptr_reg + 1;
@@ -120,6 +130,7 @@ always_ff @(posedge clk) begin
     if (rst) begin
         evt_wr_ptr_reg <= '0;
         evt_rd_ptr_reg <= '0;
+        evt_count_reg <= '0;
         evt_out_valid_reg <= 1'b0;
     end
 end
@@ -268,18 +279,58 @@ logic h_valid_reg[1:RAM_PIPE+1];
 logic [IDX_W-1:0] h_idx_reg[1:RAM_PIPE+1];
 state_t h_data_reg[1:RAM_PIPE+1];
 
-// forwarding: most recent write wins
-state_t cur;
+// forwarding: most recent write wins. Next cycle the op now in stage
+// RAM_PIPE-2 is in the compute stage; the write stage will then hold the op
+// now in compute, history entry 1 the write performed now, and entry k the
+// entry now at k-1. Compare against those now and register the result: one
+// match on the write stage (its write may still be gated by event FIFO space,
+// so it is qualified by w_en when used) and a one-hot over the history,
+// most recent first.
+localparam PN = RAM_PIPE >= 2 ? RAM_PIPE-2 : 0;
 
-always_comb begin
-    cur = ram_a_dout;
-    for (int k = RAM_PIPE+1; k >= 1; k--) begin
-        if (h_valid_reg[k] && h_idx_reg[k] == p_idx_reg[RAM_PIPE-1]) begin
-            cur = h_data_reg[k];
+logic fwd_w_reg = 1'b0;
+logic [RAM_PIPE+1:1] fwd_h_reg = '0;
+
+if (RAM_PIPE < 2)
+    $fatal(0, "Error: natgw_state RAM_PIPE (%0d) must be at least 2 (instance %m)", RAM_PIPE);
+
+always_ff @(posedge clk) begin
+    logic [RAM_PIPE+1:1] m;
+    m[1] = w_en && w_idx_reg == p_idx_reg[PN];
+    for (int k = 2; k <= RAM_PIPE+1; k++) begin
+        m[k] = h_valid_reg[k-1] && h_idx_reg[k-1] == p_idx_reg[PN];
+    end
+    // one-hot: the lowest k (most recent write) wins
+    for (int k = 1; k <= RAM_PIPE+1; k++) begin
+        fwd_h_reg[k] <= m[k];
+        for (int j = 1; j < k; j++) begin
+            if (m[j]) begin
+                fwd_h_reg[k] <= 1'b0;
+            end
         end
     end
-    if (w_en && w_idx_reg == p_idx_reg[RAM_PIPE-1]) begin
+    fwd_w_reg <= p_idx_reg[RAM_PIPE-1] == p_idx_reg[PN] && p_op_reg[RAM_PIPE-1] != OP_NONE;
+
+    if (rst) begin
+        fwd_w_reg <= 1'b0;
+        fwd_h_reg <= '0;
+    end
+end
+
+state_t cur;
+state_t cur_h;
+
+always_comb begin
+    cur_h = '0;
+    for (int k = 1; k <= RAM_PIPE+1; k++) begin
+        cur_h = cur_h | (fwd_h_reg[k] ? h_data_reg[k] : '0);
+    end
+    if (fwd_w_reg && w_en) begin
         cur = w_data_reg;
+    end else if (|fwd_h_reg) begin
+        cur = cur_h;
+    end else begin
+        cur = ram_a_dout;
     end
 end
 
