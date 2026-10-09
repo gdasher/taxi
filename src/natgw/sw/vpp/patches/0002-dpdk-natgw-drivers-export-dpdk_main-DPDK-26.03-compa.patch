@@ -1,4 +1,4 @@
-From 67a20655cfedf4df182d7c04655193f339135fd7 Mon Sep 17 00:00:00 2001
+From d44d5a8f26780cb86dce7ea321a41afe8dd61bed Mon Sep 17 00:00:00 2001
 From: Grant <grant.dasher@gmail.com>
 Date: Thu, 8 Oct 2026 15:49:13 +0000
 Subject: [PATCH 2/2] dpdk: natgw drivers, export dpdk_main, DPDK 26.03
@@ -10,10 +10,10 @@ RTE_BUS_DEVICE when building against DPDK older than 26.07.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/plugins/dpdk/device/dpdk.h   | 5 +++++
- src/plugins/dpdk/device/driver.c | 9 +++++++++
- src/plugins/dpdk/device/init.c   | 2 +-
- 3 files changed, 15 insertions(+), 1 deletion(-)
+ src/plugins/dpdk/device/dpdk.h   |  5 +++++
+ src/plugins/dpdk/device/driver.c | 11 +++++++++++
+ src/plugins/dpdk/device/init.c   |  2 +-
+ 3 files changed, 17 insertions(+), 1 deletion(-)
 
 diff --git a/src/plugins/dpdk/device/dpdk.h b/src/plugins/dpdk/device/dpdk.h
 index 7b0225e5e..0cdc956e6 100644
@@ -32,16 +32,18 @@ index 7b0225e5e..0cdc956e6 100644
  
  #if CLIB_DEBUG > 0
 diff --git a/src/plugins/dpdk/device/driver.c b/src/plugins/dpdk/device/driver.c
-index bb7301aa9..f009b6bfa 100644
+index bb7301aa9..36284a2a6 100644
 --- a/src/plugins/dpdk/device/driver.c
 +++ b/src/plugins/dpdk/device/driver.c
-@@ -20,6 +20,15 @@
+@@ -20,6 +20,17 @@
    }
  
  static dpdk_driver_t dpdk_drivers[] = {
 +  {
 +    .drivers = DPDK_DRIVERS ({ "net_cndm", "Corundum cndm (natgw)" }),
 +    .interface_name_prefix = "CndmEthernet",
++    /* every port of the card shares one PCI function */
++    .interface_number_from_port_id = 1,
 +  },
 +  {
 +    .drivers = DPDK_DRIVERS ({ "net_natgw_model", "natgw shim model" }),

@@ -954,7 +954,21 @@ struct rte_eth_dev *cndm_create_eth_dev(struct cndm_dev *cdev, int port)
 
 	eth_dev->data->mac_addrs = rte_calloc("cndm_mac", 1,
 			sizeof(struct rte_ether_addr), 0);
-	rte_eth_random_addr((void *)eth_dev->data->mac_addrs);
+	if (eth_dev->data->mac_addrs && port < cdev->mac_cnt) {
+		/* the board's MAC block: base MAC + port, stable across restarts
+		 * (DHCP leases and neighbours' ARP caches depend on it) */
+		struct rte_ether_addr *a = eth_dev->data->mac_addrs;
+		uint64_t v = 0;
+
+		for (int i = 0; i < RTE_ETHER_ADDR_LEN; i++)
+			v = (v << 8) | cdev->base_mac.addr_bytes[i];
+		v += (uint64_t)port;
+		for (int i = RTE_ETHER_ADDR_LEN - 1; i >= 0; i--, v >>= 8)
+			a->addr_bytes[i] = (uint8_t)v;
+	} else if (eth_dev->data->mac_addrs) {
+		DRV_LOG(WARNING, "port %d: no MAC address from the board, using a random one", port);
+		rte_eth_random_addr((void *)eth_dev->data->mac_addrs);
+	}
 
 	eth_dev->dev_ops = &cndm_eth_dev_ops;
 	eth_dev->rx_pkt_burst = rte_eth_pkt_burst_dummy;
