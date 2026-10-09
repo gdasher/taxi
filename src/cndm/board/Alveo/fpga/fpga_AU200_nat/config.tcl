@@ -72,8 +72,8 @@ dict set params COMBINED_MAC_PCS "1"
 dict set params MAC_DATA_W "64"
 
 # NAT shim configuration: table entries = 8 << NAT_BUCKET_W
-# (13 = 64k, 14 = 128k, 16 = 512k); override with NAT_BUCKET_W in the environment
-set nat_bucket_w 16
+# (13 = 64k, 14 = 128k, 15 = 256k, 16 = 512k); override with NAT_BUCKET_W in the environment
+set nat_bucket_w 15
 if {[info exists ::env(NAT_BUCKET_W)]} { set nat_bucket_w $::env(NAT_BUCKET_W) }
 dict set params NAT_BUCKET_W $nat_bucket_w
 # 5: natgw_ram banks deep memories behind a registered mux (64 banks need 4; 5 adds a bank output register)

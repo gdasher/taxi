@@ -16,7 +16,8 @@ no single cycle spans a long cascade:
     banks = 9..64:   PIPE >= 4
 
 A spare stage is used first as a register on each bank output, then as output
-registers. Written in a form Vivado infers as UltraRAM (RAM_STYLE = "ultra")
+registers. The input registers are replicated per bank with the bank decode in
+front of them, so no register fans out to every bank. Written in a form Vivado infers as UltraRAM (RAM_STYLE = "ultra")
 or block RAM (RAM_STYLE = "block").
 
 */
@@ -67,25 +68,14 @@ if (SEL_W > 6)
 if (PIPE < MIN_PIPE)
     $fatal(0, "Error: natgw_ram PIPE (%0d) must be at least %0d for %0d banks (instance %m)", PIPE, MIN_PIPE, BANKS);
 
-// input registers
-logic              a_en_reg = 1'b0;
-logic [ADDR_W-1:0] a_addr_reg = '0;
-logic              b_en_reg = 1'b0;
-logic              b_we_reg = 1'b0;
-logic [ADDR_W-1:0] b_addr_reg = '0;
-logic [DATA_W-1:0] b_din_reg = '0;
+// bank select of the registered address (for the output mux)
+logic [SW-1:0] a_sel = '0;
+logic [SW-1:0] b_sel = '0;
 
 always_ff @(posedge clk) begin
-    a_en_reg <= a_en;
-    a_addr_reg <= a_addr;
-    b_en_reg <= b_en;
-    b_we_reg <= b_we;
-    b_addr_reg <= b_addr;
-    b_din_reg <= b_din;
+    a_sel <= SW'(a_addr >> BAW);
+    b_sel <= SW'(b_addr >> BAW);
 end
-
-wire [SW-1:0] a_sel = SW'(a_addr_reg >> BAW);
-wire [SW-1:0] b_sel = SW'(b_addr_reg >> BAW);
 
 // banks
 wire [DATA_W-1:0] a_bank[BANKS];
@@ -99,18 +89,36 @@ for (genvar k = 0; k < BANKS; k = k + 1) begin : bank
     logic [DATA_W-1:0] a_q;
     logic [DATA_W-1:0] b_q;
 
+    // this bank's input registers, enables already decoded (kept: synthesis
+    // would otherwise merge the identical copies back into one)
+    (* keep = "true" *) logic           a_en_reg = 1'b0;
+    (* keep = "true" *) logic [BAW-1:0] a_addr_reg = '0;
+    (* keep = "true" *) logic           b_en_reg = 1'b0;
+    (* keep = "true" *) logic           b_we_reg = 1'b0;
+    (* keep = "true" *) logic [BAW-1:0] b_addr_reg = '0;
+    (* keep = "true" *) logic [DATA_W-1:0] b_din_reg = '0;
+
     always_ff @(posedge clk) begin
-        if (a_en_reg && (SEL_W == 0 || a_sel == SW'(k))) begin
-            a_q <= mem[a_addr_reg[BAW-1:0]];
+        a_en_reg <= a_en && (SEL_W == 0 || SW'(a_addr >> BAW) == SW'(k));
+        a_addr_reg <= a_addr[BAW-1:0];
+        b_en_reg <= b_en && (SEL_W == 0 || SW'(b_addr >> BAW) == SW'(k));
+        b_we_reg <= b_we;
+        b_addr_reg <= b_addr[BAW-1:0];
+        b_din_reg <= b_din;
+    end
+
+    always_ff @(posedge clk) begin
+        if (a_en_reg) begin
+            a_q <= mem[a_addr_reg];
         end
     end
 
     always_ff @(posedge clk) begin
-        if (b_en_reg && (SEL_W == 0 || b_sel == SW'(k))) begin
+        if (b_en_reg) begin
             if (b_we_reg) begin
-                mem[b_addr_reg[BAW-1:0]] <= b_din_reg;
+                mem[b_addr_reg] <= b_din_reg;
             end else begin
-                b_q <= mem[b_addr_reg[BAW-1:0]];
+                b_q <= mem[b_addr_reg];
             end
         end
     end
