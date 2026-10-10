@@ -15,11 +15,15 @@ TESTDIR = os.path.join(HERE, "..", "dpdk", "tests")
 BIN = os.path.join(TESTDIR, "build", "test_natgw_pmd")
 
 TESTS = ["ports", "validate_rejects", "snat_dnat_forwarding", "udp_zero_checksum", "punts", "count",
-         "age", "destroy_and_duplicates", "fill_table", "host_tx", "no_punt_header", "concurrent"]
+         "age", "destroy_and_duplicates", "fill_table", "host_tx", "no_punt_header", "concurrent",
+         "ddr_spill", "ddr_punt_and_count", "ddr_age", "ddr_no_dimm", "ddr_disabled"]
 
 EAL = ["-l", "0-1", "--no-pci", "--file-prefix", "natgw_pytest",
        "--vdev", "net_natgw_modelA,lanes=3,bucket_w=4,clock=manual",
-       "--vdev", "net_natgw_modelB,lanes=2,punt_hdr=0,clock=manual"]
+       "--vdev", "net_natgw_modelB,lanes=2,punt_hdr=0,clock=manual",
+       "--vdev", "net_natgw_modelC,lanes=2,bucket_w=2,ddr_bucket_w=6,clock=manual",
+       "--vdev", "net_natgw_modelD,lanes=2,bucket_w=2,ddr_bucket_w=6,ddr_calib=0,clock=manual",
+       "--vdev", "net_natgw_modelE,lanes=2,bucket_w=2,ddr_bucket_w=6,no_ddr=1,clock=manual"]
 
 
 def _skip_reason():

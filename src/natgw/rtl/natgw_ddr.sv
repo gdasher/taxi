@@ -158,8 +158,8 @@ localparam [AXI_ID_W-1:0] HOST_ID = AXI_ID_W'(8);
 
 if (AXI_ID_W < 4)
     $fatal(0, "Error: natgw_ddr needs AXI_ID_W >= 4 (instance %m)");
-if (DIDX_W < 6)
-    $fatal(0, "Error: natgw_ddr needs at least 64 entries (instance %m)");
+if (DIDX_W < 7)
+    $fatal(0, "Error: natgw_ddr needs at least 128 entries (instance %m)");
 if (RB_DEPTH != 2**RB_AW)
     $fatal(0, "Error: natgw_ddr MAX_OUT must be a power of two (instance %m)");
 
@@ -261,11 +261,11 @@ qe_t q_m_data[LANES];
 logic [LANES-1:0] q_m_ready;
 wire [LANES-1:0] q_overflow;
 
-// response beats per lane
-logic [511:0] rb_mem[LANES][RB_DEPTH];
-logic [RB_AW:0] rb_wr_ptr_reg[LANES];
-logic [RB_AW:0] rb_rd_ptr_reg[LANES];
+// response beats per lane: count and the head lookup's two lines
 logic [LANES-1:0] rb_pop;
+logic [RB_AW:0] rb_count[LANES];
+logic [511:0] rb_line0[LANES];
+logic [511:0] rb_line1[LANES];
 
 for (genvar l = 0; l < LANES; l = l + 1) begin : lane
 
@@ -284,6 +284,29 @@ for (genvar l = 0; l < LANES; l = l + 1) begin : lane
         .m_data(q_m_data[l]),
         .overflow(q_overflow[l])
     );
+
+    // this lane's read data (AXI ID l), in order
+    logic [511:0] rb_mem[RB_DEPTH];
+    logic [RB_AW:0] rb_wr_ptr_reg = '0;
+    logic [RB_AW:0] rb_rd_ptr_reg = '0;
+
+    always_ff @(posedge clk) begin
+        if (m_axi_rvalid && m_axi_rid == AXI_ID_W'(l)) begin
+            rb_mem[rb_wr_ptr_reg[RB_AW-1:0]] <= m_axi_rdata;
+            rb_wr_ptr_reg <= rb_wr_ptr_reg + 1;
+        end
+        if (rb_pop[l]) begin
+            rb_rd_ptr_reg <= rb_rd_ptr_reg + 2;
+        end
+        if (rst) begin
+            rb_wr_ptr_reg <= '0;
+            rb_rd_ptr_reg <= '0;
+        end
+    end
+
+    assign rb_count[l] = rb_wr_ptr_reg - rb_rd_ptr_reg;
+    assign rb_line0[l] = rb_mem[rb_rd_ptr_reg[RB_AW-1:0]];
+    assign rb_line1[l] = rb_mem[RB_AW'(rb_rd_ptr_reg[RB_AW-1:0] + 1)];
 
 end
 
@@ -354,15 +377,6 @@ assign m_axi_rready = 1'b1;
 
 always_ff @(posedge clk) begin
     host_rd_done_reg <= 1'b0;
-    for (int l = 0; l < LANES; l++) begin
-        if (m_axi_rvalid && m_axi_rid == AXI_ID_W'(l)) begin
-            rb_mem[l][rb_wr_ptr_reg[l][RB_AW-1:0]] <= m_axi_rdata;
-            rb_wr_ptr_reg[l] <= rb_wr_ptr_reg[l] + 1;
-        end
-        if (rb_pop[l]) begin
-            rb_rd_ptr_reg[l] <= rb_rd_ptr_reg[l] + 2;
-        end
-    end
     if (m_axi_rvalid && m_axi_rid == HOST_ID) begin
         host_rd_done_reg <= 1'b1;
         host_rdata_reg <= entry_t'(host_slot_reg ? m_axi_rdata[256 +: ENTRY_W] : m_axi_rdata[0 +: ENTRY_W]);
@@ -372,10 +386,6 @@ always_ff @(posedge clk) begin
     end
     if (rst) begin
         host_rd_done_reg <= 1'b0;
-        for (int l = 0; l < LANES; l++) begin
-            rb_wr_ptr_reg[l] <= '0;
-            rb_rd_ptr_reg[l] <= '0;
-        end
     end
 end
 
@@ -385,8 +395,7 @@ end
 logic [LANES-1:0] lane_ready;
 always_comb begin
     for (int l = 0; l < LANES; l++) begin
-        lane_ready[l] = q_m_valid[l] && (!q_m_data[l].ddr ||
-            (rb_wr_ptr_reg[l] - rb_rd_ptr_reg[l]) >= (RB_AW+1)'(2));
+        lane_ready[l] = q_m_valid[l] && (!q_m_data[l].ddr || rb_count[l] >= (RB_AW+1)'(2));
     end
 end
 
@@ -395,26 +404,47 @@ logic sel_valid;
 logic [LANE_W-1:0] sel_lane;
 wire act_almost_full;
 
+// pause while the activity bitmap catches up (never drop a hit)
+wire [LANES-1:0] lane_go = lane_ready & {LANES{!act_almost_full}};
+
+// round robin: the first ready lane at or after rr_reg
 always_comb begin
-    sel_valid = 1'b0;
-    sel_lane = '0;
+    // rotate so bit 0 is rr_reg, take the lowest set bit, rotate back
+    logic [2*LANES-1:0] dbl;
+    logic [LANES-1:0] rot;
+    dbl = {lane_go, lane_go} >> rr_reg;
+    rot = dbl[LANES-1:0];
+    sel_lane = rr_reg;
     for (int i = LANES-1; i >= 0; i--) begin
-        logic [LANE_W-1:0] l;
-        l = rr_reg + LANE_W'(i);
-        // pause while the activity bitmap catches up (never drop a hit)
-        if (lane_ready[l] && !act_almost_full) begin
-            sel_valid = 1'b1;
-            sel_lane = l;
+        if (rot[i]) begin
+            sel_lane = rr_reg + LANE_W'(i);
         end
     end
+end
+
+assign sel_valid = |lane_go;
+
+// the selected lane's head and lines (explicit compare and mux)
+qe_t sel_qe;
+logic [511:0] sel_line0, sel_line1;
+
+always_comb begin
     q_m_ready = '0;
     rb_pop = '0;
     out_dec = '0;
-    if (sel_valid) begin
-        q_m_ready[sel_lane] = 1'b1;
-        if (q_m_data[sel_lane].ddr) begin
-            rb_pop[sel_lane] = 1'b1;
-            out_dec[sel_lane] = 1'b1;
+    sel_qe = q_m_data[0];
+    sel_line0 = rb_line0[0];
+    sel_line1 = rb_line1[0];
+    for (int l = 0; l < LANES; l++) begin
+        if (sel_lane == LANE_W'(l)) begin
+            sel_qe = q_m_data[l];
+            sel_line0 = rb_line0[l];
+            sel_line1 = rb_line1[l];
+            if (sel_valid) begin
+                q_m_ready[l] = 1'b1;
+                rb_pop[l] = q_m_data[l].ddr;
+                out_dec[l] = q_m_data[l].ddr;
+            end
         end
     end
 end
@@ -428,9 +458,9 @@ logic [511:0] m1_line0_reg = '0, m1_line1_reg = '0;
 always_ff @(posedge clk) begin
     m1_valid_reg <= sel_valid;
     m1_lane_reg <= sel_lane;
-    m1_qe_reg <= q_m_data[sel_lane];
-    m1_line0_reg <= rb_mem[sel_lane][rb_rd_ptr_reg[sel_lane][RB_AW-1:0]];
-    m1_line1_reg <= rb_mem[sel_lane][RB_AW'(rb_rd_ptr_reg[sel_lane][RB_AW-1:0] + 1)];
+    m1_qe_reg <= sel_qe;
+    m1_line0_reg <= sel_line0;
+    m1_line1_reg <= sel_line1;
     if (sel_valid) begin
         rr_reg <= sel_lane + 1;
     end

@@ -6,6 +6,9 @@
  * Two devices are created:
  *   dev A: net_natgw_modelA, 3 lanes (ports 0-2), 128 entries, manual clock, punt headers
  *   dev B: net_natgw_modelB, 2 lanes (ports 3-4), punt_hdr=0
+ *   dev C: net_natgw_modelC, 2 lanes (ports 5-6), 32 entries on chip, DDR tier of 256
+ *   dev D: net_natgw_modelD, 2 lanes (ports 7-8), DDR tier present, memory not calibrated
+ *   dev E: net_natgw_modelE, 2 lanes (ports 9-10), DDR tier present, no_ddr=1
  * Each test prints PASS/FAIL; the exit status is the number of failed tests.
  */
 
@@ -45,6 +48,11 @@ struct punt_meta {
 #define PA2 2
 #define PB0 3
 #define PB1 4
+#define PC0 5
+#define PC1 6
+#define PD0 7
+#define PE0 9
+#define IDX_DDR 0x80000000u
 
 static struct rte_mempool *mp;
 static int punt_off = -1;
@@ -242,7 +250,7 @@ static void drain(void)
 {
 	uint8_t buf[9600];
 	struct rte_mbuf *m[32];
-	for (uint16_t p = 0; p < 5; p++) {
+	for (uint16_t p = 0; p < rte_eth_dev_count_avail(); p++) {
 		while (wire_take(p, buf, NULL) > 0)
 			;
 		uint16_t n;
@@ -264,8 +272,8 @@ static void test_ports(void)
 	struct rte_eth_link link;
 	struct rte_eth_dev_info info;
 
-	CHECK(rte_eth_dev_count_avail() == 5, "ports: %u", rte_eth_dev_count_avail());
-	for (uint16_t p = 0; p < 5; p++) {
+	CHECK(rte_eth_dev_count_avail() == 11, "ports: %u", rte_eth_dev_count_avail());
+	for (uint16_t p = 0; p < 11; p++) {
 		CHECK(rte_eth_link_get_nowait(p, &link) == 0 && link.link_status == RTE_ETH_LINK_UP, "port %u down", p);
 		CHECK(rte_eth_dev_info_get(p, &info) == 0 && strcmp(info.driver_name, "net_natgw_model") == 0,
 		      "driver %s", info.driver_name);
@@ -627,6 +635,206 @@ static void test_no_punt_header(void)
 	rte_pktmbuf_free(m[0]);
 }
 
+/* ------------------------------------------------------------------ */
+/* DDR tier */
+
+static uint64_t xstat(uint16_t port, const char *name)
+{
+	uint64_t id, v = ~0ull;
+
+	if (rte_eth_xstats_get_id_by_name(port, name, &id) == 0)
+		rte_eth_xstats_get_by_id(port, &id, &v, 1);
+	return v;
+}
+
+static struct tuple ddr_tuple(unsigned i)
+{
+	return (struct tuple){ .sip = 0x0a100000 + i * 7919, .dip = 0x09090909 ^ (i * 104729),
+			       .sport = (uint16_t)(2000 + i), .dport = 443, .tcp = (int)(i & 1), .vid = -1 };
+}
+
+/* create flows on <port> until the device refuses one; returns how many */
+static unsigned fill(uint16_t port, uint16_t egress, struct tuple *t, unsigned max)
+{
+	struct rte_flow_error err;
+	unsigned created = 0;
+
+	for (unsigned i = 0; i < max; i++) {
+		t[i] = ddr_tuple(i);
+		struct nat n = snat_to(egress, 0xc6336402, (uint16_t)(40000 + i));
+		if (!create(port, &t[i], &n, &err)) {
+			CHECK(rte_errno == ENOSPC, "full table: errno %d (%s)", rte_errno, err.message);
+			break;
+		}
+		created++;
+	}
+	return created;
+}
+
+static void test_ddr_spill(void)
+{
+	struct tuple t[400];
+	struct rte_flow_error err;
+	uint8_t frame[256], got[9600];
+	unsigned created = fill(PC0, PC1, t, RTE_DIM(t)), ok = 0;
+	uint64_t ddr_flows = xstat(PC0, "natgw_ddr_flows");
+
+	/* up to 32 on chip, up to 256 in DDR */
+	CHECK(created > 26 + 180 && created <= 32 + 256 && created < RTE_DIM(t), "created %u", created);
+	CHECK(ddr_flows >= created - 32 && ddr_flows <= created - 26, "DDR flows %" PRIu64 " of %u", ddr_flows,
+	      created);
+	for (unsigned i = 0; i < created; i++) {
+		int fwd = 0;
+		uint16_t len = build(frame, &t[i], 0, 64);
+		inject(PC0, frame, len);
+		int nn = wire_take(PC1, got, &fwd);
+		struct rte_ipv4_hdr *ip = ip_of(got);
+		if (nn == len && fwd && rte_be_to_cpu_16(((struct rte_tcp_hdr *)(ip + 1))->src_port) == 40000 + i &&
+		    ip_csum_ok(ip) && l4_csum_ok(ip))
+			ok++;
+	}
+	CHECK(ok == created, "%u of %u flows forwarded correctly", ok, created);
+	CHECK(xstat(PC0, "natgw_ddr_hits") >= ddr_flows, "DDR hits %" PRIu64, xstat(PC0, "natgw_ddr_hits"));
+	CHECK(rte_flow_flush(PC0, &err) == 0 && xstat(PC0, "natgw_ddr_flows") == 0, "flush empties the DDR tier");
+	/* flushed DDR entries are gone from the hardware too */
+	inject(PC0, frame, build(frame, &t[created - 1], 0, 64));
+	CHECK(wire_take(PC1, got, NULL) == 0, "flushed DDR flow still forwards");
+	drain();
+}
+
+static void test_ddr_punt_and_count(void)
+{
+	struct tuple t[40];
+	struct rte_flow_action q[] = { { .type = RTE_FLOW_ACTION_TYPE_COUNT }, { .type = RTE_FLOW_ACTION_TYPE_END } };
+	struct rte_flow_query_count c;
+	struct rte_flow_error err;
+	struct rte_flow *f[40];
+	struct rte_mbuf *m[4];
+	uint8_t frame[256];
+	unsigned hits = 0, ddr_hits = 0, tcp = 0, no_count = 0;
+
+	for (unsigned i = 0; i < RTE_DIM(t); i++) {
+		struct nat n = snat_to(PC1, 0xc6336402, (uint16_t)(40000 + i));
+		t[i] = ddr_tuple(i);
+		f[i] = create(PC0, &t[i], &n, &err);
+		CHECK(f[i], "create %u: %s", i, err.message);
+		if (!f[i])
+			return;
+	}
+	CHECK(xstat(PC0, "natgw_ddr_flows") >= 8, "%" PRIu64 " in DDR", xstat(PC0, "natgw_ddr_flows"));
+	/* a FIN on a hit is punted with the hit index; DDR flows carry the DDR flag */
+	for (unsigned i = 0; i < RTE_DIM(t); i++) {
+		struct tuple tf = t[i];
+		if (!tf.tcp)
+			continue;
+		tcp++;
+		tf.flags = RTE_TCP_FIN_FLAG | RTE_TCP_ACK_FLAG;
+		inject(PC0, frame, build(frame, &tf, 0, 64));
+		if (rte_eth_rx_burst(PC0, 0, m, 4) == 1) {
+			struct punt_meta *pm = meta_of(m[0]);
+			hits += pm->reason == RSN_FINRST && (pm->flags & PUNT_F_HIT);
+			ddr_hits += (pm->idx & IDX_DDR) != 0;
+			rte_pktmbuf_free(m[0]);
+		}
+	}
+	CHECK(hits == tcp && ddr_hits > 0 && ddr_hits < hits, "FIN punts: %u hits of %u, %u in DDR", hits, tcp,
+	      ddr_hits);
+	/* DDR flows have no counters: COUNT answers without hits */
+	for (unsigned i = 0; i < RTE_DIM(t); i++) {
+		inject(PC0, frame, build(frame, &t[i], 0, 64));
+		memset(&c, 0, sizeof(c));
+		CHECK(rte_flow_query(PC0, f[i], q, &c, &err) == 0, "query: %s", err.message);
+		if (!c.hits_set && !c.bytes_set)
+			no_count++;
+		else
+			CHECK(c.hits >= 1, "on-chip flow count %" PRIu64, c.hits);
+	}
+	CHECK(no_count == xstat(PC0, "natgw_ddr_flows"), "%u flows without counters", no_count);
+	rte_flow_flush(PC0, &err);
+	drain();
+}
+
+static void test_ddr_age(void)
+{
+	struct tuple t[40];
+	struct tuple t1 = { .sip = 0x0b0b0001, .dip = 200, .sport = 300, .dport = 400, .tcp = 0, .vid = -1 };
+	struct tuple t2 = t1;
+	struct nat n = snat_to(PC1, 0x0c000001, 7000);
+	struct rte_flow_action q[] = { { .type = RTE_FLOW_ACTION_TYPE_AGE }, { .type = RTE_FLOW_ACTION_TYPE_END } };
+	struct rte_flow_query_age qa;
+	struct rte_flow_error err;
+	void *ctx[4];
+	uint8_t frame[256];
+	int cookie1, cookie2;
+
+	/* fill the on-chip table so the aged flows land in DDR */
+	for (unsigned i = 0; i < RTE_DIM(t) && xstat(PC0, "natgw_ddr_flows") == 0; i++) {
+		struct nat nn = snat_to(PC1, 0xc6336402, (uint16_t)(40000 + i));
+		t[i] = ddr_tuple(i);
+		CHECK(create(PC0, &t[i], &nn, &err), "filler %u", i);
+	}
+	uint64_t base = xstat(PC0, "natgw_ddr_flows");
+	t2.sport = 301;
+	aged_events = 0;
+	rte_eth_dev_callback_register(PC0, RTE_ETH_EVENT_FLOW_AGED, aged_cb, NULL);
+	n.age = 2;
+	n.age_ctx = &cookie1;
+	struct rte_flow *f1 = create(PC0, &t1, &n, &err);
+	n.age = 5;
+	n.age_ctx = &cookie2;
+	struct rte_flow *f2 = create(PC0, &t2, &n, &err);
+	CHECK(f1 && f2, "create: %s", err.message);
+	CHECK(xstat(PC0, "natgw_ddr_flows") == base + 2, "aged flows in DDR (%" PRIu64 ")", xstat(PC0, "natgw_ddr_flows"));
+
+	rte_pmd_natgw_model_advance(PC0, 1500);
+	rte_pmd_natgw_model_poll(PC0);
+	CHECK(rte_flow_get_aged_flows(PC0, NULL, 0, &err) == 0, "nothing aged at 1.5 s");
+	inject(PC0, frame, build(frame, &t2, 0, 64));
+	drain();
+	rte_pmd_natgw_model_advance(PC0, 600);
+	rte_pmd_natgw_model_poll(PC0);
+	CHECK(rte_flow_get_aged_flows(PC0, ctx, 4, &err) == 1 && ctx[0] == &cookie1, "flow 1 aged at 2.1 s");
+	CHECK(aged_events == 1, "FLOW_AGED events %d", aged_events);
+	CHECK(rte_flow_query(PC0, f1, q, &qa, &err) == 0 && qa.aged && qa.sec_since_last_hit_valid &&
+	      qa.sec_since_last_hit == 2, "age query aged %u since %u", qa.aged, qa.sec_since_last_hit);
+	CHECK(rte_flow_query(PC0, f2, q, &qa, &err) == 0 && !qa.aged && qa.sec_since_last_hit == 0,
+	      "flow 2 seen in the last sweep: since %u", qa.sec_since_last_hit);
+	/* flow 2 last seen by the sweep at 2.1 s */
+	rte_pmd_natgw_model_advance(PC0, 2500);
+	rte_pmd_natgw_model_poll(PC0);
+	CHECK(rte_flow_get_aged_flows(PC0, NULL, 0, &err) == 1, "flow 2 must not age before 5 s idle");
+	rte_pmd_natgw_model_advance(PC0, 2600);
+	rte_pmd_natgw_model_poll(PC0);
+	CHECK(rte_flow_get_aged_flows(PC0, ctx, 4, &err) == 2, "flow 2 aged after 5 s idle");
+	rte_eth_dev_callback_unregister(PC0, RTE_ETH_EVENT_FLOW_AGED, aged_cb, NULL);
+	rte_flow_flush(PC0, &err);
+	drain();
+}
+
+/* a DDR tier the host must not use: on-chip capacity only, ENOSPC beyond it */
+static void check_no_ddr_use(uint16_t port)
+{
+	struct tuple t[64];
+	struct rte_flow_error err;
+	unsigned created = fill(port, (uint16_t)(port + 1), t, RTE_DIM(t));
+
+	CHECK(created >= 26 && created <= 32, "created %u (on-chip table of 32)", created);
+	CHECK(xstat(port, "natgw_ddr_flows") == 0, "DDR flows %" PRIu64, xstat(port, "natgw_ddr_flows"));
+	CHECK(xstat(port, "natgw_ddr_lookups") == 0, "DDR lookups");
+	rte_flow_flush(port, &err);
+	drain();
+}
+
+static void test_ddr_no_dimm(void)
+{
+	check_no_ddr_use(PD0);
+}
+
+static void test_ddr_disabled(void)
+{
+	check_no_ddr_use(PE0);
+}
+
 /* a worker polls the datapath while the main core creates and destroys flows */
 static volatile int stop_worker;
 static volatile uint64_t worker_frames;
@@ -725,6 +933,11 @@ int main(int argc, char **argv)
 	run("host_tx", test_host_tx);
 	run("no_punt_header", test_no_punt_header);
 	run("concurrent", test_concurrent);
+	run("ddr_spill", test_ddr_spill);
+	run("ddr_punt_and_count", test_ddr_punt_and_count);
+	run("ddr_age", test_ddr_age);
+	run("ddr_no_dimm", test_ddr_no_dimm);
+	run("ddr_disabled", test_ddr_disabled);
 
 	uint16_t pid;
 	RTE_ETH_FOREACH_DEV(pid) {

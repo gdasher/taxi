@@ -99,25 +99,29 @@ def udp_client(a):
     res = {"sent": 0, "received": 0, "lost": 0, "peers": [], "local_ports": [s.getsockname()[1] for s in socks],
            "per_flow": [0] * len(socks)}
     for p in range(a.phases):
-        for i, s in enumerate(socks):
-            for k in range(a.count):
-                payload = f"{p}:{i}:{k}:".encode() + b"x" * a.size
-                s.send(payload)
-                res["sent"] += 1
-                try:
-                    d = s.recv(65536)
-                    meta, echo = d.split(b"|", 1)
-                    if echo == payload:
-                        res["received"] += 1
-                        res["per_flow"][i] += 1
-                        if p == a.phases - 1 and k == a.count - 1:
-                            res["peers"].append(json.loads(meta))
-                    else:
-                        res["lost"] += 1
-                except socket.timeout:
+        if a.interleave:    # round robin: every flow stays active through the phase
+            order = [(i, k) for k in range(a.count) for i in range(len(socks))]
+        else:
+            order = [(i, k) for i in range(len(socks)) for k in range(a.count)]
+        for i, k in order:
+            s = socks[i]
+            payload = f"{p}:{i}:{k}:".encode() + b"x" * a.size
+            s.send(payload)
+            res["sent"] += 1
+            try:
+                d = s.recv(65536)
+                meta, echo = d.split(b"|", 1)
+                if echo == payload:
+                    res["received"] += 1
+                    res["per_flow"][i] += 1
+                    if p == a.phases - 1 and k == a.count - 1:
+                        res["peers"].append(json.loads(meta))
+                else:
                     res["lost"] += 1
-                if a.gap:
-                    time.sleep(a.gap)
+            except socket.timeout:
+                res["lost"] += 1
+            if a.gap:
+                time.sleep(a.gap)
         if p + 1 < a.phases:
             pause(f"phase{p + 1}")
     print(json.dumps(res), flush=True)
@@ -148,6 +152,7 @@ def main():
     p.add_argument("--size", type=int, default=100)
     p.add_argument("--phases", type=int, default=1)
     p.add_argument("--gap", type=float, default=0)
+    p.add_argument("--interleave", action="store_true")
     p.add_argument("--timeout", type=float, default=2)
     a = ap.parse_args()
     {"tcp-server": tcp_server, "tcp-client": tcp_client, "udp-echo": udp_echo, "udp-client": udp_client}[a.cmd](a)

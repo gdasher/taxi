@@ -5,7 +5,11 @@
  * offload as the cndm PMD on real hardware.
  *
  *   --vdev net_natgw_model0,lanes=8,bucket_w=10,wire=queue|tap,tap_prefix=ngw,
- *          punt_hdr=1,clock=wall|manual
+ *          punt_hdr=1,clock=wall|manual[,ddr_bucket_w=<5-20>,ddr_calib=0|1,no_ddr=0|1]
+ *
+ * ddr_bucket_w gives the model a DDR tier (2^(ddr_bucket_w+2) entries);
+ * ddr_calib=0 models that tier with no working DIMM, and no_ddr=1 tells the
+ * flow layer not to use it.
  *
  * The "wire" is what the MACs would see. With wire=queue, the test API below
  * injects and collects wire frames; with wire=tap, each lane is a Linux TAP

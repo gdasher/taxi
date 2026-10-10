@@ -22,8 +22,9 @@ def rand_entry(lane=None):
 class HwSim:
     """What the hardware holds: one entry per slot, searched in hardware order."""
 
-    def __init__(self, bucket_w, seed0=0xffffffff, seed1=0xffffffff):
-        self.t = pm.CuckooTable(bucket_w, seed0, seed1)   # used only for candidate order
+    def __init__(self, bucket_w, seed0=0xffffffff, seed1=0xffffffff, ddr=False):
+        cls = pm.DdrTable if ddr else pm.CuckooTable
+        self.t = cls(bucket_w, seed0, seed1)   # used only for candidate order
         self.slots = {}
 
     def apply(self, op):
@@ -40,13 +41,14 @@ class HwSim:
         return None, None
 
 
-@pytest.mark.parametrize("bucket_w,seed", [(4, 1), (6, 2), (8, 3)])
-def test_fill_relocation_never_loses_a_key(bucket_w, seed):
+@pytest.mark.parametrize("bucket_w,seed,ddr", [(4, 1, False), (6, 2, False), (8, 3, False),
+                                              (5, 7, True), (8, 8, True)])
+def test_fill_relocation_never_loses_a_key(bucket_w, seed, ddr):
     """Fill until the first refused insert. After every individual hardware
     write, every present key must still be found with its own action."""
     random.seed(seed)
-    t = Table(bucket_w)
-    hw = HwSim(bucket_w)
+    t = Table(bucket_w, ddr=ddr)
+    hw = HwSim(bucket_w, ddr=ddr)
     present = {}
     relocations = 0
     while True:
@@ -67,7 +69,8 @@ def test_fill_relocation_never_loses_a_key(bucket_w, seed):
         assert t.lookup(key_c(e.key)) == idx
     load = t.count / t.size
     assert t.count == len(present)
-    assert load > 0.85, load               # BFS relocation reaches high load
+    # BFS relocation reaches high load (two-slot buckets fill less far)
+    assert load > (0.75 if ddr else 0.85), load
     assert relocations > 0
     # every key where the table says it is, and hardware agrees
     for k, (_, idx) in present.items():
@@ -158,12 +161,13 @@ def test_rejects_invalid_entries():
     t.close()
 
 
+@pytest.mark.parametrize("ddr", [False, True])
 @pytest.mark.parametrize("seed0,seed1", [(0xffffffff, 0xffffffff), (0x1234, 0x8765)])
-def test_placement_matches_python_model(seed0, seed1):
+def test_placement_matches_python_model(seed0, seed1, ddr):
     """Same insert/delete sequence: identical writes from C and Python."""
     random.seed(seed0 ^ 99)
-    t = Table(5, seed0, seed1)
-    py = pm.CuckooTable(5, seed0, seed1)
+    t = Table(5, seed0, seed1, ddr=ddr)
+    py = (pm.DdrTable if ddr else pm.CuckooTable)(5, seed0, seed1)
     live = []
     for step in range(400):
         if live and random.random() < 0.2:
@@ -184,6 +188,25 @@ def test_placement_matches_python_model(seed0, seed1):
         assert [key_py(o.entry.key) for o in ops] == [x.key for _, x in pw], step
         live.append(e.key)
     t.close()
+
+
+def test_ddr_geometry():
+    """DDR table: 2 x 2^bw buckets of two slots, buckets from the top hash
+    bits, index {table, bucket, slot}; bucket widths outside 5..23 refused."""
+    t = Table(7, ddr=True)
+    assert t.size == 2 * 2 ** 7 * 2
+    py = pm.DdrTable(7)
+    random.seed(11)
+    for _ in range(100):
+        e = rand_entry()
+        n, idx, _ = t.insert(entry_c(e))
+        assert n >= 1
+        tb, b, s = py.split_idx(idx)
+        assert b in (py.bucket_of(e.key, 0), py.bucket_of(e.key, 1))
+        assert py.bucket_of(e.key, tb) == b and s in (0, 1)
+    t.close()
+    assert not lib.natgw_table_create_ddr(4, 1, 1, 6)
+    assert not lib.natgw_table_create_ddr(24, 1, 1, 6)
 
 
 def test_next_hop_sharing():

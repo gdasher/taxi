@@ -56,6 +56,13 @@ extern "C" {
 #define NATGW_REG_THRESH_UDP  0x0034
 #define NATGW_REG_SCAN        0x0038
 #define NATGW_REG_BUBBLE      0x003C
+#define NATGW_REG_DDR_STATUS  0x0060   /* DDR tier: see NATGW_DDR_* (all zero without one) */
+#define NATGW_REG_DDR_CTRL    0x0064   /* [0] enable, W [1] start clearing */
+#define NATGW_REG_DDR_LOOKUPS 0x0068
+#define NATGW_REG_DDR_HITS    0x006C
+#define NATGW_REG_DDR_SKIPS   0x0070
+#define NATGW_REG_ACT_LO      0x0148
+#define NATGW_REG_ACT_HI      0x014C
 #define NATGW_REG_ENT_DATA    0x0100   /* 7 words */
 #define NATGW_REG_ST_DATA     0x0120   /* 5 words */
 #define NATGW_REG_INDEX       0x0140
@@ -74,6 +81,19 @@ extern "C" {
 #define NATGW_CMD_RD_ENT  3
 #define NATGW_CMD_RD_ST   4
 #define NATGW_CMD_CLR     5
+#define NATGW_CMD_DDR_WR  6   /* ENT_DATA to DDR index INDEX */
+#define NATGW_CMD_DDR_CLR 7
+#define NATGW_CMD_DDR_RD  8   /* into ENT_DATA */
+#define NATGW_CMD_ACT_RC  9   /* read and clear activity word INDEX into ACT_LO/HI */
+
+#define NATGW_DDR_PRESENT    (1u << 0)
+#define NATGW_DDR_CALIBRATED (1u << 1)
+#define NATGW_DDR_ENABLED    (1u << 2)
+#define NATGW_DDR_CLEARING   (1u << 3)
+#define NATGW_DDR_ACTIVE     (1u << 4)
+
+/* hit index reported for a DDR-tier entry (punt header, events never) */
+#define NATGW_DDR_IDX_FLAG   0x80000000u
 
 #define NATGW_CTRL_ENABLE     (1u << 0)
 #define NATGW_CTRL_PUNT_HDR   (1u << 1)
@@ -234,6 +254,28 @@ int natgw_dev_pop_event(struct natgw_dev *d, struct natgw_event *ev);
 uint32_t natgw_dev_event_drops(struct natgw_dev *d);
 uint64_t natgw_dev_read_stat(struct natgw_dev *d, unsigned lane, unsigned n);
 
+/*
+ * DDR tier (optional). A build may have one (present); it is usable only when
+ * the memory controller calibrated (a DIMM is fitted and working). Before
+ * entries are placed the table must be cleared (DDR is random after power-up)
+ * and lookups enabled. Without a DDR tier every status bit reads zero.
+ */
+struct natgw_ddr_status {
+	bool present, calibrated, enabled, clearing, active;
+	unsigned bucket_w;    /* DDR table: 2 x 2^bucket_w lines of 2 entries */
+	unsigned max_out;     /* lookups in flight per lane */
+};
+void natgw_dev_ddr_status(struct natgw_dev *d, struct natgw_ddr_status *st);
+/* clear the DDR table and its activity bitmap; 0, or -ETIMEDOUT */
+int natgw_dev_ddr_clear(struct natgw_dev *d, unsigned max_polls);
+void natgw_dev_ddr_enable(struct natgw_dev *d, bool enable);
+void natgw_dev_write_ddr_entry(struct natgw_dev *d, uint32_t idx, const struct natgw_entry *e);
+void natgw_dev_clear_ddr_entry(struct natgw_dev *d, uint32_t idx);
+void natgw_dev_read_ddr_entry(struct natgw_dev *d, uint32_t idx, struct natgw_entry *e);
+/* read and clear 64 activity bits: bit n is DDR entry 64 * word + n, set by any hit */
+uint64_t natgw_dev_read_activity(struct natgw_dev *d, uint32_t word);
+void natgw_dev_ddr_stats(struct natgw_dev *d, uint32_t *lookups, uint32_t *hits, uint32_t *skips);
+
 /* ------------------------------------------------------------------ */
 /* host copy of the cuckoo table */
 
@@ -246,6 +288,8 @@ struct natgw_write {
 struct natgw_table;
 
 struct natgw_table *natgw_table_create(unsigned bucket_w, uint32_t seed0, uint32_t seed1, unsigned max_depth);
+/* the DDR tier's table: two slots per bucket, buckets from the top hash bits */
+struct natgw_table *natgw_table_create_ddr(unsigned bucket_w, uint32_t seed0, uint32_t seed1, unsigned max_depth);
 void natgw_table_destroy(struct natgw_table *t);
 unsigned natgw_table_size(const struct natgw_table *t);
 unsigned natgw_table_count(const struct natgw_table *t);
@@ -275,6 +319,8 @@ void natgw_table_clear(struct natgw_table *t);
 
 /* write planned operations to the device, in order, then flush */
 void natgw_dev_apply(struct natgw_dev *d, const struct natgw_write *ops, unsigned n);
+/* the same for the DDR tier (each write completes before the next starts) */
+void natgw_dev_apply_ddr(struct natgw_dev *d, const struct natgw_write *ops, unsigned n);
 
 /* largest number of writes a single insert can need */
 #define NATGW_MAX_INSERT_OPS(max_depth) ((max_depth) + 2)

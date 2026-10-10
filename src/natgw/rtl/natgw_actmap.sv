@@ -56,8 +56,8 @@ module natgw_actmap #(
 
 localparam WORD_W = BIT_W - 6;
 
-if (BIT_W < 6)
-    $fatal(0, "Error: natgw_actmap BIT_W must be at least 6 (instance %m)");
+if (BIT_W < 7)
+    $fatal(0, "Error: natgw_actmap BIT_W must be at least 7: two words (instance %m)");
 if (RAM_PIPE < 2)
     $fatal(0, "Error: natgw_actmap RAM_PIPE must be at least 2 (instance %m)");
 

@@ -19,7 +19,13 @@
 
 #include "natgw_flow.h"
 
+RTE_LOG_REGISTER_DEFAULT(natgw_logtype, NOTICE);
+#define RTE_LOGTYPE_NATGW natgw_logtype
+#define NATGW_LOG(level, ...) RTE_LOG_LINE(level, NATGW, __VA_ARGS__)
+
 #define NO_THRESH 0xffffffffu
+#define DDR_SCAN_WORDS 4096
+#define DDR_CLEAR_POLLS 50000000u
 
 struct hkey {
 	uint32_t sip, dip;
@@ -33,12 +39,14 @@ struct rte_flow {
 	struct natgw_entry e;
 	uint16_t port_id;          /* ingress port */
 	uint16_t nh_idx;
+	bool     ddr;              /* in the DDR tier */
 	bool     has_age;
 	bool     aged;
 	bool     idle_pending;     /* idle event seen, flow timeout not yet reached */
 	uint32_t age_timeout;      /* seconds */
 	void    *age_ctx;
 	uint32_t pending_ts;
+	uint32_t ddr_seen;         /* DDR tier: tick of the last sweep that saw activity */
 	uint64_t cnt_base_pkts, cnt_base_bytes;
 };
 
@@ -61,6 +69,13 @@ struct natgw_flow_ctx {
 	uint32_t thresh[2];        /* hardware idle thresholds (ticks): [udp, tcp] */
 	bool resync;
 	uint64_t ev_fin, ev_rst, ev_ovf;
+
+	/* DDR tier (td == NULL: not in use) */
+	struct natgw_table *td;
+	struct rte_flow **by_idx_ddr;
+	uint8_t *ddr_word_cnt;     /* flows per activity word: empty words are not read */
+	unsigned nflows_ddr;
+	uint32_t ddr_words, scan_pos, scan_start;
 };
 
 static struct {
@@ -91,6 +106,50 @@ static struct hkey mk_hkey(const struct natgw_key *k)
 static void write_thresholds(struct natgw_flow_ctx *ctx)
 {
 	natgw_dev_set_thresholds(&ctx->dev, ctx->thresh[1], ctx->thresh[0]);
+}
+
+/*
+ * Use the DDR tier only when the bitstream has one and its memory calibrated:
+ * clear it (contents are random after power-up), then enable lookups. Any
+ * other case leaves it disabled and every flow on chip. 0, or -ENOMEM.
+ */
+static int ddr_setup(struct natgw_flow_ctx *ctx, int socket_id)
+{
+	struct natgw_ddr_status st;
+	unsigned polls = ctx->cfg.ddr_clear_polls ? ctx->cfg.ddr_clear_polls : DDR_CLEAR_POLLS;
+
+	natgw_dev_ddr_status(&ctx->dev, &st);
+	if (!st.present)
+		return 0;
+	natgw_dev_ddr_enable(&ctx->dev, false);
+	if (ctx->cfg.no_ddr) {
+		NATGW_LOG(INFO, "DDR tier present, not used (disabled by configuration)");
+		return 0;
+	}
+	if (!st.calibrated) {
+		NATGW_LOG(NOTICE, "DDR tier present but the memory did not calibrate (no DIMM?): on-chip table only");
+		return 0;
+	}
+	if (st.bucket_w < 5 || st.bucket_w > 23) {
+		NATGW_LOG(ERR, "DDR tier reports an unsupported geometry (bucket_w %u): not used", st.bucket_w);
+		return 0;
+	}
+	if (natgw_dev_ddr_clear(&ctx->dev, polls) != 0) {
+		NATGW_LOG(ERR, "DDR tier clear timed out: not used");
+		return 0;
+	}
+	ctx->td = natgw_table_create_ddr(st.bucket_w, ctx->cfg.seed0, ctx->cfg.seed1, ctx->cfg.max_depth);
+	if (!ctx->td)
+		return -ENOMEM;
+	ctx->ddr_words = natgw_table_size(ctx->td) / 64;
+	ctx->by_idx_ddr = rte_zmalloc_socket("natgw_by_idx_ddr", natgw_table_size(ctx->td) * sizeof(*ctx->by_idx_ddr),
+					     0, socket_id);
+	ctx->ddr_word_cnt = rte_zmalloc_socket("natgw_ddr_words", ctx->ddr_words, 0, socket_id);
+	if (!ctx->by_idx_ddr || !ctx->ddr_word_cnt)
+		return -ENOMEM;
+	natgw_dev_ddr_enable(&ctx->dev, true);
+	NATGW_LOG(INFO, "DDR tier in use: %u entries", natgw_table_size(ctx->td));
+	return 0;
 }
 
 struct natgw_flow_ctx *natgw_flow_ctx_create(const struct natgw_io *io, const struct natgw_flow_cfg *cfg,
@@ -135,11 +194,15 @@ struct natgw_flow_ctx *natgw_flow_ctx_create(const struct natgw_io *io, const st
 	natgw_nh_table_init(ctx->nht);
 	ctx->by_idx = rte_zmalloc_socket("natgw_by_idx", natgw_table_size(ctx->t) * sizeof(*ctx->by_idx), 0,
 					 socket_id);
+	if (ddr_setup(ctx, socket_id) != 0)
+		goto fail;
 	snprintf(name, sizeof(name), "natgw_flows_%d", __atomic_fetch_add(&ctx_seq, 1, __ATOMIC_RELAXED));
 	hp.name = name;
 	/* headroom: a nearly full rte_hash relocates keys (a deep, stack-hungry
 	 * search) and can refuse keys the hardware table still has room for */
 	hp.entries = 2 * natgw_table_size(ctx->t) + 64;
+	if (ctx->td)
+		hp.entries += natgw_table_size(ctx->td) + natgw_table_size(ctx->td) / 4;
 	ctx->by_key = rte_hash_create(&hp);
 	if (!ctx->by_idx || !ctx->by_key)
 		goto fail;
@@ -164,9 +227,14 @@ void natgw_flow_ctx_destroy(struct natgw_flow_ctx *ctx)
 	for (unsigned p = 0; p < RTE_MAX_ETHPORTS; p++)
 		if (port_map[p].ctx == ctx)
 			port_map[p].ctx = NULL;
+	if (ctx->dev.io.rd && ctx->td)
+		natgw_dev_ddr_enable(&ctx->dev, false);
 	if (ctx->by_key)
 		rte_hash_free(ctx->by_key);
 	rte_free(ctx->by_idx);
+	rte_free(ctx->by_idx_ddr);
+	rte_free(ctx->ddr_word_cnt);
+	natgw_table_destroy(ctx->td);
 	rte_free(ctx->ops);
 	rte_free(ctx->nht);
 	natgw_table_destroy(ctx->t);
@@ -204,7 +272,17 @@ unsigned natgw_flow_count(struct natgw_flow_ctx *ctx)
 
 unsigned natgw_flow_capacity(struct natgw_flow_ctx *ctx)
 {
-	return natgw_table_size(ctx->t);
+	return natgw_table_size(ctx->t) + (ctx->td ? natgw_table_size(ctx->td) : 0);
+}
+
+unsigned natgw_flow_ddr_count(struct natgw_flow_ctx *ctx)
+{
+	return ctx->nflows_ddr;
+}
+
+unsigned natgw_flow_ddr_capacity(struct natgw_flow_ctx *ctx)
+{
+	return ctx->td ? natgw_table_size(ctx->td) : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -484,18 +562,54 @@ static struct natgw_flow_ctx *dev_ctx(struct rte_eth_dev *dev)
 	return port_map[dev->data->port_id].ctx;
 }
 
-static void apply_ops(struct natgw_flow_ctx *ctx, unsigned n)
+/* read and clear one activity word, crediting set bits to the flows there now */
+static void ddr_read_word(struct natgw_flow_ctx *ctx, uint32_t w, uint32_t now)
 {
-	natgw_dev_apply(&ctx->dev, ctx->ops, n);
+	uint64_t bits = natgw_dev_read_activity(&ctx->dev, w);
+
+	while (bits) {
+		unsigned b = (unsigned)__builtin_ctzll(bits);
+		struct rte_flow *f = ctx->by_idx_ddr[w * 64 + b];
+		bits &= bits - 1;
+		if (f)
+			f->ddr_seen = now;
+	}
+}
+
+static void apply_ops(struct natgw_flow_ctx *ctx, unsigned n, bool ddr)
+{
+	struct rte_flow **by_idx = ddr ? ctx->by_idx_ddr : ctx->by_idx;
+	uint32_t now = ddr ? natgw_dev_tick(&ctx->dev) : 0;
+
+	/* an empty DDR slot may still have the activity bit of the flow that
+	 * left it: collect that word before a new flow moves in, or the stale
+	 * bit would keep the newcomer alive */
+	for (unsigned i = 0; ddr && i < n; i++) {
+		if (!ctx->ops[i].clear && !by_idx[ctx->ops[i].idx])
+			ddr_read_word(ctx, ctx->ops[i].idx / 64, now);
+	}
+	if (ddr)
+		natgw_dev_apply_ddr(&ctx->dev, ctx->ops, n);
+	else
+		natgw_dev_apply(&ctx->dev, ctx->ops, n);
 	for (unsigned i = 0; i < n; i++) {
-		if (ctx->ops[i].clear) {
-			ctx->by_idx[ctx->ops[i].idx] = NULL;
-		} else {
+		uint32_t idx = ctx->ops[i].idx;
+		struct rte_flow *f = NULL;
+
+		if (!ctx->ops[i].clear) {
 			struct hkey hk = mk_hkey(&ctx->ops[i].entry.key);
-			void *f = NULL;
-			rte_hash_lookup_data(ctx->by_key, &hk, &f);
-			ctx->by_idx[ctx->ops[i].idx] = f;
+			void *d = NULL;
+			rte_hash_lookup_data(ctx->by_key, &hk, &d);
+			f = d;
 		}
+		if (ddr) {
+			ctx->ddr_word_cnt[idx / 64] += (f != NULL) - (by_idx[idx] != NULL);
+			/* the activity bit stays behind at the old index when a
+			 * flow moves: count the move as activity */
+			if (f)
+				f->ddr_seen = now;
+		}
+		by_idx[idx] = f;
 	}
 }
 
@@ -579,6 +693,11 @@ static struct rte_flow *natgw_flow_create(struct rte_eth_dev *dev, const struct 
 		return NULL;
 	}
 	n = natgw_table_insert(ctx->t, &f->e, ctx->ops, ctx->max_ops, &idx);
+	if (n == -ENOSPC && ctx->td) {
+		/* on-chip table full: the DDR tier */
+		n = natgw_table_insert(ctx->td, &f->e, ctx->ops, ctx->max_ops, &idx);
+		f->ddr = true;
+	}
 	if (n < 0) {
 		rte_hash_del_key(ctx->by_key, &hk);
 		if (natgw_nh_put(ctx->nht, (uint16_t)nh_idx) == 0) {
@@ -591,9 +710,10 @@ static struct rte_flow *natgw_flow_create(struct rte_eth_dev *dev, const struct 
 		     n == -ENOSPC ? "hardware flow table full" : "flow table insert failed");
 		return NULL;
 	}
-	apply_ops(ctx, (unsigned)n);
+	apply_ops(ctx, (unsigned)n, f->ddr);
 	TAILQ_INSERT_TAIL(&ctx->flows, f, next);
 	ctx->nflows++;
+	ctx->nflows_ddr += f->ddr;
 	update_thresholds(ctx, f);
 	rte_spinlock_unlock(&ctx->lock);
 	return f;
@@ -602,10 +722,10 @@ static struct rte_flow *natgw_flow_create(struct rte_eth_dev *dev, const struct 
 static void flow_remove_locked(struct natgw_flow_ctx *ctx, struct rte_flow *f)
 {
 	struct hkey hk = mk_hkey(&f->e.key);
-	int n = natgw_table_delete(ctx->t, &f->e.key, ctx->ops, ctx->max_ops);
+	int n = natgw_table_delete(f->ddr ? ctx->td : ctx->t, &f->e.key, ctx->ops, ctx->max_ops);
 
 	if (n > 0)
-		apply_ops(ctx, (unsigned)n);
+		apply_ops(ctx, (unsigned)n, f->ddr);
 	rte_hash_del_key(ctx->by_key, &hk);
 	if (natgw_nh_put(ctx->nht, f->nh_idx) == 0) {
 		struct natgw_nh off = {0};
@@ -613,6 +733,7 @@ static void flow_remove_locked(struct natgw_flow_ctx *ctx, struct rte_flow *f)
 	}
 	TAILQ_REMOVE(&ctx->flows, f, next);
 	ctx->nflows--;
+	ctx->nflows_ddr -= f->ddr;
 }
 
 static int natgw_flow_destroy(struct rte_eth_dev *dev, struct rte_flow *f, struct rte_flow_error *err)
@@ -647,10 +768,20 @@ static int natgw_flow_flush(struct rte_eth_dev *dev, struct rte_flow_error *err)
 	return 0;
 }
 
+/* per-entry state of an on-chip flow; a DDR flow has none: its last activity
+ * (as seen by the sweep) stands in for the timestamp */
 static int read_flow_state(struct natgw_flow_ctx *ctx, const struct rte_flow *f, struct natgw_state *s)
 {
 	uint32_t idx;
 
+	if (f->ddr) {
+		if (natgw_table_find(ctx->td, &f->e.key, &idx) != 0)
+			return -ENOENT;
+		memset(s, 0, sizeof(*s));
+		s->valid = 1;
+		s->ts = f->ddr_seen;
+		return 0;
+	}
 	if (natgw_table_find(ctx->t, &f->e.key, &idx) != 0)
 		return -ENOENT;
 	natgw_dev_read_state(&ctx->dev, idx, s);
@@ -679,6 +810,14 @@ static int natgw_flow_query(struct rte_eth_dev *dev, struct rte_flow *f, const s
 			break;
 		case RTE_FLOW_ACTION_TYPE_COUNT: {
 			struct rte_flow_query_count *q = data;
+			if (f->ddr) {
+				/* no counters in the DDR tier */
+				q->hits_set = 0;
+				q->bytes_set = 0;
+				q->hits = 0;
+				q->bytes = 0;
+				break;
+			}
 			q->hits_set = 1;
 			q->bytes_set = 1;
 			q->hits = s.pkts - f->cnt_base_pkts;
@@ -766,6 +905,44 @@ static bool check_age_locked(struct natgw_flow_ctx *ctx, struct rte_flow *f, uin
 	return false;
 }
 
+/*
+ * Read (and clear) up to the budget of activity words that hold DDR flows.
+ * A set bit marks its flow seen now. When a sweep wraps, DDR flows not seen
+ * for their timeout are aged; returns per-lane notifications through notify.
+ */
+static void ddr_sweep_locked(struct natgw_flow_ctx *ctx, uint32_t now, bool *notify)
+{
+	unsigned budget = ctx->cfg.ddr_scan_words ? ctx->cfg.ddr_scan_words : DDR_SCAN_WORDS;
+	struct rte_flow *f;
+	bool wrapped = false;
+
+	if (!ctx->td || !ctx->nflows_ddr)
+		return;
+	for (uint32_t n = 0; n < ctx->ddr_words && budget; n++) {
+		uint32_t w = ctx->scan_pos;
+
+		if (++ctx->scan_pos == ctx->ddr_words) {
+			ctx->scan_pos = 0;
+			wrapped = true;
+		}
+		if (ctx->ddr_word_cnt[w]) {
+			ddr_read_word(ctx, w, now);
+			budget--;
+		}
+		if (wrapped)
+			break;
+	}
+	if (!wrapped)
+		return;
+	TAILQ_FOREACH(f, &ctx->flows, next) {
+		if (f->ddr && f->has_age && !f->aged &&
+		    (uint64_t)(uint32_t)(now - f->ddr_seen) >= (uint64_t)f->age_timeout * ctx->cfg.ticks_per_sec) {
+			f->aged = true;
+			notify[f->e.key.lane] = true;
+		}
+	}
+}
+
 void natgw_flow_poll(struct natgw_flow_ctx *ctx)
 {
 	bool notify[NATGW_LANES] = {false};
@@ -803,10 +980,11 @@ void natgw_flow_poll(struct natgw_flow_ctx *ctx)
 		}
 	}
 	TAILQ_FOREACH(f, &ctx->flows, next) {
-		if ((f->idle_pending || ctx->resync) && check_age_locked(ctx, f, now))
+		if (!f->ddr && (f->idle_pending || ctx->resync) && check_age_locked(ctx, f, now))
 			notify[f->e.key.lane] = true;
 	}
 	ctx->resync = false;
+	ddr_sweep_locked(ctx, now, notify);
 	rte_spinlock_unlock(&ctx->lock);
 
 	for (unsigned l = 0; l < ctx->cfg.lanes; l++) {
@@ -826,7 +1004,7 @@ static const char *const reason_names[NATGW_STAT_COUNT] = {
 
 unsigned natgw_flow_xstats_count(void)
 {
-	return NATGW_STAT_COUNT + 4;
+	return NATGW_STAT_COUNT + 8;
 }
 
 int natgw_flow_xstats_get_names(struct natgw_flow_ctx *ctx, struct rte_eth_xstat_name *names, unsigned size)
@@ -843,6 +1021,10 @@ int natgw_flow_xstats_get_names(struct natgw_flow_ctx *ctx, struct rte_eth_xstat
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_events_fin");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_events_rst");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_events_lost");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_flows");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_lookups");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_hits");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_skips");
 	return (int)n;
 }
 
@@ -861,6 +1043,16 @@ int natgw_flow_xstats_get(struct natgw_flow_ctx *ctx, unsigned lane, struct rte_
 	xstats[i].id = i; xstats[i++].value = ctx->ev_fin;
 	xstats[i].id = i; xstats[i++].value = ctx->ev_rst;
 	xstats[i].id = i; xstats[i++].value = natgw_dev_event_drops(&ctx->dev);
+	{
+		/* device-wide (the hardware counts all lanes together); wrapping 32-bit */
+		uint32_t lk = 0, ht = 0, sk = 0;
+		if (ctx->td)
+			natgw_dev_ddr_stats(&ctx->dev, &lk, &ht, &sk);
+		xstats[i].id = i; xstats[i++].value = ctx->nflows_ddr;
+		xstats[i].id = i; xstats[i++].value = lk;
+		xstats[i].id = i; xstats[i++].value = ht;
+		xstats[i].id = i; xstats[i++].value = sk;
+	}
 	rte_spinlock_unlock(&ctx->lock);
 	return (int)n;
 }

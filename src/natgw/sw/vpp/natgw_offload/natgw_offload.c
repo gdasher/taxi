@@ -612,6 +612,7 @@ ngo_query (ngo_session_t *ngs, f64 now, ngo_update_t *u)
 				  { .type = RTE_FLOW_ACTION_TYPE_END } };
   struct rte_flow_error err;
   u32 since = ~0;
+  int heard = 0;
 
   u->pkts = u->bytes = 0;
   u->last_heard = 0;
@@ -622,6 +623,18 @@ ngo_query (ngo_session_t *ngs, f64 now, ngo_update_t *u)
       if (rte_flow_query (ngs->in_port[d], ngs->flow[d], qc, &c, &err) ||
 	  rte_flow_query (ngs->in_port[d], ngs->flow[d], qa, &a, &err))
 	return -1;
+      if (!c.hits_set)
+	{
+	  /* a flow in the DDR tier: no counters, only the time since the
+	   * hardware last saw it active (refresh never moves last_heard
+	   * backwards, so reporting an old time is harmless) */
+	  if (a.sec_since_last_hit_valid)
+	    {
+	      since = clib_min (since, (u32) a.sec_since_last_hit);
+	      heard = 1;
+	    }
+	  continue;
+	}
       u->pkts += c.hits;
       u->bytes += c.bytes;
       if (c.hits && a.sec_since_last_hit_valid)
@@ -629,8 +642,9 @@ ngo_query (ngo_session_t *ngs, f64 now, ngo_update_t *u)
 	  u32 sec = a.sec_since_last_hit;
 	  since = clib_min (since, sec);
 	}
+      heard |= c.hits != 0;
     }
-  if (u->pkts)
+  if (heard)
     u->last_heard = now - (since == ~0 ? 0 : since);
   return 0;
 }

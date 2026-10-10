@@ -371,13 +371,121 @@ void natgw_dev_apply(struct natgw_dev *d, const struct natgw_write *ops, unsigne
 }
 
 /* ------------------------------------------------------------------ */
-/* host cuckoo table: two tables of 2^bucket_w buckets x 4 slots */
+/* DDR tier */
 
-#define SLOTS 4
+void natgw_dev_ddr_status(struct natgw_dev *d, struct natgw_ddr_status *st)
+{
+	uint32_t v = rd(d, NATGW_REG_DDR_STATUS);
+
+	st->present = v & NATGW_DDR_PRESENT;
+	st->calibrated = v & NATGW_DDR_CALIBRATED;
+	st->enabled = v & NATGW_DDR_ENABLED;
+	st->clearing = v & NATGW_DDR_CLEARING;
+	st->active = v & NATGW_DDR_ACTIVE;
+	st->bucket_w = (v >> 8) & 0xff;
+	st->max_out = (v >> 16) & 0xff;
+}
+
+int natgw_dev_ddr_clear(struct natgw_dev *d, unsigned max_polls)
+{
+	uint32_t en = rd(d, NATGW_REG_DDR_CTRL) & 1;
+
+	wr(d, NATGW_REG_DDR_CTRL, en | 2);
+	for (unsigned i = 0; i < max_polls; i++) {
+		if (!(rd(d, NATGW_REG_DDR_STATUS) & NATGW_DDR_CLEARING))
+			return 0;
+	}
+	return -ETIMEDOUT;
+}
+
+void natgw_dev_ddr_enable(struct natgw_dev *d, bool enable)
+{
+	wr(d, NATGW_REG_DDR_CTRL, enable ? 1 : 0);
+	natgw_dev_flush(d);
+}
+
+static void write_ddr_entry_nf(struct natgw_dev *d, uint32_t idx, const struct natgw_entry *e)
+{
+	uint32_t w[NATGW_ENTRY_WORDS];
+
+	natgw_entry_pack(e, w);
+	for (unsigned k = 0; k < NATGW_ENTRY_WORDS; k++)
+		wr(d, NATGW_REG_ENT_DATA + 4 * k, w[k]);
+	wr(d, NATGW_REG_INDEX, idx);
+	wr(d, NATGW_REG_CMD, NATGW_CMD_DDR_WR);
+}
+
+static void clear_ddr_entry_nf(struct natgw_dev *d, uint32_t idx)
+{
+	wr(d, NATGW_REG_INDEX, idx);
+	wr(d, NATGW_REG_CMD, NATGW_CMD_DDR_CLR);
+}
+
+void natgw_dev_write_ddr_entry(struct natgw_dev *d, uint32_t idx, const struct natgw_entry *e)
+{
+	write_ddr_entry_nf(d, idx, e);
+	natgw_dev_flush(d);
+}
+
+void natgw_dev_clear_ddr_entry(struct natgw_dev *d, uint32_t idx)
+{
+	clear_ddr_entry_nf(d, idx);
+	natgw_dev_flush(d);
+}
+
+void natgw_dev_read_ddr_entry(struct natgw_dev *d, uint32_t idx, struct natgw_entry *e)
+{
+	uint32_t w[NATGW_ENTRY_WORDS];
+
+	wr(d, NATGW_REG_INDEX, idx);
+	wr(d, NATGW_REG_CMD, NATGW_CMD_DDR_RD);
+	for (unsigned k = 0; k < NATGW_ENTRY_WORDS; k++)
+		w[k] = rd(d, NATGW_REG_ENT_DATA + 4 * k);
+	natgw_entry_unpack(w, e);
+}
+
+uint64_t natgw_dev_read_activity(struct natgw_dev *d, uint32_t word)
+{
+	uint32_t lo, hi;
+
+	wr(d, NATGW_REG_INDEX, word);
+	wr(d, NATGW_REG_CMD, NATGW_CMD_ACT_RC);
+	lo = rd(d, NATGW_REG_ACT_LO);
+	hi = rd(d, NATGW_REG_ACT_HI);
+	return ((uint64_t)hi << 32) | lo;
+}
+
+void natgw_dev_ddr_stats(struct natgw_dev *d, uint32_t *lookups, uint32_t *hits, uint32_t *skips)
+{
+	*lookups = rd(d, NATGW_REG_DDR_LOOKUPS);
+	*hits = rd(d, NATGW_REG_DDR_HITS);
+	*skips = rd(d, NATGW_REG_DDR_SKIPS);
+}
+
+void natgw_dev_apply_ddr(struct natgw_dev *d, const struct natgw_write *ops, unsigned n)
+{
+	for (unsigned i = 0; i < n; i++) {
+		if (ops[i].clear)
+			clear_ddr_entry_nf(d, ops[i].idx);
+		else
+			write_ddr_entry_nf(d, ops[i].idx, &ops[i].entry);
+	}
+	natgw_dev_flush(d);
+}
+
+/* ------------------------------------------------------------------ */
+/* host cuckoo table: two tables of 2^bucket_w buckets of 2^slot_bits slots.
+ * UltraRAM tier: 4 slots, buckets from the low hash bits.
+ * DDR tier: 2 slots (one 64-byte line), buckets from the top hash bits. */
+
+#define MAX_SLOTS 4
 #define NO_PREV 0xffffffffu
 
 struct natgw_table {
 	unsigned bucket_w;
+	unsigned slot_bits;
+	unsigned slots;
+	bool top;                     /* buckets from the top hash bits */
 	uint32_t buckets;
 	uint32_t size;
 	uint32_t seed0, seed1;
@@ -393,43 +501,49 @@ struct natgw_table {
 
 static inline uint32_t mk_idx(const struct natgw_table *t, unsigned tbl, uint32_t bucket, unsigned slot)
 {
-	return ((uint32_t)tbl << (t->bucket_w + 2)) | (bucket << 2) | slot;
+	return ((uint32_t)tbl << (t->bucket_w + t->slot_bits)) | (bucket << t->slot_bits) | slot;
 }
 
 static inline unsigned idx_tbl(const struct natgw_table *t, uint32_t idx)
 {
-	return idx >> (t->bucket_w + 2);
+	return idx >> (t->bucket_w + t->slot_bits);
 }
 
 static uint32_t bucket_of(const struct natgw_table *t, const struct natgw_key *k, unsigned tbl)
 {
 	uint32_t h = tbl ? natgw_key_crc(k, t->seed1, NATGW_POLY_CRC32) : natgw_key_crc(k, t->seed0, NATGW_POLY_CRC32C);
-	return h & (t->buckets - 1);
+	return t->top ? h >> (32 - t->bucket_w) : h & (t->buckets - 1);
 }
 
-static void candidates(const struct natgw_table *t, const struct natgw_key *k, uint32_t c[8])
+/* the 2 * slots candidate indices of a key: table 0's bucket, then table 1's */
+static unsigned candidates(const struct natgw_table *t, const struct natgw_key *k, uint32_t c[2 * MAX_SLOTS])
 {
 	uint32_t b0 = bucket_of(t, k, 0);
 	uint32_t b1 = bucket_of(t, k, 1);
 
-	for (unsigned s = 0; s < SLOTS; s++) {
+	for (unsigned s = 0; s < t->slots; s++) {
 		c[s] = mk_idx(t, 0, b0, s);
-		c[SLOTS + s] = mk_idx(t, 1, b1, s);
+		c[t->slots + s] = mk_idx(t, 1, b1, s);
 	}
+	return 2 * t->slots;
 }
 
-struct natgw_table *natgw_table_create(unsigned bucket_w, uint32_t seed0, uint32_t seed1, unsigned max_depth)
+static struct natgw_table *table_create(unsigned bucket_w, unsigned slot_bits, bool top,
+					uint32_t seed0, uint32_t seed1, unsigned max_depth)
 {
 	struct natgw_table *t;
 
-	if (bucket_w < 1 || bucket_w > 21 || max_depth < 1 || max_depth > 16)
+	if (max_depth < 1 || max_depth > 16)
 		return NULL;
 	t = calloc(1, sizeof(*t));
 	if (!t)
 		return NULL;
 	t->bucket_w = bucket_w;
+	t->slot_bits = slot_bits;
+	t->slots = 1u << slot_bits;
+	t->top = top;
 	t->buckets = 1u << bucket_w;
-	t->size = 2 * t->buckets * SLOTS;
+	t->size = 2 * t->buckets * t->slots;
 	t->seed0 = seed0;
 	t->seed1 = seed1;
 	t->max_depth = max_depth;
@@ -445,6 +559,21 @@ struct natgw_table *natgw_table_create(unsigned bucket_w, uint32_t seed0, uint32
 	for (uint32_t i = 0; i < t->size; i++)
 		t->prev[i] = NO_PREV;
 	return t;
+}
+
+struct natgw_table *natgw_table_create(unsigned bucket_w, uint32_t seed0, uint32_t seed1, unsigned max_depth)
+{
+	if (bucket_w < 1 || bucket_w > 21)
+		return NULL;
+	return table_create(bucket_w, 2, false, seed0, seed1, max_depth);
+}
+
+struct natgw_table *natgw_table_create_ddr(unsigned bucket_w, uint32_t seed0, uint32_t seed1, unsigned max_depth)
+{
+	/* at least two activity words (128 entries); 2^23 buckets = 32M entries */
+	if (bucket_w < 5 || bucket_w > 23)
+		return NULL;
+	return table_create(bucket_w, 1, true, seed0, seed1, max_depth);
 }
 
 void natgw_table_destroy(struct natgw_table *t)
@@ -484,10 +613,10 @@ const struct natgw_entry *natgw_table_slot(const struct natgw_table *t, uint32_t
 
 int natgw_table_lookup(const struct natgw_table *t, const struct natgw_key *k, uint32_t *idx)
 {
-	uint32_t c[8];
+	uint32_t c[2 * MAX_SLOTS];
+	unsigned nc = candidates(t, k, c);
 
-	candidates(t, k, c);
-	for (unsigned i = 0; i < 8; i++) {
+	for (unsigned i = 0; i < nc; i++) {
 		if (t->slot[c[i]].valid && natgw_key_eq(&t->slot[c[i]].key, k)) {
 			if (idx)
 				*idx = c[i];
@@ -512,7 +641,8 @@ static int key_ok(const struct natgw_table *t, const struct natgw_entry *e)
 int natgw_table_insert(struct natgw_table *t, const struct natgw_entry *e,
 		       struct natgw_write *ops, unsigned max_ops, uint32_t *idx_out)
 {
-	uint32_t c[8];
+	uint32_t c[2 * MAX_SLOTS];
+	unsigned nc;
 	uint32_t found = NO_PREV;
 	unsigned qh = 0, qt = 0, nt = 0;
 	struct natgw_entry ne = *e;
@@ -535,8 +665,8 @@ int natgw_table_insert(struct natgw_table *t, const struct natgw_entry *e,
 		return 1;
 	}
 
-	candidates(t, &e->key, c);
-	for (unsigned i = 0; i < 8; i++) {
+	nc = candidates(t, &e->key, c);
+	for (unsigned i = 0; i < nc; i++) {
 		if (!t->slot[c[i]].valid) {
 			if (max_ops < 1)
 				return -E2BIG;
@@ -552,7 +682,7 @@ int natgw_table_insert(struct natgw_table *t, const struct natgw_entry *e,
 	}
 
 	/* breadth-first search for a relocation path ending in a free slot */
-	for (unsigned i = 0; i < 8; i++) {
+	for (unsigned i = 0; i < nc; i++) {
 		if (t->prev[c[i]] != NO_PREV)
 			continue;
 		t->prev[c[i]] = c[i];         /* root marker: points at itself */
@@ -567,7 +697,7 @@ int natgw_table_insert(struct natgw_table *t, const struct natgw_entry *e,
 		unsigned alt = 1 - idx_tbl(t, i);
 		uint32_t ab = bucket_of(t, &occ->key, alt);
 
-		for (unsigned s = 0; s < SLOTS; s++) {
+		for (unsigned s = 0; s < t->slots; s++) {
 			uint32_t j = mk_idx(t, alt, ab, s);
 			if (t->prev[j] != NO_PREV)
 				continue;

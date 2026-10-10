@@ -108,7 +108,24 @@ _sig("natgw_dev_pop_event", C.c_int, P(Dev), P(Event))
 _sig("natgw_dev_event_drops", C.c_uint32, P(Dev))
 _sig("natgw_dev_read_stat", C.c_uint64, P(Dev), C.c_uint, C.c_uint)
 _sig("natgw_dev_apply", None, P(Dev), P(Write), C.c_uint)
+
+
+class DdrStatus(C.Structure):
+    _fields_ = [("present", C.c_bool), ("calibrated", C.c_bool), ("enabled", C.c_bool),
+                ("clearing", C.c_bool), ("active", C.c_bool), ("bucket_w", C.c_uint), ("max_out", C.c_uint)]
+
+
+_sig("natgw_dev_ddr_status", None, P(Dev), P(DdrStatus))
+_sig("natgw_dev_ddr_clear", C.c_int, P(Dev), C.c_uint)
+_sig("natgw_dev_ddr_enable", None, P(Dev), C.c_bool)
+_sig("natgw_dev_write_ddr_entry", None, P(Dev), C.c_uint32, P(Entry))
+_sig("natgw_dev_clear_ddr_entry", None, P(Dev), C.c_uint32)
+_sig("natgw_dev_read_ddr_entry", None, P(Dev), C.c_uint32, P(Entry))
+_sig("natgw_dev_read_activity", C.c_uint64, P(Dev), C.c_uint32)
+_sig("natgw_dev_ddr_stats", None, P(Dev), P(C.c_uint32), P(C.c_uint32), P(C.c_uint32))
+_sig("natgw_dev_apply_ddr", None, P(Dev), P(Write), C.c_uint)
 _sig("natgw_table_create", C.c_void_p, C.c_uint, C.c_uint32, C.c_uint32, C.c_uint)
+_sig("natgw_table_create_ddr", C.c_void_p, C.c_uint, C.c_uint32, C.c_uint32, C.c_uint)
 _sig("natgw_table_destroy", None, C.c_void_p)
 _sig("natgw_table_size", C.c_uint, C.c_void_p)
 _sig("natgw_table_count", C.c_uint, C.c_void_p)
@@ -128,6 +145,7 @@ _sig("natgw_model_rd", C.c_uint32, C.c_void_p, C.c_uint32)
 _sig("natgw_model_wr", None, C.c_void_p, C.c_uint32, C.c_uint32)
 _sig("natgw_model_rx", C.c_int, C.c_void_p, C.c_uint, P(C.c_uint8), C.c_size_t, P(ModelOut))
 _sig("natgw_model_advance", None, C.c_void_p, C.c_uint32)
+_sig("natgw_model_set_ddr", C.c_int, C.c_void_p, C.c_uint, C.c_bool)
 
 
 # ---------------------------------------------------------------- conversions
@@ -170,9 +188,11 @@ def words_int(w):
 class Model:
     """The C software model, driven through libnatgw's device API."""
 
-    def __init__(self, bucket_w):
+    def __init__(self, bucket_w, ddr_bucket_w=None, ddr_calib=True):
         self.h = lib.natgw_model_create(bucket_w)
         assert self.h
+        if ddr_bucket_w is not None:
+            assert lib.natgw_model_set_ddr(self.h, ddr_bucket_w, ddr_calib) == 0
         self.io = lib.natgw_model_io(self.h)
         self.dev = Dev()
         rc = lib.natgw_dev_init(C.byref(self.dev), C.byref(self.io))
@@ -196,8 +216,9 @@ class Model:
 
 
 class Table:
-    def __init__(self, bucket_w, seed0=0xffffffff, seed1=0xffffffff, max_depth=6):
-        self.h = lib.natgw_table_create(bucket_w, seed0, seed1, max_depth)
+    def __init__(self, bucket_w, seed0=0xffffffff, seed1=0xffffffff, max_depth=6, ddr=False):
+        create = lib.natgw_table_create_ddr if ddr else lib.natgw_table_create
+        self.h = create(bucket_w, seed0, seed1, max_depth)
         assert self.h
         self.max_ops = max_depth + 2
         self.ops = (Write * self.max_ops)()

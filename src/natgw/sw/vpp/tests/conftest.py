@@ -24,8 +24,8 @@ class Gateway:
     """VPP as the NAT gateway: NatgwModel0 = LAN, NatgwModel1/2 = WAN1/2, each
     lane's wire a namespace. The server address exists behind both WANs."""
 
-    def __init__(self, tag, bucket_w=10):
-        self.vpp = Vpp(name=f"ngw{tag}", bucket_w=bucket_w,
+    def __init__(self, tag, bucket_w=10, vdev_args=""):
+        self.vpp = Vpp(name=f"ngw{tag}", bucket_w=bucket_w, vdev_args=vdev_args,
                        offload_conf="enable active-packets 4 sync-interval 0.25")
         self.ns = []
         try:

@@ -548,6 +548,9 @@ struct model_args {
 	char tap_prefix[IFNAMSIZ];
 	bool punt_hdr;
 	bool manual_clock;
+	unsigned ddr_bucket_w;     /* 0: no DDR tier in the "bitstream" */
+	bool ddr_calib;            /* false: tier present, no working DIMM */
+	bool no_ddr;               /* flow layer told not to use the tier */
 };
 
 static int arg_uint(const char *key __rte_unused, const char *val, void *out)
@@ -597,7 +600,8 @@ static int arg_clock(const char *key __rte_unused, const char *val, void *out)
 	return 0;
 }
 
-static const char *const valid_args[] = {"lanes", "bucket_w", "wire", "tap_prefix", "punt_hdr", "clock", NULL};
+static const char *const valid_args[] = {"lanes", "bucket_w", "wire", "tap_prefix", "punt_hdr", "clock",
+					 "ddr_bucket_w", "ddr_calib", "no_ddr", NULL};
 
 static int parse_args(const char *params, struct model_args *a)
 {
@@ -610,6 +614,9 @@ static int parse_args(const char *params, struct model_args *a)
 	strlcpy(a->tap_prefix, "ngw", sizeof(a->tap_prefix));
 	a->punt_hdr = true;
 	a->manual_clock = false;
+	a->ddr_bucket_w = 0;
+	a->ddr_calib = true;
+	a->no_ddr = false;
 	if (!params || !*params)
 		return 0;
 	kv = rte_kvargs_parse(params, valid_args);
@@ -620,10 +627,14 @@ static int parse_args(const char *params, struct model_args *a)
 	    rte_kvargs_process(kv, "wire", arg_wire, &a->wire) < 0 ||
 	    rte_kvargs_process(kv, "tap_prefix", arg_str, a->tap_prefix) < 0 ||
 	    rte_kvargs_process(kv, "punt_hdr", arg_bool, &a->punt_hdr) < 0 ||
-	    rte_kvargs_process(kv, "clock", arg_clock, &a->manual_clock) < 0)
+	    rte_kvargs_process(kv, "clock", arg_clock, &a->manual_clock) < 0 ||
+	    rte_kvargs_process(kv, "ddr_bucket_w", arg_uint, &a->ddr_bucket_w) < 0 ||
+	    rte_kvargs_process(kv, "ddr_calib", arg_bool, &a->ddr_calib) < 0 ||
+	    rte_kvargs_process(kv, "no_ddr", arg_bool, &a->no_ddr) < 0)
 		ret = -EINVAL;
 	rte_kvargs_free(kv);
-	if (!ret && (a->lanes < 1 || a->lanes > NATGW_LANES || a->bucket_w < 2 || a->bucket_w > 18))
+	if (!ret && (a->lanes < 1 || a->lanes > NATGW_LANES || a->bucket_w < 2 || a->bucket_w > 18 ||
+		     (a->ddr_bucket_w && (a->ddr_bucket_w < 5 || a->ddr_bucket_w > 20))))
 		ret = -EINVAL;
 	return ret;
 }
@@ -668,7 +679,7 @@ static int model_probe(struct rte_vdev_device *vdev)
 	}
 
 	md->model = natgw_model_create(a.bucket_w);
-	if (!md->model) {
+	if (!md->model || (a.ddr_bucket_w && natgw_model_set_ddr(md->model, a.ddr_bucket_w, a.ddr_calib) != 0)) {
 		ret = -ENOMEM;
 		goto fail;
 	}
@@ -682,6 +693,7 @@ static int model_probe(struct rte_vdev_device *vdev)
 	fc.seed1 = 0xffffffff;
 	fc.max_depth = 6;
 	fc.punt_hdr = a.punt_hdr;
+	fc.no_ddr = a.no_ddr;
 	md->flow = natgw_flow_ctx_create(&io, &fc, rte_socket_id());
 	if (!md->flow) {
 		ret = -EIO;
@@ -794,7 +806,8 @@ static struct rte_vdev_driver natgw_model_drv = {
 
 RTE_PMD_REGISTER_VDEV(net_natgw_model, natgw_model_drv);
 RTE_PMD_REGISTER_PARAM_STRING(net_natgw_model,
-	"lanes=<1-8> bucket_w=<2-18> wire=queue|tap tap_prefix=<name> punt_hdr=0|1 clock=wall|manual");
+	"lanes=<1-8> bucket_w=<2-18> wire=queue|tap tap_prefix=<name> punt_hdr=0|1 clock=wall|manual "
+	"ddr_bucket_w=<5-20> ddr_calib=0|1 no_ddr=0|1");
 
 /* ------------------------------------------------------------------ */
 /* test API */

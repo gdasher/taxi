@@ -85,7 +85,7 @@ class Vpp:
     net_natgw_model device."""
 
     def __init__(self, name="natgwt", lanes=3, bucket_w=10, offload_conf="enable", extra_plugins=(),
-                 tap_prefix=None):
+                 tap_prefix=None, vdev_args=""):
         self.name = name
         self.dir = tempfile.mkdtemp(prefix=f"{name}-")
         os.chmod(self.dir, 0o755)
@@ -109,7 +109,7 @@ plugins {{
 }}
 dpdk {{
   no-pci
-  vdev net_natgw_model0,lanes={lanes},wire=tap,tap_prefix={self.tap_prefix},bucket_w={bucket_w}
+  vdev net_natgw_model0,lanes={lanes},wire=tap,tap_prefix={self.tap_prefix},bucket_w={bucket_w}{vdev_args}
 }}
 natgw-offload {{ {offload_conf} }}
 """

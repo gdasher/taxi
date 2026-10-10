@@ -14,6 +14,15 @@
  *
  * Every port of one device shares one context (one table in hardware); the
  * port a flow is created on is its ingress lane.
+ *
+ * Tiers: flows go to the on-chip table first. When it refuses one (full) and
+ * the bitstream has a DDR tier whose memory calibrated (a DIMM is fitted and
+ * working), the flow goes to the DDR table instead; without a usable DDR tier
+ * the create fails with ENOSPC as before. The DDR tier is cleared and enabled
+ * when the context is created. DDR flows have no hardware counters (a COUNT
+ * query returns hits_set = bytes_set = 0); their AGE comes from the activity
+ * bitmap, swept a budget of words per poll, so idle times are accurate to one
+ * sweep.
  */
 
 #ifndef NATGW_FLOW_H
@@ -37,6 +46,9 @@ struct natgw_flow_cfg {
 	uint32_t seed0, seed1;
 	unsigned max_depth;         /* cuckoo relocation search depth */
 	bool     punt_hdr;          /* ask the hardware for punt headers */
+	bool     no_ddr;            /* never place flows in a DDR tier */
+	unsigned ddr_scan_words;    /* activity words read per poll (0: 4096) */
+	unsigned ddr_clear_polls;   /* status reads waiting for the DDR clear (0: 50M) */
 };
 
 /* create a context over a device's register window; resets the NAT block */
@@ -74,11 +86,16 @@ int natgw_flow_xstats_get(struct natgw_flow_ctx *ctx, unsigned lane, struct rte_
 __rte_internal
 unsigned natgw_flow_xstats_count(void);
 
-/* number of offloaded flows, and table capacity */
+/* number of offloaded flows, and table capacity (both tiers) */
 __rte_internal
 unsigned natgw_flow_count(struct natgw_flow_ctx *ctx);
 __rte_internal
 unsigned natgw_flow_capacity(struct natgw_flow_ctx *ctx);
+/* flows in, and capacity of, the DDR tier (0 when it is not in use) */
+__rte_internal
+unsigned natgw_flow_ddr_count(struct natgw_flow_ctx *ctx);
+__rte_internal
+unsigned natgw_flow_ddr_capacity(struct natgw_flow_ctx *ctx);
 
 /* ------------------------------------------------------------------ */
 /* punt metadata on received mbufs */

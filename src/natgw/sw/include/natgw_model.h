@@ -38,6 +38,16 @@ struct natgw_model *natgw_model_create(unsigned bucket_w);
 NATGW_API
 void natgw_model_destroy(struct natgw_model *m);
 
+/*
+ * Give the model a DDR tier (DDR_STATUS present): 2 x 2^ddr_bucket_w lines of
+ * two entries, looked up after an on-chip miss while calibrated, enabled and
+ * not clearing. calibrated = false models a build with the tier but no
+ * working DIMM. Like real DDR the table starts with random contents until
+ * cleared. 0, or -EINVAL / -ENOMEM.
+ */
+NATGW_API
+int natgw_model_set_ddr(struct natgw_model *m, unsigned ddr_bucket_w, bool calibrated);
+
 /* register interface, for natgw_dev_init() */
 NATGW_API
 struct natgw_io natgw_model_io(struct natgw_model *m);

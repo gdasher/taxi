@@ -12,6 +12,7 @@
 #include "natgw_model.h"
 
 #define EVT_DEPTH 1024
+#define DDR_MAX_OUT 16
 
 struct natgw_model {
 	unsigned bucket_w, idx_w;
@@ -45,6 +46,15 @@ struct natgw_model {
 	/* statistics */
 	uint64_t stats[NATGW_LANES][NATGW_STAT_COUNT];
 	uint32_t stat_hi_shadow;
+
+	/* DDR tier (ddr_present) */
+	uint8_t  ddr_present, ddr_calib, ddr_en;
+	unsigned ddr_bucket_w;
+	uint32_t ddr_size;              /* entries */
+	struct natgw_entry *ddr_ent;
+	uint64_t *ddr_act;              /* activity bitmap, ddr_size / 64 words */
+	uint32_t act_data[2];
+	uint32_t ddr_lookups, ddr_hits;
 };
 
 static void model_reset_regs(struct natgw_model *m)
@@ -100,7 +110,61 @@ void natgw_model_destroy(struct natgw_model *m)
 		return;
 	free(m->ent);
 	free(m->st);
+	free(m->ddr_ent);
+	free(m->ddr_act);
 	free(m);
+}
+
+/* SplitMix64: fills the DDR table with junk, as after power-up */
+static uint64_t junk_next(uint64_t *x)
+{
+	uint64_t z = (*x += 0x9e3779b97f4a7c15ull);
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+	z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+	return z ^ (z >> 31);
+}
+
+int natgw_model_set_ddr(struct natgw_model *m, unsigned ddr_bucket_w, bool calibrated)
+{
+	uint64_t x = 0x5eed;
+
+	if (ddr_bucket_w < 5 || ddr_bucket_w > 23 || m->ddr_present)
+		return -EINVAL;
+	m->ddr_size = 4u << ddr_bucket_w;
+	m->ddr_ent = calloc(m->ddr_size, sizeof(*m->ddr_ent));
+	m->ddr_act = calloc(m->ddr_size / 64, sizeof(*m->ddr_act));
+	if (!m->ddr_ent || !m->ddr_act) {
+		free(m->ddr_ent);
+		free(m->ddr_act);
+		m->ddr_ent = NULL;
+		m->ddr_act = NULL;
+		return -ENOMEM;
+	}
+	for (uint32_t i = 0; i < m->ddr_size; i++) {
+		uint32_t w[NATGW_ENTRY_WORDS];
+		for (unsigned k = 0; k < NATGW_ENTRY_WORDS; k++)
+			w[k] = (uint32_t)junk_next(&x);
+		natgw_entry_unpack(w, &m->ddr_ent[i]);
+	}
+	for (uint32_t i = 0; i < m->ddr_size / 64; i++)
+		m->ddr_act[i] = junk_next(&x);
+	m->ddr_present = 1;
+	m->ddr_calib = calibrated;
+	m->ddr_bucket_w = ddr_bucket_w;
+	return 0;
+}
+
+static int ddr_active(const struct natgw_model *m)
+{
+	return m->ddr_present && m->ddr_calib && m->ddr_en;
+}
+
+static void ddr_clear(struct natgw_model *m)
+{
+	if (!m->ddr_calib)
+		return;     /* the clear engine's writes never complete; modelled as no-op */
+	memset(m->ddr_ent, 0, m->ddr_size * sizeof(*m->ddr_ent));
+	memset(m->ddr_act, 0, m->ddr_size / 64 * sizeof(*m->ddr_act));
 }
 
 /* ------------------------------------------------------------------ */
@@ -158,7 +222,7 @@ uint32_t natgw_model_rd(struct natgw_model *m, uint32_t off)
 
 	switch (off) {
 	case NATGW_REG_ID: return NATGW_ID;
-	case NATGW_REG_VERSION: return 0x00010000;
+	case NATGW_REG_VERSION: return 0x00010100;
 	case NATGW_REG_CAPS: return (16u << 16) | ((uint32_t)NATGW_LANES << 8) | m->idx_w;
 	case NATGW_REG_SCRATCH: return m->scratch;
 	case NATGW_REG_CTRL:
@@ -185,6 +249,18 @@ uint32_t natgw_model_rd(struct natgw_model *m, uint32_t off)
 		return v;
 	}
 	case NATGW_REG_EVT_DROPS: return m->evt_drops;
+	case NATGW_REG_DDR_STATUS:
+		if (!m->ddr_present)
+			return 0;
+		return ((uint32_t)DDR_MAX_OUT << 16) | ((uint32_t)m->ddr_bucket_w << 8) |
+		       (ddr_active(m) ? NATGW_DDR_ACTIVE : 0) | (m->ddr_en ? NATGW_DDR_ENABLED : 0) |
+		       (m->ddr_calib ? NATGW_DDR_CALIBRATED : 0) | NATGW_DDR_PRESENT;
+	case NATGW_REG_DDR_CTRL: return m->ddr_en;
+	case NATGW_REG_DDR_LOOKUPS: return m->ddr_lookups;
+	case NATGW_REG_DDR_HITS: return m->ddr_hits;
+	case NATGW_REG_DDR_SKIPS: return 0;     /* no request cap in the model */
+	case NATGW_REG_ACT_LO: return m->act_data[0];
+	case NATGW_REG_ACT_HI: return m->act_data[1];
 	default: return 0;
 	}
 }
@@ -192,9 +268,13 @@ uint32_t natgw_model_rd(struct natgw_model *m, uint32_t off)
 static void model_cmd(struct natgw_model *m, uint32_t cmd)
 {
 	uint32_t idx = m->index & (m->size - 1);
+	uint32_t didx = m->index & (m->ddr_size - 1);
 	struct natgw_entry e;
 
-	switch (cmd & 7) {
+	cmd &= 0xf;
+	if (cmd >= NATGW_CMD_DDR_WR && cmd <= NATGW_CMD_ACT_RC && !(m->ddr_present && m->ddr_calib))
+		return;     /* ignored without a DDR tier; without a DIMM, never completes */
+	switch (cmd) {
 	case NATGW_CMD_WR_ENT:
 		natgw_entry_unpack(m->ent_data, &e);
 		m->ent[idx] = e;
@@ -216,6 +296,22 @@ static void model_cmd(struct natgw_model *m, uint32_t cmd)
 		memset(&m->ent[idx], 0, sizeof(m->ent[idx]));
 		memset(&m->st[idx], 0, sizeof(m->st[idx]));
 		break;
+	case NATGW_CMD_DDR_WR:
+		natgw_entry_unpack(m->ent_data, &m->ddr_ent[didx]);
+		break;
+	case NATGW_CMD_DDR_CLR:
+		memset(&m->ddr_ent[didx], 0, sizeof(m->ddr_ent[didx]));
+		break;
+	case NATGW_CMD_DDR_RD:
+		natgw_entry_pack(&m->ddr_ent[didx], m->ent_data);
+		break;
+	case NATGW_CMD_ACT_RC: {
+		uint32_t w = m->index & (m->ddr_size / 64 - 1);
+		m->act_data[0] = (uint32_t)m->ddr_act[w];
+		m->act_data[1] = (uint32_t)(m->ddr_act[w] >> 32);
+		m->ddr_act[w] = 0;
+		break;
+	}
 	default:
 		break;
 	}
@@ -260,6 +356,11 @@ void natgw_model_wr(struct natgw_model *m, uint32_t off, uint32_t v)
 		m->scan_interval = (uint16_t)v;
 		break;
 	case NATGW_REG_BUBBLE: m->bubble = (uint16_t)v; break;
+	case NATGW_REG_DDR_CTRL:
+		m->ddr_en = v & 1;
+		if ((v & 2) && m->ddr_present)
+			ddr_clear(m);
+		break;
 	case NATGW_REG_INDEX: m->index = v; break;
 	case NATGW_REG_CMD: model_cmd(m, v); break;
 	case NATGW_REG_NH_INDEX: m->nh_index = v & (NATGW_NH_COUNT - 1); break;
@@ -470,6 +571,28 @@ static int model_lookup(const struct natgw_model *m, const struct natgw_key *k, 
 	return -ENOENT;
 }
 
+/* the DDR tier, after an on-chip miss: index {table, bucket, slot}, buckets from the top bits */
+static int model_lookup_ddr(struct natgw_model *m, const struct natgw_key *k, uint32_t *idx)
+{
+	unsigned bw = m->ddr_bucket_w;
+	uint32_t b0 = natgw_key_crc(k, m->seed0, NATGW_POLY_CRC32C) >> (32 - bw);
+	uint32_t b1 = natgw_key_crc(k, m->seed1, NATGW_POLY_CRC32) >> (32 - bw);
+
+	m->ddr_lookups++;
+	for (unsigned t = 0; t < 2; t++) {
+		for (unsigned s = 0; s < 2; s++) {
+			uint32_t i = ((uint32_t)t << (bw + 1)) | ((t ? b1 : b0) << 1) | s;
+			if (m->ddr_ent[i].valid && natgw_key_eq(&m->ddr_ent[i].key, k)) {
+				m->ddr_hits++;
+				m->ddr_act[i / 64] |= 1ull << (i % 64);
+				*idx = i;
+				return 0;
+			}
+		}
+	}
+	return -ENOENT;
+}
+
 static void count(struct natgw_model *m, unsigned lane, unsigned reason)
 {
 	m->stats[lane][reason]++;
@@ -481,7 +604,8 @@ int natgw_model_rx(struct natgw_model *m, unsigned lane, const uint8_t *frame, s
 	int bypass = !m->enable || ((m->bypass >> lane) & 1);
 	struct parsed p;
 	uint32_t idx = 0, h0 = 0;
-	int hit = 0;
+	int hit = 0, ddr_hit = 0;
+	const struct natgw_entry *e = NULL;
 	uint8_t reason;
 
 	if (lane >= NATGW_LANES || !out || !out->data)
@@ -503,9 +627,19 @@ int natgw_model_rx(struct natgw_model *m, unsigned lane, const uint8_t *frame, s
 	if (p.lookup) {
 		h0 = natgw_key_crc(&p.key, m->seed0, NATGW_POLY_CRC32C);
 		hit = model_lookup(m, &p.key, &idx) == 0;
+		if (hit) {
+			e = &m->ent[idx];
+		} else if (ddr_active(m) && model_lookup_ddr(m, &p.key, &idx) == 0) {
+			hit = ddr_hit = 1;
+			e = &m->ddr_ent[idx];
+		}
 	}
 
-	if (hit) {
+	if (ddr_hit) {
+		/* no per-entry state or events for the DDR tier: the activity bit only */
+		idx |= NATGW_DDR_IDX_FLAG;
+		out->hit_idx = idx;
+	} else if (hit) {
 		/* per-entry state: every looked-up hit updates it (natgw_state) */
 		struct natgw_state *s = &m->st[idx];
 		s->ts = m->tick;
@@ -523,7 +657,6 @@ int natgw_model_rx(struct natgw_model *m, unsigned lane, const uint8_t *frame, s
 
 	reason = p.reason;
 	if (reason == NATGW_RSN_MISS && hit) {
-		const struct natgw_entry *e = &m->ent[idx];
 		const struct natgw_nh *nh = &m->nh[e->nh_idx];
 		if (!nh->valid || !((m->egress_en >> nh->lane) & 1)) {
 			reason = NATGW_RSN_NH;
