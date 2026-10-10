@@ -20,6 +20,12 @@ being cleared):
     slot}), takes its next hop from a mirror of the next-hop table, and sets
     its bit in the activity bitmap (no DDR write on the packet path)
 
+Lines are compared as they arrive: each lane keeps the keys of its
+outstanding lookups (at most MAX_OUT, in issue order, which is also AXI's
+return order for the lane's ID), each returned line is compared against the
+lane's oldest key, and only the outcome (hit, DDR index, action: about 90
+bits) is kept per lane. No 512-bit line is buffered or muxed between lanes.
+
 Every result, needing DDR or not, passes through a per-lane in-order queue, so
 a hit or exception behind a pending DDR lookup waits for it. QUEUE_DEPTH must
 cover every result a lane can have in flight: the shim's metadata FIFO bounds
@@ -152,15 +158,14 @@ module natgw_ddr
 
 localparam LINE_W = DDR_BUCKET_W + 1;           // {table, bucket}
 localparam OUT_W = $clog2(MAX_OUT + 1);
-localparam RB_DEPTH = 2 * MAX_OUT;               // response beats per lane
-localparam RB_AW = $clog2(RB_DEPTH);
+localparam PK_AW = $clog2(MAX_OUT);              // per-lane outstanding keys
 localparam [AXI_ID_W-1:0] HOST_ID = AXI_ID_W'(8);
 
 if (AXI_ID_W < 4)
     $fatal(0, "Error: natgw_ddr needs AXI_ID_W >= 4 (instance %m)");
 if (DIDX_W < 7)
     $fatal(0, "Error: natgw_ddr needs at least 128 entries (instance %m)");
-if (RB_DEPTH != 2**RB_AW)
+if (MAX_OUT != 2**PK_AW || MAX_OUT < 2)
     $fatal(0, "Error: natgw_ddr MAX_OUT must be a power of two (instance %m)");
 
 function automatic logic [AXI_ADDR_W-1:0] line_addr(input logic [LINE_W-1:0] line);
@@ -179,11 +184,27 @@ assign clear_busy = clear_busy_reg || act_clear_busy;
 // enqueue: every result enters its lane's queue; misses issue DDR reads
 
 typedef struct packed {
-    logic                    ddr;    // waits for two DDR lines
-    logic [DDR_BUCKET_W-1:0] b1;     // table 1 bucket (from h1); table 0's is in res.hash
-    key_t                    key;
+    logic                    ddr;    // waits for its DDR outcome
     result_t                 res;
 } qe_t;
+
+// an outstanding DDR lookup: what each returned line is compared against
+typedef struct packed {
+    key_t                    key;
+    logic [DDR_BUCKET_W-1:0] b0;     // table 0 bucket (top of h0)
+    logic [DDR_BUCKET_W-1:0] b1;     // table 1 bucket (top of h1)
+} pk_t;
+
+// the outcome of one DDR lookup
+typedef struct packed {
+    logic                    hit;
+    logic [DIDX_W-1:0]       didx;   // {table, bucket, slot}
+    logic                    xlate_dst;
+    logic [31:0]             new_ip;
+    logic [15:0]             new_port;
+    logic                    dec_ttl;
+    logic [NH_IDX_W-1:0]     nh_idx;
+} dres_t;
 
 localparam QE_W = $bits(qe_t);
 
@@ -249,11 +270,13 @@ always_ff @(posedge clk) begin
 end
 
 qe_t q_in;
+pk_t pk_in;
 always_comb begin
     q_in.ddr = do_ddr;
-    q_in.b1 = s_h1[31 -: DDR_BUCKET_W];
-    q_in.key = s_key;
     q_in.res = s_res;
+    pk_in.key = s_key;
+    pk_in.b0 = s_res.hash[31 -: DDR_BUCKET_W];
+    pk_in.b1 = s_h1[31 -: DDR_BUCKET_W];
 end
 
 wire [LANES-1:0] q_m_valid;
@@ -261,11 +284,14 @@ qe_t q_m_data[LANES];
 logic [LANES-1:0] q_m_ready;
 wire [LANES-1:0] q_overflow;
 
-// response beats per lane: count and the head lookup's two lines
-logic [LANES-1:0] rb_pop;
-logic [RB_AW:0] rb_count[LANES];
-logic [511:0] rb_line0[LANES];
-logic [511:0] rb_line1[LANES];
+// per lane: outstanding keys (read by the compare) and finished outcomes
+logic [LANES-1:0] pk_pop;               // a lookup's second line was compared
+pk_t pk_head[LANES];
+logic [LANES-1:0] dr_push;
+dres_t dr_in;
+wire [LANES-1:0] dr_valid;
+dres_t dr_data[LANES];
+logic [LANES-1:0] dr_pop;
 
 for (genvar l = 0; l < LANES; l = l + 1) begin : lane
 
@@ -285,28 +311,45 @@ for (genvar l = 0; l < LANES; l = l + 1) begin : lane
         .overflow(q_overflow[l])
     );
 
-    // this lane's read data (AXI ID l), in order
-    logic [511:0] rb_mem[RB_DEPTH];
-    logic [RB_AW:0] rb_wr_ptr_reg = '0;
-    logic [RB_AW:0] rb_rd_ptr_reg = '0;
+    // keys of this lane's outstanding lookups, oldest first (at most MAX_OUT:
+    // the issue cap); the compare reads the oldest, so AXI's in-order return
+    // per ID pairs every line with its key
+    pk_t pk_mem[MAX_OUT];
+    logic [PK_AW-1:0] pk_wr_ptr_reg = '0;
+    logic [PK_AW-1:0] pk_rd_ptr_reg = '0;
 
     always_ff @(posedge clk) begin
-        if (m_axi_rvalid && m_axi_rid == AXI_ID_W'(l)) begin
-            rb_mem[rb_wr_ptr_reg[RB_AW-1:0]] <= m_axi_rdata;
-            rb_wr_ptr_reg <= rb_wr_ptr_reg + 1;
+        if (do_ddr && s_lane == LANE_W'(l)) begin
+            pk_mem[pk_wr_ptr_reg] <= pk_in;
+            pk_wr_ptr_reg <= pk_wr_ptr_reg + 1;
         end
-        if (rb_pop[l]) begin
-            rb_rd_ptr_reg <= rb_rd_ptr_reg + 2;
+        if (pk_pop[l]) begin
+            pk_rd_ptr_reg <= pk_rd_ptr_reg + 1;
         end
         if (rst) begin
-            rb_wr_ptr_reg <= '0;
-            rb_rd_ptr_reg <= '0;
+            pk_wr_ptr_reg <= '0;
+            pk_rd_ptr_reg <= '0;
         end
     end
 
-    assign rb_count[l] = rb_wr_ptr_reg - rb_rd_ptr_reg;
-    assign rb_line0[l] = rb_mem[rb_rd_ptr_reg[RB_AW-1:0]];
-    assign rb_line1[l] = rb_mem[RB_AW'(rb_rd_ptr_reg[RB_AW-1:0] + 1)];
+    assign pk_head[l] = pk_mem[pk_rd_ptr_reg];
+
+    // finished outcomes, in order (at most MAX_OUT: one per outstanding lookup)
+    natgw_fifo #(
+        .DATA_W($bits(dres_t)),
+        .DEPTH(MAX_OUT)
+    )
+    dr_inst (
+        .clk(clk),
+        .rst(rst),
+        .s_valid(dr_push[l]),
+        .s_ready(),
+        .s_data(dr_in),
+        .m_valid(dr_valid[l]),
+        .m_ready(dr_pop[l]),
+        .m_data(dr_data[l]),
+        .overflow()
+    );
 
 end
 
@@ -366,8 +409,8 @@ always_ff @(posedge clk) begin
 end
 
 // ---------------------------------------------------------------------------
-// AXI read data: lane IDs into the lane's response buffer, the host ID to the
-// host. Every lane has room for all its outstanding beats, so RREADY is 1.
+// AXI read data: lane lines are compared on arrival, the host ID goes to the
+// host. Every lane has room for all its outstanding outcomes, so RREADY is 1.
 
 logic host_rd_done_reg = 1'b0;
 entry_t host_rdata_reg = '0;
@@ -389,13 +432,121 @@ always_ff @(posedge clk) begin
     end
 end
 
+// compare on arrival
+//   r0: the beat (lane IDs only), with the two entries it holds
+//   r1: the lane's oldest key (read here, so a second line advances the key
+//       before the next beat of that lane reaches this stage)
+//   r2: compare both slots; on a lookup's second line, combine with the first
+//       line's outcome (table 0 wins, slot 0 before slot 1) and push it
+
+entry_t r0_slot0, r0_slot1;
+logic r0_valid_reg = 1'b0;
+logic [LANE_W-1:0] r0_lane_reg = '0;
+entry_t r0_slot0_reg = '0, r0_slot1_reg = '0;
+
+always_ff @(posedge clk) begin
+    r0_valid_reg <= m_axi_rvalid && m_axi_rid < AXI_ID_W'(LANES);
+    r0_lane_reg <= LANE_W'(m_axi_rid);
+    r0_slot0_reg <= entry_t'(m_axi_rdata[0 +: ENTRY_W]);
+    r0_slot1_reg <= entry_t'(m_axi_rdata[256 +: ENTRY_W]);
+    if (rst) begin
+        r0_valid_reg <= 1'b0;
+    end
+end
+
+// which line of its lookup each lane's next beat is
+logic [LANES-1:0] second_reg = '0;
+
+logic r1_valid_reg = 1'b0;
+logic [LANE_W-1:0] r1_lane_reg = '0;
+logic r1_second_reg = 1'b0;
+entry_t r1_slot0_reg = '0, r1_slot1_reg = '0;
+pk_t r1_pk_reg = '0;
+
+always_comb begin
+    pk_pop = '0;
+    for (int l = 0; l < LANES; l++) begin
+        pk_pop[l] = r0_valid_reg && r0_lane_reg == LANE_W'(l) && second_reg[l];
+    end
+end
+
+always_ff @(posedge clk) begin
+    pk_t pk;
+    pk = pk_head[0];
+    for (int l = 0; l < LANES; l++) begin
+        if (r0_lane_reg == LANE_W'(l)) begin
+            pk = pk_head[l];
+        end
+    end
+    r1_valid_reg <= r0_valid_reg;
+    r1_lane_reg <= r0_lane_reg;
+    r1_second_reg <= second_reg[r0_lane_reg];
+    r1_slot0_reg <= r0_slot0_reg;
+    r1_slot1_reg <= r0_slot1_reg;
+    r1_pk_reg <= pk;
+    if (r0_valid_reg) begin
+        second_reg[r0_lane_reg] <= !second_reg[r0_lane_reg];
+    end
+    if (rst) begin
+        r1_valid_reg <= 1'b0;
+        second_reg <= '0;
+    end
+end
+
+// first-line outcomes waiting for their second line, per lane
+dres_t first_reg[LANES];
+
+always_comb begin
+    logic h0, h1;
+    entry_t e;
+    dres_t d;
+    h0 = r1_slot0_reg.valid && r1_slot0_reg.key == r1_pk_reg.key;
+    h1 = r1_slot1_reg.valid && r1_slot1_reg.key == r1_pk_reg.key;
+    e = h0 ? r1_slot0_reg : r1_slot1_reg;
+    d.hit = h0 || h1;
+    d.didx = {r1_second_reg, r1_second_reg ? r1_pk_reg.b1 : r1_pk_reg.b0, !h0};
+    d.xlate_dst = e.xlate_dst;
+    d.new_ip = e.new_ip;
+    d.new_port = e.new_port;
+    d.dec_ttl = e.dec_ttl;
+    d.nh_idx = e.nh_idx;
+    // a table-0 hit wins over table 1
+    dr_in = first_reg[r1_lane_reg].hit ? first_reg[r1_lane_reg] : d;
+    dr_push = '0;
+    for (int l = 0; l < LANES; l++) begin
+        dr_push[l] = r1_valid_reg && r1_second_reg && r1_lane_reg == LANE_W'(l);
+    end
+end
+
+always_ff @(posedge clk) begin
+    logic h0, h1;
+    entry_t e;
+    h0 = r1_slot0_reg.valid && r1_slot0_reg.key == r1_pk_reg.key;
+    h1 = r1_slot1_reg.valid && r1_slot1_reg.key == r1_pk_reg.key;
+    e = h0 ? r1_slot0_reg : r1_slot1_reg;
+    if (r1_valid_reg && !r1_second_reg) begin
+        first_reg[r1_lane_reg].hit <= h0 || h1;
+        first_reg[r1_lane_reg].didx <= {1'b0, r1_pk_reg.b0, !h0};
+        first_reg[r1_lane_reg].xlate_dst <= e.xlate_dst;
+        first_reg[r1_lane_reg].new_ip <= e.new_ip;
+        first_reg[r1_lane_reg].new_port <= e.new_port;
+        first_reg[r1_lane_reg].dec_ttl <= e.dec_ttl;
+        first_reg[r1_lane_reg].nh_idx <= e.nh_idx;
+    end
+    if (rst) begin
+        for (int l = 0; l < LANES; l++) begin
+            first_reg[l].hit <= 1'b0;
+        end
+    end
+end
+
 // ---------------------------------------------------------------------------
 // merge: one lane per cycle, round robin among lanes whose head is ready
 
 logic [LANES-1:0] lane_ready;
 always_comb begin
     for (int l = 0; l < LANES; l++) begin
-        lane_ready[l] = q_m_valid[l] && (!q_m_data[l].ddr || rb_count[l] >= (RB_AW+1)'(2));
+        lane_ready[l] = q_m_valid[l] && (!q_m_data[l].ddr || dr_valid[l]);
     end
 end
 
@@ -424,61 +575,30 @@ end
 
 assign sel_valid = |lane_go;
 
-// the selected lane's head and lines (explicit compare and mux)
+// the selected lane's head and outcome (explicit compare and mux)
 qe_t sel_qe;
-logic [511:0] sel_line0, sel_line1;
+dres_t sel_dr;
 
 always_comb begin
     q_m_ready = '0;
-    rb_pop = '0;
+    dr_pop = '0;
     out_dec = '0;
     sel_qe = q_m_data[0];
-    sel_line0 = rb_line0[0];
-    sel_line1 = rb_line1[0];
+    sel_dr = dr_data[0];
     for (int l = 0; l < LANES; l++) begin
         if (sel_lane == LANE_W'(l)) begin
             sel_qe = q_m_data[l];
-            sel_line0 = rb_line0[l];
-            sel_line1 = rb_line1[l];
+            sel_dr = dr_data[l];
             if (sel_valid) begin
                 q_m_ready[l] = 1'b1;
-                rb_pop[l] = q_m_data[l].ddr;
+                dr_pop[l] = q_m_data[l].ddr;
                 out_dec[l] = q_m_data[l].ddr;
             end
         end
     end
 end
 
-// stage 1: the selected head and its two lines
-logic m1_valid_reg = 1'b0;
-logic [LANE_W-1:0] m1_lane_reg = '0;
-qe_t m1_qe_reg = '0;
-logic [511:0] m1_line0_reg = '0, m1_line1_reg = '0;
-
-always_ff @(posedge clk) begin
-    m1_valid_reg <= sel_valid;
-    m1_lane_reg <= sel_lane;
-    m1_qe_reg <= sel_qe;
-    m1_line0_reg <= sel_line0;
-    m1_line1_reg <= sel_line1;
-    if (sel_valid) begin
-        rr_reg <= sel_lane + 1;
-    end
-    if (rst) begin
-        m1_valid_reg <= 1'b0;
-        rr_reg <= '0;
-    end
-end
-
-// stage 2: compare the four candidates (b0 slots 0/1, b1 slots 0/1)
-entry_t cand[4];
-always_comb begin
-    cand[0] = entry_t'(m1_line0_reg[0 +: ENTRY_W]);
-    cand[1] = entry_t'(m1_line0_reg[256 +: ENTRY_W]);
-    cand[2] = entry_t'(m1_line1_reg[0 +: ENTRY_W]);
-    cand[3] = entry_t'(m1_line1_reg[256 +: ENTRY_W]);
-end
-
+// the selected result, with its DDR outcome applied
 logic m2_valid_reg = 1'b0;
 logic [LANE_W-1:0] m2_lane_reg = '0;
 result_t m2_res_reg = '0;
@@ -487,33 +607,26 @@ logic [DIDX_W-1:0] m2_didx_reg = '0;
 
 always_ff @(posedge clk) begin
     logic hit;
-    logic [1:0] sel;
-    hit = 1'b0;
-    sel = '0;
-    for (int c = 3; c >= 0; c--) begin
-        if (cand[c].valid && cand[c].key == m1_qe_reg.key) begin
-            hit = 1'b1;
-            sel = 2'(c);
-        end
-    end
-    hit = hit && m1_qe_reg.ddr;
-
-    m2_valid_reg <= m1_valid_reg;
-    m2_lane_reg <= m1_lane_reg;
-    m2_res_reg <= m1_qe_reg.res;
+    hit = sel_qe.ddr && sel_dr.hit;
+    m2_valid_reg <= sel_valid;
+    m2_lane_reg <= sel_lane;
+    m2_res_reg <= sel_qe.res;
     m2_dhit_reg <= hit;
-    // {table, bucket, slot}; the bucket is the line's address within its table
-    m2_didx_reg <= {sel[1], sel[1] ? m1_qe_reg.b1 : m1_qe_reg.res.hash[31 -: DDR_BUCKET_W], sel[0]};
+    m2_didx_reg <= sel_dr.didx;
     if (hit) begin
         m2_res_reg.hit <= 1'b1;
-        m2_res_reg.xlate_dst <= cand[sel].xlate_dst;
-        m2_res_reg.new_ip <= cand[sel].new_ip;
-        m2_res_reg.new_port <= cand[sel].new_port;
-        m2_res_reg.dec_ttl <= cand[sel].dec_ttl;
-        m2_res_reg.nh_idx <= cand[sel].nh_idx;
+        m2_res_reg.xlate_dst <= sel_dr.xlate_dst;
+        m2_res_reg.new_ip <= sel_dr.new_ip;
+        m2_res_reg.new_port <= sel_dr.new_port;
+        m2_res_reg.dec_ttl <= sel_dr.dec_ttl;
+        m2_res_reg.nh_idx <= sel_dr.nh_idx;
+    end
+    if (sel_valid) begin
+        rr_reg <= sel_lane + 1;
     end
     if (rst) begin
         m2_valid_reg <= 1'b0;
+        rr_reg <= '0;
     end
 end
 

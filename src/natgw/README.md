@@ -147,8 +147,10 @@ unchanged and every DDR register reads zero.
   same two hashes (the on-chip tier uses the low bits). Index =
   {table, bucket, slot}; line address = `DDR_BASE` + 64 x {table, bucket}.
 - **Lookup** (`natgw_ddr`). A miss that was looked up issues one 64-byte read
-  per table (ARID = lane, so results stay in order per lane) and the two
-  slots of each line are compared. A hit is reported with index
+  per table (ARID = lane, so results stay in order per lane). Each line is
+  compared as it arrives against the lane's oldest outstanding key (kept per
+  lane, in issue order), and only the outcome (about 90 bits) is kept, so no
+  512-bit line is buffered or muxed between lanes. A hit is reported with index
   `0x80000000 | ddr_idx` (punt header and statistics) and uses the same
   next-hop table. At most `DDR_MAX_OUT` lookups per lane are in flight; a
   miss beyond that is punted unlooked-up and counted as a skip.
