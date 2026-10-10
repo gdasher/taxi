@@ -130,7 +130,12 @@ natgw-offload {{ {offload_conf} }}
         sudo("rm", "-f", self.api_sock, self.cli_sock, check=False)
         self.proc = subprocess.Popen(["sudo", "-n"] + cmd, stdout=self._console,
                                      stderr=subprocess.STDOUT, text=True)
-        self._connect()
+        try:
+            self._connect()
+        except BaseException:
+            # no caller holds this instance yet: don't leave VPP running
+            self._halt()
+            raise
 
     def _connect(self, timeout=30):
         from vpp_papi import VPPApiClient
