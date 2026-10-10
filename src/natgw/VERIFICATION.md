@@ -308,7 +308,12 @@ without a DIMM).
   stage (commit `0cd6e71`; no 512-bit line buffers or 1024-bit merge) the
   same configuration routes in about 12 minutes with little congestion and
   meets timing with WNS +0.019 ns, WHS +0.008 ns (tightest: the 250 MHz
-  core, +0.019 ns, and MAC receive on lane 1, +0.021 ns).
+  core, +0.019 ns, and MAC receive on lane 1, +0.021 ns). With that stage
+  (and the read-error check, commit `7f04c97`), 256k on-chip entries plus
+  the tier also meet timing (`NAT_BUCKET_W=15`): WNS +0.011 ns, WHS +0.004 ns
+  (tightest: the 250 MHz core, +0.011 ns, and MAC receive on lane 4,
+  +0.013 ns); 171k LUTs, 336 URAM. Its synthesis peaked near this build
+  machine's memory (about 17 GB across Vivado's synthesis workers).
 - Timing closure of the 512k-entry build. Build results:
   - 128k entries (`NAT_BUCKET_W=14`, commit `1933cd5`): meets timing on
     every clock (WNS +0.015 ns, WHS +0.010 ns).
