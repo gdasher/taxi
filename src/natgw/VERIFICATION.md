@@ -294,16 +294,16 @@ without a DIMM).
 - DDR tier on hardware: memory calibration with the real RDIMM, DDR latency
   and the resulting lookup rate (the simulations use a behavioural memory).
   The system testbench runs without the tier.
-- Timing closure of the `fpga_AU200_nat_ddr` build (256k on-chip entries,
-  4M in DDR, first full build 2026-10-10): places and routes, but misses
-  timing after post-route phys_opt with WNS -0.234 ns, TNS -16.7 ns, 593
-  endpoints (hold met). Failing: Ethernet MAC receive logic on three lanes
-  (390 MHz, worst -0.234 ns, CRC/tuser paths with 2 ns of routing) and the
-  250 MHz core (-0.032 ns, cndm receive DMA). No DDR-tier path fails. The
-  router reported heavy congestion. The tier itself is small (natgw_ddr
-  10.4k LUTs, bitmap 16 URAM, controller 18k LUTs); the plain 256k build
-  closed with +0.005 ns, so the added logic is enough to tip it. Its
-  bitstream must not be used until timing is met.
+- Timing of the `fpga_AU200_nat_ddr` build. With 256k on-chip entries plus
+  the tier (first full build, 2026-10-10) it routes but misses: WNS -0.234 ns,
+  593 endpoints, in Ethernet MAC receive (390 MHz) and the 250 MHz core, with
+  heavy routing congestion; no DDR-tier path failed. With 128k on-chip
+  entries (now the variant's default) and 4M in DDR it **meets timing** (same
+  day, RTL of commit `ae12f94`): WNS 0.000 ns, TNS 0, WHS +0.006 ns after
+  post-route phys_opt; 169k LUTs, 176 URAM. The margin is zero, and routing
+  took about two hours through congestion, so the later compare-on-arrival
+  DDR stage (narrower datapath) is meant to add margin; it has not been
+  through a full build yet.
 - Timing closure of the 512k-entry build. Build results:
   - 128k entries (`NAT_BUCKET_W=14`, commit `1933cd5`): meets timing on
     every clock (WNS +0.015 ns, WHS +0.010 ns).
