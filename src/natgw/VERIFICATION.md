@@ -71,7 +71,7 @@ the property's main check can first fire, from the matching cover trace).
 | `ram` | 8 banks, PIPE 3/4/5 | P9.1–P9.2 | Bounded pass | 12 / 13 / 14 | – | across one mux level, with and without bank and output registers |
 | `ram` | 32 banks, PIPE 4/5/6 | P9.1–P9.2 | Bounded pass | 11 / 12 / 13 | – | across two mux levels |
 | `actmap` | `p2_bmc`, `p3_bmc` (RAM_PIPE 2, 3) | P10.1–P10.3 | Bounded pass | 21 | read-back of a word with bits 0 and 63 set by hits | hits on every cycle the producer may send, host read-and-clear and bulk clear interleaved, both ends of the forwarding window (DDR branch) |
-| `ddr` | `bmc` | P11.1–P11.5 | Bounded pass | 15 | a request-cap skip at 5; a DDR hit at 9 | two lanes of lookups against a free AXI memory (arbitrary stalls and data, in order per ID), calibration and enable toggling; covers several complete lookups per lane, the cap and a DDR hit (DDR branch) |
+| `ddr` | `bmc` | P11.1–P11.5 | Bounded pass | 16 | a request-cap skip at 5; a DDR hit at 9 | two lanes of lookups against a free AXI memory (arbitrary stalls and data, in order per ID), calibration and enable toggling; covers several complete lookups per lane, the cap and a DDR hit (DDR branch) |
 | all | `cover` | – | Pass | – | – | every harness reaches its checked scenarios |
 
 Note on the rewrite: the forwarded-frame properties (P3.3–P3.5: unchanged
@@ -195,7 +195,10 @@ tracked through a shadow queue:
 
 Both harnesses were checked against mutants: removing the bitmap's
 forwarding from the most recent write fails P10.1 at once, and ignoring the
-request cap fails P11.3 within three cycles.
+request cap fails P11.3 within three cycles. The bound for P11 is for the
+compare-on-arrival version of the DDR stage (lines compared against the
+lane's oldest key as they arrive): 16 cycles took 33 minutes (15 took 9), and
+the mutant above still fails.
 
 ### Defects found by formal verification
 
@@ -301,9 +304,11 @@ without a DIMM).
   entries (now the variant's default) and 4M in DDR it **meets timing** (same
   day, RTL of commit `ae12f94`): WNS 0.000 ns, TNS 0, WHS +0.006 ns after
   post-route phys_opt; 169k LUTs, 176 URAM. The margin is zero, and routing
-  took about two hours through congestion, so the later compare-on-arrival
-  DDR stage (narrower datapath) is meant to add margin; it has not been
-  through a full build yet.
+  took about two hours through congestion. With the compare-on-arrival DDR
+  stage (commit `0cd6e71`; no 512-bit line buffers or 1024-bit merge) the
+  same configuration routes in about 12 minutes with little congestion and
+  meets timing with WNS +0.019 ns, WHS +0.008 ns (tightest: the 250 MHz
+  core, +0.019 ns, and MAC receive on lane 1, +0.021 ns).
 - Timing closure of the 512k-entry build. Build results:
   - 128k entries (`NAT_BUCKET_W=14`, commit `1933cd5`): meets timing on
     every clock (WNS +0.015 ns, WHS +0.010 ns).
