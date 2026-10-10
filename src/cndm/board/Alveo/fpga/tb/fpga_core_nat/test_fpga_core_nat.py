@@ -27,7 +27,7 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, FallingEdge, Timer, with_timeout
 
-from cocotbext.axi import AxiStreamBus
+from cocotbext.axi import AxiBus, AxiRam, AxiStreamBus
 from cocotbext.eth import XgmiiFrame
 from cocotbext.uart import UartSource, UartSink
 from cocotbext.pcie.core import RootComplex
@@ -65,6 +65,23 @@ class TB:
 
         # Clocks
         cocotb.start_soon(Clock(dut.clk_125mhz, 8, units="ns").start())
+
+        # DDR tier: an AXI memory with random stalls on every channel (the
+        # board's clock converter and memory controller are not modelled)
+        self.ddr = int(dut.NAT_DDR.value)
+        dut.ddr_calib.setimmediatevalue(1 if self.ddr else 0)
+        if self.ddr:
+            self.ddr_ram = AxiRam(AxiBus.from_prefix(dut, "m_axi_ddr"), dut.pcie_clk, dut.pcie_rst, size=2**16)
+            for ifc in (self.ddr_ram.write_if, self.ddr_ram.read_if):
+                ifc.log.setLevel(logging.WARNING)
+            for i, ch in enumerate([self.ddr_ram.write_if.aw_channel, self.ddr_ram.write_if.w_channel,
+                                    self.ddr_ram.write_if.b_channel, self.ddr_ram.read_if.ar_channel,
+                                    self.ddr_ram.read_if.r_channel]):
+                ch.set_pause_generator(itertools.cycle([0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1][i:] + [0] * i))
+        else:
+            for n in ("awready", "wready", "bvalid", "arready", "rvalid", "bid", "bresp", "rid", "rdata",
+                      "rresp", "rlast"):
+                getattr(dut, f"m_axi_ddr_{n}").setimmediatevalue(0)
 
         # PCIe
         self.rc = RootComplex()
@@ -510,7 +527,12 @@ class NatHarness:
         caps = await self.regs.caps()
         tb.log.info("NAT caps: %s", caps)
         await self.regs.wait_clear()
-        self.model = nm.ShimModel(bucket_w=caps["idx_w"] - 3)
+        st = await self.regs.ddr_status()
+        self.ddr = st["present"] and st["calibrated"]
+        self.model = nm.ShimModel(bucket_w=caps["idx_w"] - 3, ddr_bucket_w=st["bucket_w"] if self.ddr else None)
+        if self.ddr:
+            await self.regs.ddr_clear(enable_after=True)
+            self.model.ddr_active = True
         m = self.model
         m.enable = True
         m.bypass_mask = 0
@@ -522,7 +544,7 @@ class NatHarness:
             await self.regs.write_nh(idx, nh)
         await self.regs.set_ctrl(True, punt_hdr=punt_hdr, bypass=0)
 
-    async def add_session(self, lan_ip, lan_port, rem_ip, rem_port, tcp, wan):
+    async def add_session(self, lan_ip, lan_port, rem_ip, rem_port, tcp, wan, tier="uram"):
         pub_ip = PUB_IP[wan]
         pub_port = 20000 + (self.seq % 30000)
         self.seq += 1
@@ -530,8 +552,18 @@ class NatHarness:
         in_key = nm.Key(WAN_LANES[wan], 0, tcp, rem_ip, pub_ip, rem_port, pub_port)
         for e in (nm.Entry(out_key, 0, pub_ip, pub_port, 1, NH_WAN[wan]),
                   nm.Entry(in_key, 1, lan_ip, lan_port, 1, NH_LAN)):
-            await self.regs.apply(self.model.table.insert(e))
+            if tier == "ddr":
+                await self.regs.apply_ddr(self.model.ddr.insert(e))
+            else:
+                await self.regs.apply(self.model.table.insert(e))
         return out_key, in_key
+
+    async def remove_session(self, keys, tier="uram"):
+        for k in keys:
+            if tier == "ddr":
+                await self.regs.apply_ddr(self.model.ddr.delete(k))
+            else:
+                await self.regs.apply(self.model.table.delete(k))
 
     def packet(self, key, flags='A', size=64, src_mac=LAN_HOST_MAC):
         self.seq += 1
@@ -551,16 +583,43 @@ async def recv_wire(tb, lane, timeout_us=200):
     return bytes(pkt.get_payload())
 
 
+async def function_level_reset(tb):
+    """pulse a function-level reset and wait for it to complete"""
+    dut = tb.dut
+    dut.cfg_flr_in_process.value = 1
+    for k in range(20000):
+        await RisingEdge(dut.pcie_clk)
+        if int(dut.cfg_flr_done.value) & 1:
+            break
+    else:
+        assert False, "cfg_flr_done never pulsed"
+    dut.cfg_flr_in_process.value = 0
+    for k in range(100):
+        await RisingEdge(dut.pcie_clk)
+
+
 async def init_all(dut):
     tb = TB(dut)
     dut.cfg_flr_in_process.setimmediatevalue(0)
     await tb.init()
+    # every test starts from a function-level reset, as a host does when it
+    # opens the device (vfio-pci resets it). The tests share one simulation;
+    # without the reset, re-initialising the driver's queues on the running
+    # NIC made it redeliver the previous test's last received frame with a
+    # 4096-byte length as the first frame (seen after run_test_nat)
+    await function_level_reset(tb)
     driver = cndm.Driver()
     await driver.init_pcie_dev(tb.rc.find_device(tb.dev.functions[0].pcie_id))
     for k in range(1200):
         await RisingEdge(tb.dut.clk_125mhz)
     for snk in tb.qsfp_sinks:
         snk.clear()
+    # tests share one simulation: frames an earlier test left in the NIC's
+    # receive path reach the new driver's queues; drop them
+    for port in driver.ports:
+        while not port.rx_queue.empty():
+            stale = port.rx_queue.get_nowait()
+            tb.log.info("dropped a frame left from an earlier test: %s", bytes(stale)[:16].hex())
     return tb, driver
 
 
@@ -678,6 +737,189 @@ async def run_test_nat(dut):
     await RisingEdge(dut.clk_125mhz)
 
 
+def describe(data):
+    """one line: punt header fields, then the frame's addresses and ports"""
+    hdr = ""
+    if data[:2] == b"NG":
+        hdr = f"punt reason {data[3]} lane {data[4]} flags {data[5]:#x} idx {int.from_bytes(data[12:16], 'big'):#x} | "
+        data = data[16:]
+    try:
+        e = Ether(data)
+        if IP in e:
+            l4 = e[TCP] if TCP in e else e[UDP] if UDP in e else None
+            ports = f" {l4.sport}->{l4.dport}" if l4 is not None else ""
+            return hdr + f"{e[IP].src}->{e[IP].dst}{ports} ttl {e[IP].ttl} len {len(data)}"
+        return hdr + f"type {e.type:#06x} len {len(data)}"
+    except Exception:
+        return hdr + f"raw {data[:16].hex()} len {len(data)}"
+
+
+def diff_report(tb, where, got, want):
+    from collections import Counter
+    g, w = Counter(got), Counter(want)
+    extra, missing = list((g - w).elements()), list((w - g).elements())
+    if extra or missing:
+        for d in extra[:4]:
+            tb.log.error("%s: unexpected  %s", where, describe(d))
+        for d in missing[:4]:
+            tb.log.error("%s: missing     %s", where, describe(d))
+    assert not extra and not missing, \
+        f"{where}: {len(extra)} unexpected and {len(missing)} missing of {len(want)} expected frames " \
+        f"(first unexpected: {describe(extra[0]) if extra else '-'}; first missing: " \
+        f"{describe(missing[0]) if missing else '-'})"
+
+
+async def exchange(tb, driver, nat, items):
+    """send (lane, frame) items, receive every expected output and compare
+    with the model per destination (outputs from different ingress lanes
+    may interleave at one egress lane)"""
+    m = nat.model
+    # Ethernet frames are at least 60 bytes (without FCS); the MACs pad
+    # shorter ones, so send them padded
+    items = [(lane, data.ljust(60, b"\0")) for lane, data in items]
+    want_wire = {lane: [] for lane in range(8)}
+    want_host = {lane: [] for lane in range(8)}
+    for lane, data in items:
+        exp = m.process(lane, data)
+        (want_wire if exp.kind == "fwd" else want_host)[exp.lane].append(exp.data)
+    for lane, data in items:
+        await tb.qsfp_sources[lane].send(XgmiiFrame.from_payload(data))
+    for lane in range(8):
+        got = [await recv_wire(tb, lane, timeout_us=2000) for _ in want_wire[lane]]
+        diff_report(tb, f"wire lane {lane}", got, want_wire[lane])
+        got = [await recv_port(driver, lane, timeout_us=2000) for _ in want_host[lane]]
+        diff_report(tb, f"host port {lane}", got, want_host[lane])
+    await Timer(5, 'us')
+    for lane in range(8):
+        assert tb.qsfp_sinks[lane].empty(), f"unexpected frame on wire lane {lane}"
+        assert driver.ports[lane].rx_queue.empty(), f"unexpected punt on port {lane}"
+    return sum(map(len, want_wire.values())), sum(map(len, want_host.values()))
+
+
+async def check_counters(nat):
+    m = nat.model
+    for lane in range(8):
+        for r in range(18):
+            assert await nat.regs.read_stat(lane, r) == m.stats.get((lane, r), 0), (lane, r)
+
+
+async def check_ddr_activity(nat):
+    words = (nat.model.ddr.size + 63) // 64
+    for w in range(words):
+        assert await nat.regs.read_activity(w) == nat.model.read_activity(w), f"activity word {w}"
+
+
+@cocotb.test()
+async def run_test_ddr(dut):
+    """DDR tier at system level: sessions in DDR forwarded wire to wire both
+    ways, a FIN on a DDR flow punted with the DDR hit index, activity bits and
+    DDR statistics as the model says."""
+    random.seed(13)
+    tb, driver = await init_all(dut)
+    if not tb.ddr:
+        tb.log.info("no DDR tier in this configuration")
+        return
+    nat = NatHarness(tb, driver)
+    await nat.setup(punt_hdr=True)
+    st = await nat.regs.ddr_status()
+    assert st["present"] and st["calibrated"] and st["active"], st
+    m = nat.model
+    sessions = []
+    for k in range(8):
+        tier = "ddr" if k % 2 == 0 else "uram"
+        sessions.append(await nat.add_session(0xc0a80200 + k, 41000 + k, 0x09090900 + k, 443, 1, k % 2, tier) +
+                        (tier,))
+    items = []
+    for out_key, in_key, tier in sessions:
+        wan = WAN_LANES.index(in_key.lane)
+        items.append((LAN_LANE, nat.packet(out_key)))
+        items.append((in_key.lane, nat.packet(in_key, src_mac=WAN_GW_MAC[wan])))
+    fwd, punt = await exchange(tb, driver, nat, items)
+    assert fwd == len(items) and punt == 0
+    out_key = sessions[0][0]
+    data = nat.packet(out_key, flags='FA')
+    exp = m.process(LAN_LANE, data)
+    assert exp.kind == "punt" and exp.hit_idx is not None and exp.hit_idx & nm.DDR_IDX_FLAG
+    await tb.qsfp_sources[LAN_LANE].send(XgmiiFrame.from_payload(data))
+    got = await recv_port(driver, LAN_LANE)
+    assert got == exp.data, describe(got)
+    assert int.from_bytes(got[12:16], "big") == exp.hit_idx
+    await check_counters(nat)
+    await check_ddr_activity(nat)
+    stats = await nat.regs.ddr_stats()
+    assert stats["hits"] > 0 and stats["skips"] == 0 and stats["read_errors"] == 0, stats
+
+
+@cocotb.test()
+async def run_test_soak(dut):
+    """Long random run against the model: sessions on chip (and in DDR when
+    the build has the tier) with table churn between bursts, mixed traffic on
+    all eight lanes (hits both ways, FIN/RST, SYN, TTL expiry, bad IP
+    checksums, non-IPv4, misses), every frame's outcome compared with the C
+    model, then every counter and the DDR activity bits."""
+    random.seed(14)
+    tb, driver = await init_all(dut)
+    nat = NatHarness(tb, driver)
+    await nat.setup(punt_hdr=True)
+    sessions = []
+
+    async def add(n):
+        for _ in range(n):
+            tier = "ddr" if nat.ddr and random.random() < 0.5 else "uram"
+            try:
+                o, i = await nat.add_session(0xc0a80000 | random.getrandbits(16), random.randrange(1024, 65536),
+                                             random.getrandbits(32), random.choice([53, 80, 123, 443]),
+                                             random.randint(0, 1), random.randint(0, 1), tier)
+            except nm.TableFull:
+                continue
+            sessions.append((o, i, tier))
+
+    def frame():
+        r = random.random()
+        o, i, tier = random.choice(sessions)
+        lan = random.random() < 0.5
+        key, lane, src = (o, LAN_LANE, LAN_HOST_MAC) if lan else (i, i.lane, WAN_GW_MAC[WAN_LANES.index(i.lane)])
+        if r < 0.55:
+            flags = random.choice(['A'] * 8 + ['PA', 'FA', 'R']) if key.tcp else 'A'
+            return lane, nat.packet(key, flags=flags, size=random.randint(0, 200), src_mac=src)
+        if r < 0.62 and key.tcp:
+            return lane, nat.packet(key, flags='S', src_mac=src)
+        if r < 0.70:
+            d = bytearray(nat.packet(key, src_mac=src))
+            d[14 + 8] = 1                      # TTL 1 (checksum left stale: a checksum punt or TTL)
+            return lane, bytes(d)
+        if r < 0.78:
+            d = bytearray(nat.packet(key, src_mac=src))
+            d[14 + 10] ^= 0x5a                 # bad IP header checksum
+            return lane, bytes(d)
+        if r < 0.84:
+            return random.randrange(8), bytes(Ether(dst=mac_str(GW_MAC), src=mac_str(src), type=0x0806) /
+                                              Raw(bytes(random.getrandbits(8) for _ in range(46))))
+        miss = nm.Key(random.randrange(8), 0, random.randint(0, 1), random.getrandbits(32), random.getrandbits(32),
+                      random.getrandbits(16), random.getrandbits(16))
+        return miss.lane, nat.packet(miss, size=random.randint(0, 100))
+
+    await add(40)
+    fwd = punt = 0
+    for burst in range(6):
+        items = [frame() for _ in range(150)]
+        f, p = await exchange(tb, driver, nat, items)
+        fwd += f
+        punt += p
+        # churn: retire some sessions, add new ones (relocations included)
+        for o, i, tier in random.sample(sessions, 5):
+            await nat.remove_session((o, i), tier)
+            sessions.remove((o, i, tier))
+        await add(8)
+        tb.log.info("burst %d: %d forwarded, %d punted; %d sessions", burst, f, p, len(sessions))
+    assert fwd > 300 and punt > 150
+    await check_counters(nat)
+    if nat.ddr:
+        await check_ddr_activity(nat)
+        stats = await nat.regs.ddr_stats()
+        assert stats["skips"] == 0 and stats["read_errors"] == 0, stats
+
+
 @cocotb.test()
 async def run_test_flr(dut):
     """Function-level reset: core and shim reset, tables cleared, lanes back in bypass, driver re-initializes."""
@@ -754,8 +996,9 @@ def process_f_files(files):
     return list(lst.values())
 
 
+@pytest.mark.parametrize("ddr", [0, 1])
 @pytest.mark.parametrize("mac_data_w", [64])
-def test_fpga_core_nat(request, mac_data_w):
+def test_fpga_core_nat(request, mac_data_w, ddr):
     dut = "fpga_core_nat"
     module = os.path.splitext(os.path.basename(__file__))[0]
     toplevel = module
@@ -812,6 +1055,8 @@ def test_fpga_core_nat(request, mac_data_w):
     parameters['NAT_BUCKET_W'] = 8
     parameters['NAT_RAM_PIPE'] = 3
     parameters['NAT_TICK_DIV'] = 64
+    parameters['NAT_DDR'] = ddr
+    parameters['NAT_DDR_BUCKET_W'] = 6
 
     extra_env = {f'PARAM_{k}': str(v) for k, v in parameters.items()}
 

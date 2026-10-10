@@ -6,7 +6,8 @@ Design plan: "NAT Gateway FPGA Design Plan" (reviewed and approved 2026-10-07).
 All shim logic runs on one clock, `clk` = `pcie_clk` (250 MHz), with 128-bit
 AXI-Stream per lane. Byte 0 of a frame is `tdata[7:0]` of its first beat.
 Frames carry no FCS. `natgw_pkg.sv` holds every shared type; `tb/natgw_model.py`
-mirrors it bit for bit and is the scoreboard for all tests.
+mirrors its layouts bit for bit and, through the C software model
+(`sw/model`), is the scoreboard for all tests (see VERIFICATION.md).
 
 ## Block interfaces
 

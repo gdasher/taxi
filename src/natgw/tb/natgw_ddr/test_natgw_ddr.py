@@ -14,6 +14,7 @@ reference model's DdrTable.
 
 import itertools
 import logging
+from collections import deque
 import os
 import random
 import sys
@@ -27,10 +28,12 @@ from cocotb.triggers import ReadOnly, RisingEdge
 from cocotbext.axi import AxiBus, AxiRam
 
 try:
+    import natgw_cov as cov
     import natgw_model as nm
 except ImportError:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
     try:
+        import natgw_cov as cov
         import natgw_model as nm
     finally:
         del sys.path[0]
@@ -83,6 +86,12 @@ class TB:
         self.table = nm.DdrTable(self.bucket_w, SEED0, SEED1)
         self.nh = {}
         self.out = {l: [] for l in range(8)}
+        # request-cap tracking (see _monitor)
+        self.kinds = {l: deque() for l in range(8)}   # per lane, in order: was the result a DDR lookup
+        self.outst = [0] * 8                          # DDR lookups issued and not yet out, per lane
+        self.issued = 0
+        self.pend = None                              # last cycle's DDR-eligible input
+        self.cap_checks = {"lookup": 0, "skip": 0}
         self.stats = {"lookup": 0, "hit": 0, "skip": 0, "overflow": 0, "lane_ar": 0,
                       "rerr": 0, "rerr_lane": 0, "rerr_host": 0}
         cocotb.start_soon(self._monitor())
@@ -125,13 +134,56 @@ class TB:
                        self.ram.read_if.r_channel]:
                 ch.clear_pause_generator()
 
+    # A DDR-eligible miss (looked up, on-chip miss, tier active) is looked up
+    # exactly when its lane has fewer than MAX_OUT lookups outstanding and the
+    # shared request queue (16) has room; otherwise it is skipped. The monitor
+    # counts outstanding lookups from what it sees (issued, minus DDR results
+    # out). The DUT frees a slot when the result leaves its queue, at most
+    # CAP_SLACK cycles (results) before the result appears here, so: a skip
+    # needs our count >= MAX_OUT (or the queue full), and a lookup needs our
+    # count - CAP_SLACK < MAX_OUT.
+    CAP_SLACK = 3
+    ARQ_DEPTH = 16
+
     async def _monitor(self):
         dut = self.dut
         while True:
             await RisingEdge(dut.clk)
             await ReadOnly()
             if dut.m_valid.value:
-                self.out[int(dut.m_lane.value)].append(unpack(RES_FIELDS, int(dut.m_res.value)))
+                lane = int(dut.m_lane.value)
+                self.out[lane].append(unpack(RES_FIELDS, int(dut.m_res.value)))
+                if self.kinds[lane] and self.kinds[lane].popleft():
+                    self.outst[lane] -= 1
+            # last cycle's eligible input: its decision is visible now
+            if self.pend is not None:
+                lane, outst, occ = self.pend
+                looked, skipped = int(dut.stat_lookup.value), int(dut.stat_skip.value)
+                assert looked + skipped == 1, "an eligible miss neither looked up nor skipped"
+                cov.hit("ddr event", "lookup" if looked else "skip")
+                if outst >= self.max_out:
+                    cov.hit("ddr event", "cap reached")
+                if looked:
+                    assert outst - self.CAP_SLACK < self.max_out, \
+                        f"lane {lane}: looked up with {outst} outstanding (cap {self.max_out})"
+                    self.outst[lane] += 1
+                    self.issued += 1
+                    self.cap_checks["lookup"] += 1
+                else:
+                    assert outst >= self.max_out or occ >= self.ARQ_DEPTH - 1, \
+                        f"lane {lane}: skipped with only {outst} outstanding, request queue {occ}"
+                    self.cap_checks["skip"] += 1
+                self.kinds[lane].append(bool(looked))
+                self.pend = None
+            # this cycle's input
+            if dut.s_valid.value:
+                lane = int(dut.s_lane.value)
+                eligible = (dut.s_lookup.value and not (int(dut.s_res.value) & 1) and dut.ddr_active.value)
+                if eligible:
+                    occ = self.issued - self.stats["lane_ar"] // 2
+                    self.pend = (lane, self.outst[lane], occ)
+                else:
+                    self.kinds[lane].append(False)
             self.stats["lookup"] += int(dut.stat_lookup.value)
             self.stats["hit"] += int(dut.stat_hit.value)
             self.stats["skip"] += int(dut.stat_skip.value)
@@ -140,7 +192,9 @@ class TB:
                 self.stats["lane_ar"] += 1
             self.stats["rerr"] += int(dut.stat_rerr.value)
             if dut.m_axi_rvalid.value and dut.m_axi_rready.value and dut.rresp_err.value:
-                self.stats["rerr_lane" if int(dut.m_axi_rid.value) < 8 else "rerr_host"] += 1
+                lane_beat = int(dut.m_axi_rid.value) < 8
+                self.stats["rerr_lane" if lane_beat else "rerr_host"] += 1
+                cov.hit("ddr event", "read error, lane" if lane_beat else "read error, host")
 
     def inject_errors(self, prob, seed=0):
         """force SLVERR on each cycle's read data with probability prob"""
@@ -311,6 +365,8 @@ def check(tb, expect, allow_skips, err_misses=0):
             idx, e = tb.table.lookup(key)
             if e is not None and g["hit"]:
                 hits += 1
+                t, _, sl = tb.table.split_idx(idx)
+                cov.hit("hit slot", "ddr", t, sl)
                 nh = tb.nh[e.nh_idx]
                 want.update(hit=1, idx=FLAG | idx, xlate_dst=e.xlate_dst, new_ip=e.new_ip, new_port=e.new_port,
                             dec_ttl=e.dec_ttl, nh_idx=e.nh_idx, nh=nh.pack())

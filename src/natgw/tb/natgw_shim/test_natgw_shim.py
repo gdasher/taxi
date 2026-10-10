@@ -572,7 +572,7 @@ async def run_test_events(dut):
     await tb.regs.wr(0x0030, 1 << 30)
     live = udp_sessions[0]
     idle_idx = {tb.model.table.lookup(k)[0] for s in udp_sessions[1:] for k in s[:2]}
-    seen = set()
+    seen = {}
     for _ in range(200):
         tb.begin()
         await tb.send(LAN_LANE, tb.flow_packet(live[0], LAN_LANE))
@@ -582,14 +582,98 @@ async def run_test_events(dut):
             e = await tb.regs.pop_event()
             if e is None:
                 break
-            t, i, _ = e
+            t, i, tick = e
             assert t == nm.EVT_IDLE, e
             assert i not in seen, f"idle event repeated for {i}"
-            seen.add(i)
-        if seen >= idle_idx:
+            seen[i] = tick
+        if set(seen) >= idle_idx:
             break
         await Timer(1, 'us')
-    assert seen == idle_idx, (seen, idle_idx)
+    assert set(seen) == idle_idx, (set(seen), idle_idx)
+
+    # timing: an entry is reported once it has been idle longer than the
+    # threshold, by the scanner's next visit, so within one full pass (every
+    # entry, one per SCAN interval cycles, in ticks of TICK_DIV cycles)
+    thresh = 80
+    interval = await tb.regs.rd(0x0038) & 0xffff
+    tick_div = await tb.regs.rd(0x0028)
+    size = 8 << tb.bucket_w
+    pass_ticks = -(-size * interval // tick_div)
+    for i, tick in seen.items():
+        ts = (await tb.regs.read_state(i)).ts
+        idle_for = (tick - ts) & 0xffffffff
+        assert thresh < idle_for <= thresh + pass_ticks + 1, \
+            f"entry {i}: idle event after {idle_for} ticks (threshold {thresh}, scan pass {pass_ticks})"
+
+
+@cocotb.test()
+async def run_test_corners(dut):
+    """Every outcome on every lane, tagged and untagged: on each lane a
+    forwarding session (and a FIN on it), a session whose next hop is invalid,
+    VLAN mismatches both ways (untagged frame to a tagging next hop, tagged
+    frame to an untagged one), a tagged forwarding session, and tagged
+    multicast and malformed-header frames; every outcome against the model."""
+    tb = TB(dut)
+    random.seed(15)
+    await tb.reset()
+    await tb.setup_gateway()
+    m = tb.model
+    NH_PLAIN, NH_BAD, NH_TAG = 10, 20, 30
+    for lane in range(LANES):
+        m.nh[NH_PLAIN + lane] = nm.NextHop(dst_mac=0x020000004400 + lane, src_mac=GW_MAC, lane=lane)
+        m.nh[NH_TAG + lane] = nm.NextHop(dst_mac=0x020000005500 + lane, src_mac=GW_MAC, lane=lane, vlan=1,
+                                         vid=200 + lane)
+    m.nh[NH_BAD] = nm.NextHop(dst_mac=0x020000006600, src_mac=GW_MAC, lane=3, valid=0)
+    for idx in [NH_BAD] + [NH_PLAIN + l for l in range(LANES)] + [NH_TAG + l for l in range(LANES)]:
+        await tb.regs.write_nh(idx, m.nh[idx])
+
+    def key(lane, vid=0, tcp=1):
+        return nm.Key(lane=lane, vid=vid, tcp=tcp, sip=random_ip(), dip=random_ip(), sport=random.randint(1, 65535),
+                      dport=random.randint(1, 65535))
+
+    def tagged(k, flags='A'):
+        l4 = TCP(sport=k.sport, dport=k.dport, flags=flags) if k.tcp else UDP(sport=k.sport, dport=k.dport)
+        return bytes(Ether(dst=mac_str(GW_MAC), src=mac_str(LAN_HOST_MAC)) / Dot1Q(vlan=k.vid) /
+                     IP(src=ip_str(k.sip), dst=ip_str(k.dip), ttl=64) / l4 / Raw(tb.next_payload(k.lane, 40)))
+
+    async def install(k, nh):
+        e = nm.Entry(key=k, xlate_dst=random.randint(0, 1), new_ip=random_ip(), new_port=random.randint(1, 65535),
+                     dec_ttl=random.randint(0, 1), nh_idx=nh)
+        await tb.regs.apply(m.table.insert(e))
+
+    sends = []
+    for lane in range(LANES):
+        nxt = (lane + 1) % LANES
+        k = key(lane)
+        await install(k, NH_PLAIN + nxt)
+        sends += [(lane, tb.flow_packet(k, lane)), (lane, tb.flow_packet(k, lane, flags='FA'))]
+        k = key(lane, tcp=0)
+        await install(k, NH_BAD)
+        sends.append((lane, tb.flow_packet(k, lane)))
+        k = key(lane)
+        await install(k, NH_TAG + nxt)                      # untagged frame, tagging next hop
+        sends.append((lane, tb.flow_packet(k, lane)))
+        k = key(lane, vid=100 + lane)
+        await install(k, NH_TAG + nxt)                      # tagged, forwarded with the next hop's VID
+        sends += [(lane, tagged(k)), (lane, tagged(k, flags='R'))]
+        k = key(lane, vid=110 + lane, tcp=0)
+        await install(k, NH_PLAIN + nxt)                    # tagged frame, untagged next hop
+        sends.append((lane, tagged(k)))
+        sends.append((lane, bytes(Ether(dst="01:00:5e:00:00:fb", src=mac_str(LAN_HOST_MAC)) / Dot1Q(vlan=5) /
+                                  IP(src="192.168.1.10", dst="224.0.0.251") / UDP(sport=5353, dport=5353) /
+                                  Raw(tb.next_payload(lane, 16)))))
+        sends.append((lane, bytes(Ether(dst=mac_str(GW_MAC), src=mac_str(LAN_HOST_MAC)) / Dot1Q(vlan=5) /
+                                  IP(src="192.168.1.10", dst="8.8.8.8", options=b'\x01\x01\x01\x00') / UDP() /
+                                  Raw(tb.next_payload(lane, 16)))))
+    tb.begin()
+    for lane, data in sends:
+        await tb.send(lane, data)
+    await tb.collect()
+    await tb.check_stats()
+    want = {nm.RSN_FWD, nm.RSN_FINRST, nm.RSN_NH, nm.RSN_VLAN, nm.RSN_MCAST, nm.RSN_IP_HDR}
+    for lane in range(LANES):
+        seen = {r for (l, r) in m.stats if l == lane}
+        assert want <= seen, f"lane {lane}: outcomes {sorted(want - seen)} not exercised"
 
 
 # ------------------------------------------------------------------ DDR tier

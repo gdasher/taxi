@@ -291,6 +291,16 @@ struct natgw_write {
 struct natgw_table;
 
 struct natgw_table *natgw_table_create(unsigned bucket_w, uint32_t seed0, uint32_t seed1, unsigned max_depth);
+/* the candidate slots of a key in hardware lookup order (table 0's bucket,
+ * then table 1's): returns the count (8 on chip, 4 in DDR) */
+unsigned natgw_table_candidates(const struct natgw_table *t, const struct natgw_key *k, uint32_t c[8]);
+
+/* one's complement sum of big-endian 16-bit words (n even), folded */
+uint16_t natgw_oc_sum16(const uint8_t *d, size_t n);
+/* RFC 1624 eqn. 3 for three changed words, the arithmetic of natgw_pkg::csum_update3 */
+uint16_t natgw_csum_update3(uint16_t hc, uint16_t m0, uint16_t n0, uint16_t m1, uint16_t n1, uint16_t m2,
+			    uint16_t n2);
+
 /* the DDR tier's table: two slots per bucket, buckets from the top hash bits */
 struct natgw_table *natgw_table_create_ddr(unsigned bucket_w, uint32_t seed0, uint32_t seed1, unsigned max_depth);
 void natgw_table_destroy(struct natgw_table *t);

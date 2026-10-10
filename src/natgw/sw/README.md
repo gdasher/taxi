@@ -1,8 +1,9 @@
 # natgw host software
 
 Everything on the host side of the natgw shim, from register access up to VPP.
-Each layer is tested against a software model of the FPGA, and that model is
-checked against the RTL's own scoreboard.
+Each layer is tested against the C software model of the FPGA. The same model
+is the RTL testbenches' scoreboard, and the RTL shim and system testbenches
+program the simulated hardware through libnatgw itself.
 
 For wiring, addresses and a ready-to-adapt VPP configuration, see the [natgw wiring diagram and config template](https://claude.ai/artifact/ND6dAJem8HD2SyUbQYS8a2).
 
@@ -52,7 +53,7 @@ The second option matters for shared builds. A shared DPDK autoloads every mempo
 
 | Suite | Command | Covers |
 | --- | --- | --- |
-| libnatgw and C model | `make test` (`tests/test_{layout,table,model,dev,ddr}.py`) | <ul><li>Layouts and hashes are bit-exact with the Python model.</li><li>Cuckoo placement matches the Python model write for write, and stays relocation-safe after every write, for both the on-chip and the DDR table geometry.</li><li>The C model matches the Python ShimModel byte for byte, also with flows split between the two tiers.</li><li>Registers, events, aging and overflow; DDR status when absent, present without a DIMM and working; DDR entry access, clear and the activity bitmap.</li></ul> |
+| libnatgw and C model | `make test` (`tests/test_{layout,table,model,dev,ddr}.py`) | <ul><li>Layouts are bit-exact with the Python data types; hashes match the CRC written out from the spec.</li><li>Cuckoo placement stays relocation-safe after every write, for both the on-chip and the DDR table geometry.</li><li>The C model's forwarded frames, decoded with scapy, carry exactly the rewrite of the entry and next hop that hit (addresses, ports, MACs, VLAN, TTL, valid checksums), also with flows split between the two tiers; punts are unchanged; every punt reason is reachable.</li><li>Registers, events, aging and overflow; DDR status when absent, present without a DIMM and working; DDR entry access, clear and the activity bitmap.</li></ul> |
 | DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li><li>DDR tier: spill to DDR once on-chip is full, DDR punts carry the DDR index flag, no counters for DDR flows, DDR aging from the activity bitmap; with no DIMM or `no_ddr=1`, ENOSPC at on-chip capacity and no DDR lookups.</li><li>Tier policy: admission at the high-water mark and bulk flows to DDR; idle flows demoted and busy DDR flows promoted, with a probe frame run through the model after every single table command forwarding unchanged throughout; no ping-pong once settled; counters monotonic across demote and promote; `fill` ignores the watermark.</li></ul> |
 | VPP integration | `pytest vpp/tests` (VPP and passwordless sudo; skipped otherwise) | Kernel TCP/UDP from namespaces on the model's TAP lanes, through VPP and the model. See below. |
 | WAN manager | `pytest wanmgr/tests` | <ul><li>Unit tests against a fake VPP that models routing and NAT for probes: thresholds, flapping, target fallback, steering, flushing, lease changes, restarts, alert rate limiting and SMTP.</li><li>Integration tests with real VPP, the offload plugin, dnsmasq "modems" and an SMTP sink: startup, an ISP outage, all WANs down, and a VPP restart.</li></ul> |

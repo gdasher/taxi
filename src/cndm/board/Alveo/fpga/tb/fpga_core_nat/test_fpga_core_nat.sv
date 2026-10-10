@@ -62,6 +62,8 @@ module test_fpga_core_nat #
     parameter NAT_BUCKET_W = 8,
     parameter NAT_RAM_PIPE = 3,
     parameter NAT_TICK_DIV = 64,
+    parameter NAT_DDR = 0,
+    parameter NAT_DDR_BUCKET_W = 6,
 
     // MAC configuration
     parameter logic CFG_LOW_LATENCY = 1'b1,
@@ -195,6 +197,38 @@ logic [3:0]  qspi_dq_o;
 logic [3:0]  qspi_dq_oe;
 logic        qspi_cs;
 
+// DDR tier (pcie_clk domain)
+logic [3:0]    m_axi_ddr_awid;
+logic [33:0]   m_axi_ddr_awaddr;
+logic [7:0]    m_axi_ddr_awlen;
+logic [2:0]    m_axi_ddr_awsize;
+logic [1:0]    m_axi_ddr_awburst;
+logic          m_axi_ddr_awvalid;
+logic          m_axi_ddr_awready;
+logic [511:0]  m_axi_ddr_wdata;
+logic [63:0]   m_axi_ddr_wstrb;
+logic          m_axi_ddr_wlast;
+logic          m_axi_ddr_wvalid;
+logic          m_axi_ddr_wready;
+logic [3:0]    m_axi_ddr_bid;
+logic [1:0]    m_axi_ddr_bresp;
+logic          m_axi_ddr_bvalid;
+logic          m_axi_ddr_bready;
+logic [3:0]    m_axi_ddr_arid;
+logic [33:0]   m_axi_ddr_araddr;
+logic [7:0]    m_axi_ddr_arlen;
+logic [2:0]    m_axi_ddr_arsize;
+logic [1:0]    m_axi_ddr_arburst;
+logic          m_axi_ddr_arvalid;
+logic          m_axi_ddr_arready;
+logic [3:0]    m_axi_ddr_rid;
+logic [511:0]  m_axi_ddr_rdata;
+logic [1:0]    m_axi_ddr_rresp;
+logic          m_axi_ddr_rlast;
+logic          m_axi_ddr_rvalid;
+logic          m_axi_ddr_rready;
+logic          ddr_calib;
+
 fpga_core_nat #(
     .SIM(SIM),
     .VENDOR(VENDOR),
@@ -240,7 +274,11 @@ fpga_core_nat #(
     // NAT shim
     .NAT_BUCKET_W(NAT_BUCKET_W),
     .NAT_RAM_PIPE(NAT_RAM_PIPE),
-    .NAT_TICK_DIV(NAT_TICK_DIV)
+    .NAT_TICK_DIV(NAT_TICK_DIV),
+    .NAT_DDR(NAT_DDR),
+    .NAT_DDR_BUCKET_W(NAT_DDR_BUCKET_W),
+    .NAT_DDR_AXI_ADDR_W(34),
+    .NAT_DDR_AXI_ID_W(4)
 )
 uut (
     /*
@@ -359,37 +397,37 @@ uut (
     .qspi_dq_oe(qspi_dq_oe),
     .qspi_cs(qspi_cs),
 
-    // no DDR tier in this testbench
-    .m_axi_ddr_awid(),
-    .m_axi_ddr_awaddr(),
-    .m_axi_ddr_awlen(),
-    .m_axi_ddr_awsize(),
-    .m_axi_ddr_awburst(),
-    .m_axi_ddr_awvalid(),
-    .m_axi_ddr_awready('0),
-    .m_axi_ddr_wdata(),
-    .m_axi_ddr_wstrb(),
-    .m_axi_ddr_wlast(),
-    .m_axi_ddr_wvalid(),
-    .m_axi_ddr_wready('0),
-    .m_axi_ddr_bid('0),
-    .m_axi_ddr_bresp('0),
-    .m_axi_ddr_bvalid('0),
-    .m_axi_ddr_bready(),
-    .m_axi_ddr_arid(),
-    .m_axi_ddr_araddr(),
-    .m_axi_ddr_arlen(),
-    .m_axi_ddr_arsize(),
-    .m_axi_ddr_arburst(),
-    .m_axi_ddr_arvalid(),
-    .m_axi_ddr_arready('0),
-    .m_axi_ddr_rid('0),
-    .m_axi_ddr_rdata('0),
-    .m_axi_ddr_rresp('0),
-    .m_axi_ddr_rlast('0),
-    .m_axi_ddr_rvalid('0),
-    .m_axi_ddr_rready(),
-    .ddr_calib(1'b0)
+    // DDR tier: an AXI memory model in the testbench (NAT_DDR)
+    .m_axi_ddr_awid(m_axi_ddr_awid),
+    .m_axi_ddr_awaddr(m_axi_ddr_awaddr),
+    .m_axi_ddr_awlen(m_axi_ddr_awlen),
+    .m_axi_ddr_awsize(m_axi_ddr_awsize),
+    .m_axi_ddr_awburst(m_axi_ddr_awburst),
+    .m_axi_ddr_awvalid(m_axi_ddr_awvalid),
+    .m_axi_ddr_awready(m_axi_ddr_awready),
+    .m_axi_ddr_wdata(m_axi_ddr_wdata),
+    .m_axi_ddr_wstrb(m_axi_ddr_wstrb),
+    .m_axi_ddr_wlast(m_axi_ddr_wlast),
+    .m_axi_ddr_wvalid(m_axi_ddr_wvalid),
+    .m_axi_ddr_wready(m_axi_ddr_wready),
+    .m_axi_ddr_bid(m_axi_ddr_bid),
+    .m_axi_ddr_bresp(m_axi_ddr_bresp),
+    .m_axi_ddr_bvalid(m_axi_ddr_bvalid),
+    .m_axi_ddr_bready(m_axi_ddr_bready),
+    .m_axi_ddr_arid(m_axi_ddr_arid),
+    .m_axi_ddr_araddr(m_axi_ddr_araddr),
+    .m_axi_ddr_arlen(m_axi_ddr_arlen),
+    .m_axi_ddr_arsize(m_axi_ddr_arsize),
+    .m_axi_ddr_arburst(m_axi_ddr_arburst),
+    .m_axi_ddr_arvalid(m_axi_ddr_arvalid),
+    .m_axi_ddr_arready(m_axi_ddr_arready),
+    .m_axi_ddr_rid(m_axi_ddr_rid),
+    .m_axi_ddr_rdata(m_axi_ddr_rdata),
+    .m_axi_ddr_rresp(m_axi_ddr_rresp),
+    .m_axi_ddr_rlast(m_axi_ddr_rlast),
+    .m_axi_ddr_rvalid(m_axi_ddr_rvalid),
+    .m_axi_ddr_rready(m_axi_ddr_rready),
+    .ddr_calib(ddr_calib)
 );
 
 endmodule

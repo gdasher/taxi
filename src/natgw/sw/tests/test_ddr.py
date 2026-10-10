@@ -11,7 +11,7 @@ import pytest
 
 import frames
 from natgw_c import OUT_FWD, OUT_PUNT, DdrStatus, Entry, Model, Table, entry_c, key_c, lib, pm
-from test_model import compare, make_world, setup_pair, traffic
+from test_model import check_forward, make_world, traffic
 
 NATGW_REG_DDR_STATUS = 0x60
 
@@ -91,80 +91,69 @@ def test_clear_enable_and_entries():
     m.close()
 
 
-def place(m, py, entries, nhs, uram_bw, ddr_bw):
-    """Program on-chip first, the DDR tier once the on-chip table refuses."""
+def place(m, entries, nhs):
+    """Program on chip first, the DDR tier once the on-chip table refuses."""
     for idx, nh in nhs.items():
-        from natgw_c import nh_c
-        py.nh[idx] = nh
-        lib.natgw_dev_write_nh(dev(m), idx, C.byref(nh_c(nh)))
-    t = Table(uram_bw)
-    td = Table(ddr_bw, ddr=True)
+        m.nh[idx] = nh
     where = {}
     for e in entries:
-        n, idx, _ = t.insert(entry_c(e))
-        if n >= 1:
-            lib.natgw_dev_apply(dev(m), t.ops, n)
-            py.table.insert(e)
+        try:
+            m.table.insert(e)
             where[e.key] = "uram"
-            continue
-        n, idx, _ = td.insert(entry_c(e))
-        assert n >= 1
-        lib.natgw_dev_apply_ddr(dev(m), td.ops, n)
-        py.ddr.insert(e)
-        where[e.key] = "ddr"
-    return t, td, where
+        except pm.TableFull:
+            m.ddr.insert(e)
+            where[e.key] = "ddr"
+    return where
 
 
 @pytest.mark.parametrize("seed", [1, 2])
-def test_tiers_match_python(seed):
+def test_tiers(seed):
+    """Flows in both tiers forward exactly as their entries say (checked with
+    scapy); a DDR hit reports the DDR index the table placed it at, flagged;
+    the activity bitmap holds exactly the DDR entries that hit."""
     random.seed(seed)
-    uram_bw, ddr_bw = 3, 7
-    m, py = setup_pair(uram_bw)
-    assert lib.natgw_model_set_ddr(m.h, ddr_bw, True) == 0
-    py.ddr_bucket_w = ddr_bw
-    py.ddr = pm.DdrTable(ddr_bw, py.seed0, py.seed1)
-    py.ddr_active = True
-    assert lib.natgw_dev_ddr_clear(dev(m), 100) == 0
-    lib.natgw_dev_ddr_enable(dev(m), True)
+    m = pm.ShimModel(bucket_w=3, enable=True, bypass_mask=0, punt_hdr=True, ddr_bucket_w=7)
+    m.ddr_active = True
     entries, nhs = make_world(200)
-    t, td, where = place(m, py, entries, nhs, uram_bw, ddr_bw)
+    where = place(m, entries, nhs)
     assert 40 < sum(v == "ddr" for v in where.values()) < 200
-    ddr_fwd = 0
+    ddr_fwd, ddr_hit = 0, set()
     for lane, frame in traffic(entries, 3000):
-        kind, olane, reason, hit_idx, data = m.rx(lane, frame)
-        exp = py.process(lane, frame)
-        assert (kind, olane, reason) == (OUT_FWD if exp.kind == "fwd" else OUT_PUNT, exp.lane, exp.reason)
-        assert data == exp.data
-        assert hit_idx == (0xffffffff if exp.hit_idx is None else exp.hit_idx)
-        ddr_fwd += kind == OUT_FWD and hit_idx & 0x80000000 != 0
+        out = m.process(lane, frame)
+        key = pm.parse(frame, lane).key
+        tier = where.get(key)
+        if out.hit_idx is not None:
+            if tier == "ddr":
+                assert out.hit_idx == pm.DDR_IDX_FLAG | m.ddr.where[key]
+                ddr_hit.add(m.ddr.where[key])
+            else:
+                assert tier == "uram" and out.hit_idx == m.table.where[key]
+        if out.kind == "fwd":
+            e = m.ddr.slots[out.hit_idx & ~pm.DDR_IDX_FLAG] if tier == "ddr" else m.table.slots[out.hit_idx]
+            check_forward(m, lane, frame, out, e)
+            ddr_fwd += tier == "ddr"
     assert ddr_fwd > 100
-    # activity bitmap: the same set of DDR entries, then all clear
-    words = td.size // 64
-    got = [lib.natgw_dev_read_activity(dev(m), w) for w in range(words)]
-    exp = [py.read_activity(w) for w in range(words)]
-    assert got == exp and any(got)
-    assert all(lib.natgw_dev_read_activity(dev(m), w) == 0 for w in range(words))
+    words = m.ddr.size // 64
+    got = set()
+    for w in range(words):
+        v = m.read_activity(w)
+        got |= {w * 64 + b for b in range(64) if (v >> b) & 1}
+    assert got == ddr_hit and got
+    assert all(m.read_activity(w) == 0 for w in range(words))
     lookups, hits, skips = C.c_uint32(), C.c_uint32(), C.c_uint32()
-    lib.natgw_dev_ddr_stats(dev(m), C.byref(lookups), C.byref(hits), C.byref(skips))
+    lib.natgw_dev_ddr_stats(C.byref(m.dev), C.byref(lookups), C.byref(hits), C.byref(skips))
     assert hits.value >= ddr_fwd and lookups.value > hits.value and skips.value == 0
-    assert lib.natgw_dev_ddr_read_errors(dev(m)) == 0
-    for lane in range(8):
-        for r in range(16):
-            assert lib.natgw_dev_read_stat(dev(m), lane, r) == py.stats.get((lane, r), 0)
-    m.close()
+    assert lib.natgw_dev_ddr_read_errors(C.byref(m.dev)) == 0
 
 
 def test_disabled_tier_not_looked_up():
-    """Entries in DDR but the tier disabled: misses, no activity."""
+    """Entries in DDR but the tier disabled: they miss, no activity."""
     random.seed(3)
-    m, py = setup_pair(3)
-    assert lib.natgw_model_set_ddr(m.h, 6, True) == 0
-    assert lib.natgw_dev_ddr_clear(dev(m), 100) == 0
+    m = pm.ShimModel(bucket_w=3, enable=True, bypass_mask=0, punt_hdr=True, ddr_bucket_w=6)
     entries, nhs = make_world(100)
-    py.ddr = pm.DdrTable(6, py.seed0, py.seed1)
-    py.ddr_active = False
-    place(m, py, entries, nhs, 3, 6)
+    where = place(m, entries, nhs)
     for lane, frame in traffic(entries, 500):
-        compare(m, py, lane, frame)
-    assert all(lib.natgw_dev_read_activity(dev(m), w) == 0 for w in range(4))
-    m.close()
+        out = m.process(lane, frame)
+        if where.get(pm.parse(frame, lane).key) == "ddr":
+            assert out.hit_idx is None and out.kind == "punt"
+    assert all(m.read_activity(w) == 0 for w in range(4))

@@ -68,14 +68,25 @@ def test_nh_pack_matches_model():
         assert (back.lane, back.vlan, back.vid, back.valid) == (n.lane, n.vlan, n.vid, n.valid)
 
 
+def spec_crc(key_bits, seed, poly):
+    """the spec, written out: reflected CRC over the 112 key bits, bit 0 first, from seed, no final XOR"""
+    crc = seed
+    for i in range(112):
+        if (crc ^ (key_bits >> i)) & 1:
+            crc = (crc >> 1) ^ poly
+        else:
+            crc >>= 1
+    return crc
+
+
 @pytest.mark.parametrize("seed0,seed1", [(0xffffffff, 0xffffffff), (0, 0), (0x12345678, 0x9abcdef0)])
-def test_hashes_match_model(seed0, seed1):
+def test_hashes_match_spec(seed0, seed1):
     random.seed(seed0 ^ seed1)
     for _ in range(1000):
         k = rand_key()
         kb = k.pack()
-        assert lib.natgw_key_crc(C.byref(key_c(k)), seed0, 0x82F63B78) == pm.key_crc(kb, seed0, pm.POLY_CRC32C)
-        assert lib.natgw_key_crc(C.byref(key_c(k)), seed1, 0xEDB88320) == pm.key_crc(kb, seed1, pm.POLY_CRC32)
+        assert lib.natgw_key_crc(C.byref(key_c(k)), seed0, 0x82F63B78) == spec_crc(kb, seed0, 0x82F63B78)
+        assert lib.natgw_key_crc(C.byref(key_c(k)), seed1, 0xEDB88320) == spec_crc(kb, seed1, 0xEDB88320)
 
 
 def test_punt_parse():

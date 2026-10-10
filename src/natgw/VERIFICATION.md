@@ -5,11 +5,42 @@ the formal properties proved with SymbiYosys, and the simulation tests run
 with cocotb and Verilator. All of it runs on the RTL in `rtl/`; nothing here
 has run on hardware yet.
 
-Shared basis: `tb/natgw_model.py` is a bit-exact Python model of the shim
-(classification, hashing, cuckoo placement, rewrite, checksums, punt header).
-Simulation tests use it as the scoreboard. The formal harnesses do not use it;
-they restate the specification in SystemVerilog (`formal/common/natgw_formal_ref_pkg.sv`)
-so the two methods check against independent references.
+Shared basis: one behavioural model. The C software model and libnatgw
+(`sw/model`, `sw/lib`) are the reference for classification, hashing, cuckoo
+placement, rewrite, checksums, the punt header, the DDR tier and the register
+interface. The RTL testbenches use it as their scoreboard through
+`tb/natgw_model.py`, which keeps only the data types and bit layouts in Python
+and calls the C code through ctypes (`tb/natgw_clib.py`). The host software
+(DPDK, VPP) runs against the same model, so RTL, model and host are tied
+together directly rather than through a second implementation.
+
+How the pieces are checked against each other:
+
+```
+ RTL ──scoreboard──▶ C model ◀──runs under── DPDK + VPP stacks
+  ▲                    ▲
+  │ registers          │ independent checks: scapy decodes of forwarded frames,
+  └─ libnatgw          │ spec CRC in the layout test, real kernel TCP/UDP endpoints
+     (the host's own   │ in the VPP tests
+      code, in the shim and system testbenches)
+ formal: a separately written SystemVerilog spec (formal/common)
+```
+
+- **The host's register code drives the RTL.** In the shim and system
+  testbenches every table, next-hop, statistics, event and DDR operation is a
+  libnatgw call (`tb/natgw_regs.py`), run in a cocotb bridge thread whose
+  register accesses become AXI-Lite or PCIe BAR transactions. There is no
+  second implementation of the register protocol: writing an entry's data
+  words in the wrong order in libnatgw fails both the host model tests and the
+  RTL shim test.
+- **Independent checks where a second opinion matters.** The model tests
+  (`sw/tests/test_model.py`, `test_ddr.py`) decode every forwarded frame with
+  scapy and compare it with the entry and next hop that hit; the hash test
+  compares with the CRC written out from the spec; the VPP tests use real
+  kernel endpoints.
+- **Coverage.** Every simulation writes `natgw_cov.json` (`tb/natgw_cov.py`,
+  sampled in the shared model layer and the DDR monitor); `tb/cov_report.py`
+  merges them and lists the bins never hit (see "Coverage" below).
 
 ## How to run
 
@@ -23,6 +54,9 @@ src/natgw/formal/run_formal.sh 3                      # all tasks, 3 at a time
 src/natgw/formal/run_formal.sh 3 lookup rewrite       # selected harnesses
 FORMAL_TIMEOUT=1200 src/natgw/formal/run_formal.sh 6  # cap each task at 20 minutes; a capped BMC
                                                       # reports the last cycle fully proved
+
+# coverage, merged from every simulation run since the last clean
+src/natgw/tb/cov_report.py                            # every point, and the bins never hit
 ```
 
 ## Formal verification
@@ -197,8 +231,9 @@ Both harnesses were checked against mutants: removing the bitmap's
 forwarding from the most recent write fails P10.1 at once, and ignoring the
 request cap fails P11.3 within three cycles. The bound for P11 is for the
 compare-on-arrival version of the DDR stage (lines compared against the
-lane's oldest key as they arrive): 16 cycles took 33 minutes (15 took 9), and
-the mutant above still fails.
+lane's oldest key as they arrive), with the memory free to return error
+responses (RRESP) at any time: 16 cycles took 31 minutes, and the mutant above
+still fails.
 
 ### Defects found by formal verification
 
@@ -269,9 +304,26 @@ Block test `natgw_ddr` (DDR_BUCKET_W 6, MAX_OUT 4, activity-bitmap pipeline 2 an
 | `run_test_request_cap` | Slow memory: the per-lane cap holds and misses beyond it are skipped and counted |
 | `run_test_activity` | After 1500 lookups at full rate, the bitmap holds exactly the DDR entries that hit; a read clears its word |
 | `run_test_inactive` | Not calibrated, or disabled: no lane reads reach the memory |
+| `run_test_read_errors` | SLVERR on every read (no DDR hit, every error beat counted), on a host read (empty entry), and on 30% of reads under stalls (hits only from good lines) |
+
+Every test also checks the request cap exactly: the monitor counts each
+lane's outstanding lookups from what it observes and asserts that an eligible
+miss is skipped only when its lane is at the cap (or the request queue is
+full) and looked up otherwise, allowing only the pipeline's lag between the
+DUT freeing a slot and the result appearing (3 cycles). Skipping one lookup
+early (cap 3 instead of 4) fails five tests.
 
 Fault injection caught by these tests: wrong table-1 index, request cap
-ignored, no bitmap forwarding.
+ignored, request cap one too low, no bitmap forwarding, lines compared with
+the wrong key, read errors ignored.
+
+Shim test additions: `run_test_corners` (every outcome on every lane, tagged
+and untagged: forwarding, FIN/RST, invalid next hop, VLAN mismatch both ways,
+tagged multicast and malformed headers); `run_test_events` now also checks
+each idle event's timing (after the threshold, within one full scanner pass;
+a scanner at half speed fails it). Lookup test addition:
+`run_test_until_full` (insert until the host table refuses a key, then every
+key hits and absent keys miss).
 
 Shim test `natgw_shim` with `DDR_ENABLE=1` (in addition to all tests above):
 `run_test_ddr_random` (sessions split between the tiers, mixed traffic, activity
@@ -279,9 +331,31 @@ bitmap checked against the model), `run_test_ddr_fin_and_entries` (FIN on DDR
 flows, entry read-back, statistics), `run_test_ddr_no_dimm` (calibration low:
 DDR entries never hit, no memory traffic).
 
-Host side: see `sw/README.md` (libnatgw and C model against the Python model
-with both tiers, the DPDK rte_flow tiering tests, and VPP integration with and
+Host side: see `sw/README.md` (libnatgw and the C model against independent
+scapy checks with both tiers, the DPDK rte_flow tiering tests, and VPP integration with and
 without a DIMM).
+
+### Coverage
+
+Each simulation records functional coverage (`tb/natgw_cov.py`) in the shared
+model layer and the DDR monitor; `tb/cov_report.py` merges the runs. After the
+full regression every defined bin is hit:
+
+| Point | Bins | From |
+| --- | --- | --- |
+| outcome × VLAN (14 outcomes, untagged and tagged) | 28/28 | rewrite, shim, system |
+| outcome × lane | 112/112 | rewrite, shim, system |
+| forward kind (SNAT/DNAT × TCP/UDP × tagging × TTL decrement) | 16/16 | rewrite, shim, system |
+| hit slot (on chip: 2 tables × 4 slots; DDR: 2 × 2) | 12/12 | DDR, rewrite, shim, system |
+| FIN/RST on a hit, per tier | 2/2 | rewrite, shim, system |
+| punt header on/off | 2/2 | rewrite, shim, system |
+| insert: writes 1–4, 5+, and table full, per tier | 12/12 | DDR, lookup, rewrite, shim, system |
+| DDR events (lookup, skip, cap reached, read error on a lane, on a host read) | 5/5 | DDR |
+
+The first report showed real gaps (no forwarding or FIN/RST, invalid-next-hop or
+VLAN-mismatch outcomes on lanes 3–7, no tagged multicast or malformed headers,
+no full table in RTL, DDR table 1 slot 1 never hit); `run_test_corners`,
+`run_test_until_full` and DDR hit sampling closed them.
 
 ### System test (V3): `fpga_core_nat`, PCIe, cndm driver and BASE-R SerDes models
 
@@ -290,6 +364,21 @@ without a DIMM).
 | `run_test_bypass` | The unmodified stock cndm test passes through the shim |
 | `run_test_nat` | Sessions installed through BAR0 by the driver model; hits forwarded wire to wire with nothing reaching the host; a miss and a FIN punted to the driver with a header; FIN event; host transmit merged with forwarded traffic on one lane; statistics, per-entry state and idle events read back |
 | `run_test_flr` | Function-level reset: cfg_flr_done pulses once; the core and shim reset, tables and next hops cleared, lanes back in bypass, statistics zero; the driver re-initialises and traffic flows |
+| `run_test_ddr` (DDR configuration) | Sessions in DDR forwarded wire to wire both ways, a FIN on a DDR flow punted with the DDR index, activity bits and DDR statistics as the model says (the DDR memory is an AXI model with stalls on every channel, on the shim's clock) |
+| `run_test_soak` (both configurations) | Six bursts of 150 frames on all eight lanes (hits both ways, FIN/RST, SYN, TTL expiry, bad checksums, non-IPv4, misses), sessions in both tiers when DDR is present, table churn with relocation between bursts; every frame's outcome against the model, then every counter and the activity bits |
+
+The system test runs in two configurations, with and without the DDR tier,
+and programs the NAT block through libnatgw over the PCIe BAR. Each test
+starts with a function-level reset, as a host does when vfio-pci opens the
+device.
+
+Finding (NIC core, not the NAT path): the tests share one simulation, and
+without that reset, re-initialising the driver's queues on the running NIC
+after `run_test_nat` made it redeliver that test's last received frame, with
+a 4096-byte length, as the first received frame of the next test. A plain
+on-chip miss showed it as well as a DDR punt. It has not been investigated
+further in the cndm core or its Python driver model; on hardware the device
+is reset when it is opened.
 
 ## Not covered
 

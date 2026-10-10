@@ -56,6 +56,23 @@ uint32_t natgw_model_rd(struct natgw_model *m, uint32_t off);
 NATGW_API
 void natgw_model_wr(struct natgw_model *m, uint32_t off, uint32_t val);
 
+/* the parser's view of a frame (natgw_parser.sv; only the first 64 bytes count) */
+struct natgw_parsed {
+	uint8_t  reason;     /* pre-lookup reason (NATGW_RSN_MISS: looked up, no exception) */
+	uint8_t  lookup;     /* key looked up (MISS or FINRST) */
+	uint8_t  l3ok;       /* well-formed IPv4 with a good header checksum */
+	uint8_t  vlan;
+	uint16_t tci;
+	uint8_t  ttl;
+	uint8_t  tcp;
+	uint32_t ip_off;     /* offset of the IPv4 header */
+	uint8_t  fin, rst;
+	struct natgw_key key;
+};
+
+NATGW_API
+void natgw_model_parse(const uint8_t *frame, size_t len, unsigned lane, bool bypass, struct natgw_parsed *p);
+
 /* process one frame (no FCS) received on a lane */
 NATGW_API
 int natgw_model_rx(struct natgw_model *m, unsigned lane, const uint8_t *frame, size_t len,

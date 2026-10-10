@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Host cuckoo table: placement, relocation safety, deletes, failure modes,
-and write-for-write agreement with the Python model's CuckooTable."""
+and the DDR table geometry."""
 
 import errno
 import random
@@ -158,35 +158,6 @@ def test_rejects_invalid_entries():
     e = entry_c(rand_entry())
     e.nh_idx = 1024
     assert t.insert(e)[0] == -errno.EINVAL
-    t.close()
-
-
-@pytest.mark.parametrize("ddr", [False, True])
-@pytest.mark.parametrize("seed0,seed1", [(0xffffffff, 0xffffffff), (0x1234, 0x8765)])
-def test_placement_matches_python_model(seed0, seed1, ddr):
-    """Same insert/delete sequence: identical writes from C and Python."""
-    random.seed(seed0 ^ 99)
-    t = Table(5, seed0, seed1, ddr=ddr)
-    py = (pm.DdrTable if ddr else pm.CuckooTable)(5, seed0, seed1)
-    live = []
-    for step in range(400):
-        if live and random.random() < 0.2:
-            k = live.pop(random.randrange(len(live)))
-            n, ops = t.delete(key_c(k))
-            pw = py.delete(k)
-            assert n == len(pw) and [o.idx for o in ops] == [i for i, _ in pw]
-            continue
-        e = rand_entry()
-        n, idx, ops = t.insert(entry_c(e))
-        try:
-            pw = py.insert(e)
-        except pm.TableFull:
-            assert n == -errno.ENOSPC
-            continue
-        assert n == len(pw), step
-        assert [o.idx for o in ops] == [i for i, _ in pw], step
-        assert [key_py(o.entry.key) for o in ops] == [x.key for _, x in pw], step
-        live.append(e.key)
     t.close()
 
 

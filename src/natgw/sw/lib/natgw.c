@@ -533,6 +533,31 @@ static unsigned candidates(const struct natgw_table *t, const struct natgw_key *
 	return 2 * t->slots;
 }
 
+unsigned natgw_table_candidates(const struct natgw_table *t, const struct natgw_key *k, uint32_t c[8])
+{
+	return candidates(t, k, c);
+}
+
+uint16_t natgw_oc_sum16(const uint8_t *d, size_t n)
+{
+	uint32_t s = 0;
+
+	for (size_t k = 0; k + 1 < n; k += 2)
+		s += (uint32_t)(d[k] << 8) | d[k + 1];
+	while (s >> 16)
+		s = (s & 0xffff) + (s >> 16);
+	return (uint16_t)s;
+}
+
+uint16_t natgw_csum_update3(uint16_t hc, uint16_t m0, uint16_t n0, uint16_t m1, uint16_t n1, uint16_t m2,
+			    uint16_t n2)
+{
+	uint32_t s = (uint16_t)~hc + (uint32_t)(uint16_t)~m0 + n0 + (uint16_t)~m1 + n1 + (uint16_t)~m2 + n2;
+	uint32_t f = (s & 0xffff) + (s >> 16);
+	f = (f & 0xffff) + (f >> 16);
+	return (uint16_t)~f;
+}
+
 static struct natgw_table *table_create(unsigned bucket_w, unsigned slot_bits, bool top,
 					uint32_t seed0, uint32_t seed1, unsigned max_depth)
 {

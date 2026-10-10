@@ -395,18 +395,7 @@ struct natgw_io natgw_model_io(struct natgw_model *m)
 /* ------------------------------------------------------------------ */
 /* frame parsing (natgw_model.parse) */
 
-struct parsed {
-	uint8_t  reason;
-	uint8_t  lookup;
-	uint8_t  l3ok;
-	uint8_t  vlan;
-	uint16_t tci;
-	uint8_t  ttl;
-	uint8_t  tcp;
-	unsigned ip;
-	uint8_t  fin, rst;
-	struct natgw_key key;
-};
+/* struct natgw_parsed: natgw_model.h */
 
 static inline uint8_t b8(const uint8_t *f, size_t len, size_t i)
 {
@@ -423,7 +412,7 @@ static inline uint32_t b32(const uint8_t *f, size_t len, size_t i)
 	return ((uint32_t)b16(f, len, i) << 16) | b16(f, len, i + 2);
 }
 
-static void parse(const uint8_t *f, size_t L, unsigned lane, int bypass, struct parsed *p)
+void natgw_model_parse(const uint8_t *f, size_t L, unsigned lane, bool bypass, struct natgw_parsed *p)
 {
 	uint16_t et = b16(f, L, 12), totlen, frag;
 	unsigned o = 0, ip;
@@ -439,7 +428,7 @@ static void parse(const uint8_t *f, size_t L, unsigned lane, int bypass, struct 
 		o = 4;
 	}
 	ip = 14 + o;
-	p->ip = ip;
+	p->ip_off = ip;
 	ver_ihl = b8(f, L, ip);
 	totlen = b16(f, L, ip + 2);
 	frag = b16(f, L, ip + 6);
@@ -490,13 +479,6 @@ static void parse(const uint8_t *f, size_t L, unsigned lane, int bypass, struct 
 /* ------------------------------------------------------------------ */
 /* rewrite (ShimModel.rewrite) */
 
-static uint16_t csum_update3(uint16_t hc, uint16_t m0, uint16_t n0, uint16_t m1, uint16_t n1, uint16_t m2, uint16_t n2)
-{
-	uint32_t s = (uint16_t)~hc + (uint32_t)(uint16_t)~m0 + n0 + (uint16_t)~m1 + n1 + (uint16_t)~m2 + n2;
-	uint32_t f = (s & 0xffff) + (s >> 16);
-	f = (f & 0xffff) + (f >> 16);
-	return (uint16_t)~f;
-}
 
 static inline void put16(uint8_t *f, size_t i, uint16_t v)
 {
@@ -510,9 +492,9 @@ static inline void put32(uint8_t *f, size_t i, uint32_t v)
 	put16(f, i + 2, (uint16_t)v);
 }
 
-static void rewrite(uint8_t *f, size_t L, const struct parsed *p, const struct natgw_entry *e, const struct natgw_nh *nh)
+static void rewrite(uint8_t *f, size_t L, const struct natgw_parsed *p, const struct natgw_entry *e, const struct natgw_nh *nh)
 {
-	unsigned ip = p->ip;
+	unsigned ip = p->ip_off;
 	uint8_t ttl, proto, nttl;
 	unsigned ip_field = ip + (e->xlate_dst ? 16 : 12);
 	unsigned port_field = ip + (e->xlate_dst ? 22 : 20);
@@ -533,13 +515,13 @@ static void rewrite(uint8_t *f, size_t L, const struct parsed *p, const struct n
 	old_port = b16(f, L, port_field);
 
 	hc = b16(f, L, ip + 10);
-	hc = csum_update3(hc, (uint16_t)(old_ip >> 16), (uint16_t)(e->new_ip >> 16),
+	hc = natgw_csum_update3(hc, (uint16_t)(old_ip >> 16), (uint16_t)(e->new_ip >> 16),
 			  (uint16_t)old_ip, (uint16_t)e->new_ip,
 			  (uint16_t)((ttl << 8) | proto), (uint16_t)((nttl << 8) | proto));
 
 	l4c = b16(f, L, l4c_off);
 	if (p->tcp || l4c != 0) {
-		l4c = csum_update3(l4c, (uint16_t)(old_ip >> 16), (uint16_t)(e->new_ip >> 16),
+		l4c = natgw_csum_update3(l4c, (uint16_t)(old_ip >> 16), (uint16_t)(e->new_ip >> 16),
 				   (uint16_t)old_ip, (uint16_t)e->new_ip, old_port, e->new_port);
 		if (!p->tcp && l4c == 0)
 			l4c = 0xffff;
@@ -603,7 +585,7 @@ int natgw_model_rx(struct natgw_model *m, unsigned lane, const uint8_t *frame, s
 		   struct natgw_model_out *out)
 {
 	int bypass = !m->enable || ((m->bypass >> lane) & 1);
-	struct parsed p;
+	struct natgw_parsed p;
 	uint32_t idx = 0, h0 = 0;
 	int hit = 0, ddr_hit = 0;
 	const struct natgw_entry *e = NULL;
@@ -612,7 +594,7 @@ int natgw_model_rx(struct natgw_model *m, unsigned lane, const uint8_t *frame, s
 	if (lane >= NATGW_LANES || !out || !out->data)
 		return -EINVAL;
 
-	parse(frame, len, lane, bypass, &p);
+	natgw_model_parse(frame, len, lane, bypass, &p);
 	out->hit_idx = 0xffffffff;
 
 	if (p.reason == NATGW_RSN_BYPASS) {

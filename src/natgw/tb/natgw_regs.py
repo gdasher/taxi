@@ -1,15 +1,27 @@
 # SPDX-License-Identifier: CERN-OHL-S-2.0
 """
 
-NAT gateway shim register access (host side)
+NAT gateway shim register access (host side), through libnatgw
 
 Wraps any pair of async 32-bit read/write callables (an AXI-Lite master in the
-shim testbench, a PCIe BAR in the system testbench). Mirrors the register map
-in natgw_regs.sv.
+shim testbench, a PCIe BAR in the system testbench) and drives them with the
+host library's own code. The register map constants below mirror
+natgw_regs.sv for tests that poke registers directly.
 
 """
 
-from natgw_model import Entry, NextHop, State, to_words, from_words, CuckooTable
+import ctypes as C
+
+from cocotb.triggers import Lock
+
+try:
+    from cocotb import bridge, resume
+except ImportError:          # cocotb 2.0 keeps them in _bridge
+    from cocotb._bridge import bridge, resume
+
+import natgw_clib as clib
+from natgw_model import (Entry, NextHop, State, to_words, from_words, CuckooTable,  # noqa: F401
+                         _entry_c, _entry_py, _nh_c)
 
 REG_ID = 0x0000
 REG_VERSION = 0x0004
@@ -63,10 +75,57 @@ STAT_BAD = 17
 
 
 class NatRegs:
+    """The shim's registers driven by libnatgw, the host library the real
+    driver uses: every operation below is a libnatgw call whose register
+    reads and writes become bus transactions on the simulated design
+    (read32/write32 coroutines, e.g. an AXI-Lite master or the driver's BAR).
+    The C code runs in a cocotb bridge thread and blocks on each access, so
+    the register protocol under test is exactly the host's. rd()/wr() remain
+    for direct register pokes."""
+
     def __init__(self, read32, write32, base=0):
         self._rd = read32
         self._wr = write32
         self.base = base
+        self._dev = None
+        self._lock = None
+
+        resume_rd = resume(self._raw_rd)
+        resume_wr = resume(self._raw_wr)
+
+        def c_rd(ctx, off):
+            return resume_rd(off)
+
+        def c_wr(ctx, off, val):
+            resume_wr(off, val)
+
+        # keep the callback objects alive as long as this object
+        self._c_rd = clib.RD(c_rd)
+        self._c_wr = clib.WR(c_wr)
+        self._io = clib.Io(self._c_rd, self._c_wr, None)
+
+    async def _raw_rd(self, off):
+        return (await self._rd(self.base + off)) & 0xffffffff
+
+    async def _raw_wr(self, off, val):
+        await self._wr(self.base + off, val & 0xffffffff)
+
+    async def _call(self, fn, *args):
+        """run fn(dev, *args) (blocking libnatgw code) in a bridge thread"""
+        if self._lock is None:
+            self._lock = Lock()
+        async with self._lock:
+            if self._dev is None:
+                self._dev = clib.Dev()
+
+                def init():
+                    return clib.lib.natgw_dev_init(C.byref(self._dev), C.byref(self._io))
+                rc = await bridge(init)()
+                assert rc == 0, f"natgw_dev_init: {rc}"
+
+            def call():
+                return fn(C.byref(self._dev), *args)
+            return await bridge(call)()
 
     async def rd(self, reg):
         return await self._rd(self.base + reg)
@@ -75,150 +134,130 @@ class NatRegs:
         await self._wr(self.base + reg, val & 0xffffffff)
 
     async def flush(self):
-        """Read back so that earlier posted writes have taken effect (PCIe writes are posted)."""
-        await self.rd(REG_ID)
+        """read back so that earlier posted writes have taken effect"""
+        await self._call(clib.lib.natgw_dev_flush)
 
     async def caps(self):
-        v = await self.rd(REG_CAPS)
-        return {"idx_w": v & 0xff, "lanes": (v >> 8) & 0xff, "punt_hdr_len": (v >> 16) & 0xff}
+        await self._call(clib.lib.natgw_dev_flush)
+        d = self._dev
+        return {"idx_w": d.idx_w, "lanes": d.lanes, "punt_hdr_len": d.punt_hdr_len}
 
     async def set_ctrl(self, enable, punt_hdr=False, bypass=0x00, egress_en=0xff):
-        await self.wr(REG_CTRL, (1 if enable else 0) | (2 if punt_hdr else 0) | (bypass << 8) | (egress_en << 16))
-        await self.flush()
+        await self._call(clib.lib.natgw_dev_set_ctrl, bool(enable), bool(punt_hdr), bypass & 0xff, egress_en & 0xff)
 
     async def clear(self, poll=None):
-        await self.wr(REG_CLEAR, 1)
-        await self.wait_clear(poll)
+        assert await self._call(clib.lib.natgw_dev_clear, 1000000) == 0, "clear timed out"
 
     async def wait_clear(self, poll=None):
+        """wait for a clear started elsewhere (e.g. by a reset)"""
         while await self.rd(REG_CLEAR) & 1:
             if poll:
                 await poll()
 
     async def set_seeds(self, seed0, seed1):
-        await self.wr(REG_SEED0, seed0)
-        await self.wr(REG_SEED1, seed1)
+        await self._call(clib.lib.natgw_dev_set_seeds, seed0 & 0xffffffff, seed1 & 0xffffffff)
 
     async def write_entry(self, idx, entry):
-        bits = entry.pack() if entry is not None else 0
-        for k, w in enumerate(to_words(bits, 7)):
-            await self.wr(REG_ENT_DATA + 4*k, w)
-        await self.wr(REG_INDEX, idx)
-        await self.wr(REG_CMD, CMD_WR_ENT)
+        if entry is None:
+            await self.clear_entry(idx)
+        else:
+            await self._call(clib.lib.natgw_dev_write_entry, idx, C.byref(_entry_c(entry)))
 
     async def clear_entry(self, idx):
-        await self.wr(REG_INDEX, idx)
-        await self.wr(REG_CMD, CMD_CLR)
+        await self._call(clib.lib.natgw_dev_clear_entry, idx)
+
+    @staticmethod
+    def _ops(writes):
+        ops = (clib.Write * max(len(writes), 1))()
+        for k, (i, e) in enumerate(writes):
+            ops[k].idx = i
+            ops[k].clear = e is None
+            if e is not None:
+                ops[k].entry = _entry_c(e)
+        return ops
 
     async def apply(self, writes):
-        """Apply CuckooTable insert/delete writes in order."""
-        for idx, entry in writes:
-            if entry is None:
-                await self.clear_entry(idx)
-            else:
-                await self.write_entry(idx, entry)
-        await self.flush()
+        """apply table insert/delete writes in order (natgw_dev_apply)"""
+        writes = list(writes)
+        await self._call(clib.lib.natgw_dev_apply, self._ops(writes), len(writes))
 
     async def read_entry(self, idx):
-        await self.wr(REG_INDEX, idx)
-        await self.wr(REG_CMD, CMD_RD_ENT)
-        words = [await self.rd(REG_ENT_DATA + 4*k) for k in range(7)]
-        return Entry.unpack(from_words(words))
+        e = clib.Entry()
+        await self._call(clib.lib.natgw_dev_read_entry, idx, C.byref(e))
+        return _entry_py(e)
 
     async def write_state(self, idx, state):
+        # no host need to write state: a direct register poke for tests
         for k, w in enumerate(to_words(state.pack(), 5)):
             await self.wr(REG_ST_DATA + 4*k, w)
         await self.wr(REG_INDEX, idx)
         await self.wr(REG_CMD, CMD_WR_ST)
 
     async def read_state(self, idx):
-        await self.wr(REG_INDEX, idx)
-        await self.wr(REG_CMD, CMD_RD_ST)
-        words = [await self.rd(REG_ST_DATA + 4*k) for k in range(5)]
-        return State.unpack(from_words(words))
+        s = clib.State()
+        await self._call(clib.lib.natgw_dev_read_state, idx, C.byref(s))
+        return State(valid=s.valid, fin=s.fin, rst=s.rst, evp=s.evp, tcp=s.tcp, ts=s.ts, pkts=s.pkts,
+                     bytes=s.bytes)
 
     async def write_nh(self, idx, nh):
-        for k, w in enumerate(to_words(nh.pack(), 4)):
-            await self.wr(REG_NH_DATA + 4*k, w)
-        await self.wr(REG_NH_INDEX, idx)
-        await self.wr(REG_NH_CMD, 1)
-        await self.flush()
+        await self._call(clib.lib.natgw_dev_write_nh, idx, C.byref(_nh_c(nh)))
 
     async def read_nh(self, idx):
-        await self.wr(REG_NH_INDEX, idx)
-        await self.wr(REG_NH_CMD, 2)
-        words = [await self.rd(REG_NH_DATA + 4*k) for k in range(4)]
-        return NextHop.unpack(from_words(words))
+        n = clib.NextHop()
+        await self._call(clib.lib.natgw_dev_read_nh, idx, C.byref(n))
+        return NextHop(dst_mac=int.from_bytes(bytes(n.dst_mac), "big"),
+                       src_mac=int.from_bytes(bytes(n.src_mac), "big"), lane=n.lane, vlan=n.vlan, vid=n.vid,
+                       valid=n.valid)
 
     async def pop_event(self):
         """Return (type, idx, tick) or None."""
-        if not (await self.rd(REG_EVT_STATUS) & 1):
+        ev = clib.Event()
+        if not await self._call(clib.lib.natgw_dev_pop_event, C.byref(ev)):
             return None
-        lo = await self.rd(REG_EVT_LO)
-        hi = await self.rd(REG_EVT_HI)
-        return (hi >> 28) & 0xf, hi & 0xffffff, lo
+        return ev.type, ev.idx, ev.tick
 
     async def read_stat(self, lane, n):
-        a = REG_STATS + lane*0x100 + n*8
-        lo = await self.rd(a)
-        hi = await self.rd(a + 4)
-        return (hi << 32) | lo
+        return await self._call(clib.lib.natgw_dev_read_stat, lane, n)
 
     # ---------------------------------------------------------------- DDR tier
 
     async def ddr_status(self):
-        v = await self.rd(REG_DDR_STATUS)
-        return {"present": bool(v & 1), "calibrated": bool(v & 2), "enabled": bool(v & 4),
-                "clearing": bool(v & 8), "active": bool(v & 16), "bucket_w": (v >> 8) & 0xff,
-                "max_out": (v >> 16) & 0xff}
+        st = clib.DdrStatus()
+        await self._call(clib.lib.natgw_dev_ddr_status, C.byref(st))
+        return {"present": st.present, "calibrated": st.calibrated, "enabled": st.enabled,
+                "clearing": st.clearing, "active": st.active, "bucket_w": st.bucket_w, "max_out": st.max_out}
 
     async def ddr_enable(self, enable):
-        await self.wr(REG_DDR_CTRL, 1 if enable else 0)
-        await self.flush()
+        await self._call(clib.lib.natgw_dev_ddr_enable, bool(enable))
 
     async def ddr_clear(self, enable_after=False, poll=None):
         """zero the DDR table and the activity bitmap (DDR is random after power-up)"""
-        await self.wr(REG_DDR_CTRL, 2)
-        while (await self.ddr_status())["clearing"]:
-            if poll:
-                await poll()
+        assert await self._call(clib.lib.natgw_dev_ddr_clear, 10000000) == 0, "DDR clear timed out"
         if enable_after:
             await self.ddr_enable(True)
 
     async def write_ddr_entry(self, idx, entry):
-        for k, w in enumerate(to_words(entry.pack(), 7)):
-            await self.wr(REG_ENT_DATA + 4*k, w)
-        await self.wr(REG_INDEX, idx)
-        await self.wr(REG_CMD, CMD_DDR_WR)
+        await self._call(clib.lib.natgw_dev_write_ddr_entry, idx, C.byref(_entry_c(entry)))
 
     async def clear_ddr_entry(self, idx):
-        await self.wr(REG_INDEX, idx)
-        await self.wr(REG_CMD, CMD_DDR_CLR)
+        await self._call(clib.lib.natgw_dev_clear_ddr_entry, idx)
 
     async def read_ddr_entry(self, idx):
-        await self.wr(REG_INDEX, idx)
-        await self.wr(REG_CMD, CMD_DDR_RD)
-        words = [await self.rd(REG_ENT_DATA + 4*k) for k in range(7)]
-        return Entry.unpack(from_words(words))
+        e = clib.Entry()
+        await self._call(clib.lib.natgw_dev_read_ddr_entry, idx, C.byref(e))
+        return _entry_py(e)
 
     async def apply_ddr(self, writes):
-        """Apply DdrTable insert/delete writes in order."""
-        for idx, entry in writes:
-            if entry is None:
-                await self.clear_ddr_entry(idx)
-            else:
-                await self.write_ddr_entry(idx, entry)
-        await self.flush()
+        """apply DDR table insert/delete writes in order (natgw_dev_apply_ddr)"""
+        writes = list(writes)
+        await self._call(clib.lib.natgw_dev_apply_ddr, self._ops(writes), len(writes))
 
     async def read_activity(self, word):
         """read and clear 64 activity bits (DDR entries 64*word + n)"""
-        await self.wr(REG_INDEX, word)
-        await self.wr(REG_CMD, CMD_ACT_RC)
-        lo = await self.rd(REG_ACT_LO)
-        hi = await self.rd(REG_ACT_HI)
-        return lo | (hi << 32)
+        return await self._call(clib.lib.natgw_dev_read_activity, word)
 
     async def ddr_stats(self):
-        return {"lookups": await self.rd(REG_DDR_LOOKUPS), "hits": await self.rd(REG_DDR_HITS),
-                "skips": await self.rd(REG_DDR_SKIPS),
-                "read_errors": await self.rd(REG_DDR_RERR)}
+        lk, ht, sk = C.c_uint32(), C.c_uint32(), C.c_uint32()
+        await self._call(clib.lib.natgw_dev_ddr_stats, C.byref(lk), C.byref(ht), C.byref(sk))
+        rerr = await self._call(clib.lib.natgw_dev_ddr_read_errors)
+        return {"lookups": lk.value, "hits": ht.value, "skips": sk.value, "read_errors": rerr}

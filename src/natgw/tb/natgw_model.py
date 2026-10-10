@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: CERN-OHL-S-2.0
 """
 
-NAT gateway shim reference model
+NAT gateway shim reference model: the Python face of the C model
 
-Mirrors natgw_pkg.sv bit for bit: field layouts, hashes, classification
-precedence, cuckoo table placement, rewrite and incremental checksums.
-Also provides a host-side cuckoo table manager (insert with relocation,
-delete) of the kind the driver (S2) will need.
+Data types and bit layouts (natgw_pkg.sv) are defined here; every behaviour
+(hashes, checksums, classification, cuckoo placement, the whole shim) comes
+from the C software model and libnatgw (sw/, through natgw_clib), the same
+code the host software runs against. So the RTL testbenches, the host tests
+and the DPDK/VPP stacks all check against one reference.
 
 """
 
-import struct
-from collections import deque
-from dataclasses import dataclass, field
+import ctypes as C
+from dataclasses import dataclass
+
+import natgw_clib as clib
+import natgw_cov as cov
 
 LANES = 8
 
@@ -183,39 +186,56 @@ def from_words(words):
 
 
 # ---------------------------------------------------------------------------
-# hashes and checksums
+# conversions to and from the C structures
+
+def _key_c(k):
+    return clib.Key(k.lane, k.vid, k.tcp, k.sip, k.dip, k.sport, k.dport)
+
+
+def _key_py(k):
+    return Key(k.lane, k.vid, k.tcp, k.sip, k.dip, k.sport, k.dport)
+
+
+def _entry_c(e):
+    return clib.Entry(_key_c(e.key), e.valid, e.xlate_dst, e.new_ip, e.new_port, e.dec_ttl, e.nh_idx)
+
+
+def _entry_py(e):
+    return Entry(key=_key_py(e.key), xlate_dst=e.xlate_dst, new_ip=e.new_ip, new_port=e.new_port,
+                 dec_ttl=e.dec_ttl, nh_idx=e.nh_idx, valid=e.valid)
+
+
+def _nh_c(n):
+    mac = lambda v: (C.c_uint8 * 6)(*v.to_bytes(6, 'big'))  # noqa: E731
+    return clib.NextHop(n.valid, mac(n.dst_mac), mac(n.src_mac), n.lane, n.vlan, n.vid)
+
+
+def _buf(data):
+    data = bytes(data)
+    return (C.c_uint8 * max(len(data), 1)).from_buffer_copy(data or b"\0"), len(data)
+
+
+# ---------------------------------------------------------------------------
+# hashes and checksums (C)
 
 def key_crc(key_bits, seed, poly):
-    crc = seed & 0xffffffff
-    for i in range(KEY_W):
-        b = (key_bits >> i) & 1
-        if (crc ^ b) & 1:
-            crc = (crc >> 1) ^ poly
-        else:
-            crc >>= 1
-    return crc
+    """reflected CRC over the 112-bit key, bit 0 first, from seed, no final XOR"""
+    return clib.lib.natgw_key_crc(C.byref(_key_c(Key.unpack(key_bits))), seed & 0xffffffff, poly)
 
 
 def oc_sum16(data):
     """One's complement sum of 16-bit big-endian words (data length even)."""
-    s = 0
-    for k in range(0, len(data), 2):
-        s += (data[k] << 8) | data[k+1]
-    while s >> 16:
-        s = (s & 0xffff) + (s >> 16)
-    return s
+    b, n = _buf(data)
+    return clib.lib.natgw_oc_sum16(b, n)
 
 
 def csum_update3(hc, m0, n0, m1, n1, m2, n2):
     """RFC 1624 eqn. 3, identical arithmetic to natgw_pkg::csum_update3."""
-    s = ((~hc) & 0xffff) + ((~m0) & 0xffff) + n0 + ((~m1) & 0xffff) + n1 + ((~m2) & 0xffff) + n2
-    f = (s & 0xffff) + (s >> 16)
-    f = (f & 0xffff) + (f >> 16)
-    return (~f) & 0xffff
+    return clib.lib.natgw_csum_update3(hc, m0, n0, m1, n1, m2, n2)
 
 
 # ---------------------------------------------------------------------------
-# frame parsing and classification
+# frame parsing and classification (C)
 
 @dataclass
 class Parsed:
@@ -246,80 +266,29 @@ def _w32(frame, i):
 
 def parse(frame, lane, bypass=False):
     """Classify a frame exactly as natgw_parser.sv does (only the first 64 bytes are visible)."""
-    L = len(frame)
-    vlan = 0
-    tci = 0
-    o = 0
-    et = _w16(frame, 12)
-    if et == 0x8100:
-        vlan = 1
-        tci = _w16(frame, 14)
-        et = _w16(frame, 16)
-        o = 4
-
-    ip = 14 + o
-    ver_ihl = _b(frame, ip)
-    totlen = _w16(frame, ip+2)
-    frag = _w16(frame, ip+6)
-    ttl = _b(frame, ip+8)
-    proto = _b(frame, ip+9)
-    sip = _w32(frame, ip+12)
-    dip = _w32(frame, ip+16)
-    sport = _w16(frame, ip+20)
-    dport = _w16(frame, ip+22)
-    tcp_flags = _b(frame, ip+33)
-    tcp = 1 if proto == 6 else 0
-
-    hdr = bytes(_b(frame, ip+k) for k in range(20))
-    csum_ok = oc_sum16(hdr) == 0xffff
-
-    is_ipv4 = et == 0x0800
-    hdr_ok = ver_ihl == 0x45 and L >= ip + 20 and totlen >= 20 and ip + totlen <= L
-    l3ok = is_ipv4 and hdr_ok and csum_ok
-
-    key = Key(lane=lane, vid=(tci & 0xfff) if vlan else 0, tcp=tcp, sip=sip, dip=dip, sport=sport, dport=dport)
-
-    def p(reason, lookup=False, **kw):
-        return Parsed(reason=reason, lookup=lookup, l3ok=l3ok, vlan=vlan, tci=tci, key=key,
-                      ttl=ttl, tcp=tcp, ip_off=ip, **kw)
-
-    if bypass:
-        return p(RSN_BYPASS)
-    if _b(frame, 0) & 1:
-        return p(RSN_MCAST)
-    if not is_ipv4:
-        return p(RSN_NOT_IPV4)
-    if not hdr_ok:
-        return p(RSN_IP_HDR)
-    if not csum_ok:
-        return p(RSN_CSUM)
-    if frag & 0x3fff:
-        return p(RSN_FRAG)
-    if ttl <= 1:
-        return p(RSN_TTL)
-    if proto not in (6, 17):
-        return p(RSN_PROTO)
-    if (tcp and totlen < 40) or (not tcp and totlen < 28):
-        return p(RSN_IP_HDR)
-    if tcp and tcp_flags & 0x02:
-        return p(RSN_SYN)
-    if tcp and tcp_flags & 0x05:
-        return p(RSN_FINRST, lookup=True, fin=tcp_flags & 1, rst=(tcp_flags >> 2) & 1)
-    return p(RSN_MISS, lookup=True)
+    b, n = _buf(frame)
+    p = clib.Parsed()
+    clib.lib.natgw_model_parse(b, n, lane, bool(bypass), C.byref(p))
+    return Parsed(reason=p.reason, lookup=bool(p.lookup), l3ok=bool(p.l3ok), vlan=p.vlan, tci=p.tci,
+                  key=_key_py(p.key), ttl=p.ttl, tcp=p.tcp, ip_off=p.ip_off, fin=p.fin, rst=p.rst)
 
 
 # ---------------------------------------------------------------------------
-# table geometry and host-side cuckoo manager
+# cuckoo tables (libnatgw's host table)
 
 class TableFull(Exception):
     pass
 
 
 class CuckooTable:
-    """Host copy of the two-table, 4-slot cuckoo table."""
+    """Host copy of the two-table, 4-slot cuckoo table (libnatgw). insert()
+    returns the ordered (idx, Entry) writes, relocations first; delete()
+    returns [(idx, None)]. slots (idx -> Entry) and where (Key -> idx) mirror
+    the table, updated from those writes."""
 
     SLOTS = 4
     TABLES = 2
+    _create = "natgw_table_create"
 
     def __init__(self, bucket_w, seed0=0xffffffff, seed1=0xffffffff, max_depth=6):
         self.bucket_w = bucket_w
@@ -327,8 +296,18 @@ class CuckooTable:
         self.seed0 = seed0
         self.seed1 = seed1
         self.max_depth = max_depth
+        self.h = getattr(clib.lib, self._create)(bucket_w, seed0 & 0xffffffff, seed1 & 0xffffffff, max_depth)
+        if not self.h:
+            raise ValueError(f"table geometry bucket_w={bucket_w} refused")
+        self.max_ops = max_depth + 2
+        self._ops = (clib.Write * self.max_ops)()
         self.slots = {}     # idx -> Entry
         self.where = {}     # Key -> idx
+
+    def __del__(self):
+        if getattr(self, "h", None):
+            clib.lib.natgw_table_destroy(self.h)
+            self.h = None
 
     @property
     def idx_w(self):
@@ -342,10 +321,7 @@ class CuckooTable:
         kb = key.pack()
         return key_crc(kb, self.seed0, POLY_CRC32C), key_crc(kb, self.seed1, POLY_CRC32)
 
-    def bucket_of(self, key, t):
-        h = self.hashes(key)[t]
-        return h & (self.buckets - 1)
-
+    # index layout ({table, bucket, slot}): an address format, not behaviour
     def idx(self, t, bucket, slot):
         return (t << (self.bucket_w + 2)) | (bucket << 2) | slot
 
@@ -357,85 +333,60 @@ class CuckooTable:
         t, b, _ = self.split_idx(idx)
         return t, b
 
+    def bucket_of(self, key, t):
+        return self.split_idx(list(self.candidates(key))[t * self.SLOTS])[1]
+
     def candidates(self, key):
-        for t in range(self.TABLES):
-            b = self.bucket_of(key, t)
-            for s in range(self.SLOTS):
-                yield self.idx(t, b, s)
+        c = (C.c_uint32 * 8)()
+        n = clib.lib.natgw_table_candidates(self.h, C.byref(_key_c(key)), c)
+        return list(c[:n])
 
     def lookup(self, key):
-        """Hardware lookup: first valid matching slot, T0 slots 0..3 then T1 slots 0..3."""
-        for i in self.candidates(key):
-            e = self.slots.get(i)
-            if e is not None and e.valid and e.key == key:
-                return i, e
-        return None, None
+        """Hardware lookup order: first valid matching candidate."""
+        idx = C.c_uint32()
+        if clib.lib.natgw_table_lookup(self.h, C.byref(_key_c(key)), C.byref(idx)) != 0:
+            return None, None
+        return idx.value, self.slots[idx.value]
+
+    def _writes(self, n):
+        out = []
+        for i in range(n):
+            op = self._ops[i]
+            if op.clear:
+                out.append((op.idx, None))
+                old = self.slots.pop(op.idx, None)
+                if old is not None and self.where.get(old.key) == op.idx:
+                    del self.where[old.key]
+            else:
+                e = _entry_py(op.entry)
+                old = self.slots.get(op.idx)
+                if old is not None and self.where.get(old.key) == op.idx:
+                    del self.where[old.key]
+                self.slots[op.idx] = e
+                self.where[e.key] = op.idx
+                out.append((op.idx, e))
+        return out
 
     def insert(self, entry):
-        """Insert; returns the ordered list of (idx, Entry) writes (relocations first)."""
-        key = entry.key
-        if key in self.where:
-            i = self.where[key]
-            self.slots[i] = entry
-            return [(i, entry)]
-
-        for i in self.candidates(key):
-            if i not in self.slots:
-                self._place(i, entry)
-                return [(i, entry)]
-
-        # BFS for a relocation path ending in a free slot
-        start = list(self.candidates(key))
-        prev = {i: None for i in start}
-        q = deque((i, 1) for i in start)
-        found = None
-        while q:
-            i, depth = q.popleft()
-            occ = self.slots[i]
-            t, _, _ = self.split_idx(i)
-            alt_t = 1 - t
-            ab = self.bucket_of(occ.key, alt_t)
-            for s in range(self.SLOTS):
-                j = self.idx(alt_t, ab, s)
-                if j in prev:
-                    continue
-                prev[j] = i
-                if j not in self.slots:
-                    found = j
-                    break
-                if depth < self.max_depth:
-                    q.append((j, depth + 1))
-            if found is not None:
-                break
-
-        if found is None:
+        idx = C.c_uint32()
+        n = clib.lib.natgw_table_insert(self.h, C.byref(_entry_c(entry)), self._ops, self.max_ops, C.byref(idx))
+        tier = "ddr" if isinstance(self, DdrTable) else "uram"
+        if n == -28:            # ENOSPC
+            cov.hit("insert", tier, "full")
             raise TableFull()
-
-        # path: found <- i_k <- ... <- i_1 (a candidate of the new key)
-        path = [found]
-        while prev[path[-1]] is not None:
-            path.append(prev[path[-1]])
-        writes = []
-        # move occupants toward the free slot, last hop first
-        for dst, src in zip(path, path[1:]):
-            moved = self.slots[src]
-            self._place(dst, moved)
-            writes.append((dst, moved))
-        self._place(path[-1], entry)
-        writes.append((path[-1], entry))
-        return writes
-
-    def _place(self, i, entry):
-        old = self.slots.get(i)
-        if old is not None and self.where.get(old.key) == i:
-            del self.where[old.key]
-        self.slots[i] = entry
-        self.where[entry.key] = i
+        if n < 0:
+            raise ValueError(f"insert refused: {n}")
+        cov.hit("insert", tier, str(n) if n < 5 else "5+")
+        w = self._writes(n)
+        # the last write is the new entry itself, as given (its dataclass identity kept)
+        self.slots[w[-1][0]] = entry
+        return w[:-1] + [(w[-1][0], entry)]
 
     def delete(self, key):
-        i = self.where.pop(key)
-        del self.slots[i]
-        return [(i, None)]
+        n = clib.lib.natgw_table_delete(self.h, C.byref(_key_c(key)), self._ops, self.max_ops)
+        if n < 0:
+            raise KeyError(key)
+        return self._writes(n)
 
     def load(self):
         return len(self.slots) / self.size
@@ -447,13 +398,11 @@ class DdrTable(CuckooTable):
     tier uses the low bits). Index = {table, bucket, slot}."""
 
     SLOTS = 2
+    _create = "natgw_table_create_ddr"
 
     @property
     def idx_w(self):
         return self.bucket_w + 2
-
-    def bucket_of(self, key, t):
-        return self.hashes(key)[t] >> (32 - self.bucket_w)
 
     def idx(self, t, bucket, slot):
         return (t << (self.bucket_w + 1)) | (bucket << 1) | slot
@@ -470,7 +419,7 @@ DDR_IDX_FLAG = 0x80000000
 
 
 # ---------------------------------------------------------------------------
-# full shim model
+# full shim model (the C model)
 
 @dataclass
 class Output:
@@ -483,126 +432,184 @@ class Output:
     rst: int = 0
 
 
-@dataclass
-class ShimModel:
-    bucket_w: int = 10
-    seed0: int = 0xffffffff
-    seed1: int = 0xffffffff
-    enable: bool = False
-    bypass_mask: int = 0xff
-    punt_hdr: bool = False
-    egress_en: int = 0xff
-    table: CuckooTable = None
-    nh: dict = field(default_factory=dict)
-    stats: dict = field(default_factory=dict)
-    # DDR tier: present when ddr_bucket_w is set; looked up after an on-chip
-    # miss while active (calibrated, enabled, not clearing)
-    ddr_bucket_w: int = None
-    ddr: DdrTable = None
-    ddr_active: bool = False
-    ddr_activity: set = field(default_factory=set)
+class _ModelTable:
+    """a table whose writes also go to the C model's registers"""
 
-    def __post_init__(self):
-        if self.table is None:
-            self.table = CuckooTable(self.bucket_w, self.seed0, self.seed1)
-        if self.ddr is None and self.ddr_bucket_w is not None:
-            self.ddr = DdrTable(self.ddr_bucket_w, self.seed0, self.seed1)
+    def __init__(self, table, apply):
+        self._t = table
+        self._apply = apply
 
-    def lookup(self, key):
-        """(hit index, entry): UltraRAM tier, then the DDR tier"""
-        hit_idx, e = self.table.lookup(key)
-        if e is None and self.ddr is not None and self.ddr_active:
-            i, e = self.ddr.lookup(key)
+    def __getattr__(self, name):
+        return getattr(self._t, name)
+
+    def _push(self, writes):
+        ops = (clib.Write * max(len(writes), 1))()
+        for k, (i, e) in enumerate(writes):
+            ops[k].idx = i
+            ops[k].clear = e is None
             if e is not None:
-                hit_idx = DDR_IDX_FLAG | i
-                self.ddr_activity.add(i)
-        return hit_idx, e
+                ops[k].entry = _entry_c(e)
+        self._apply(ops, len(writes))
+        return writes
+
+    def insert(self, entry):
+        return self._push(self._t.insert(entry))
+
+    def delete(self, key):
+        return self._push(self._t.delete(key))
+
+
+class _ModelNh(dict):
+    """next hops; every assignment is written to the C model"""
+
+    def __init__(self, model):
+        super().__init__()
+        self._m = model
+
+    def __setitem__(self, idx, nh):
+        super().__setitem__(idx, nh)
+        clib.lib.natgw_dev_write_nh(C.byref(self._m.dev), idx, C.byref(_nh_c(nh)))
+
+    def update(self, *args, **kw):
+        for idx, nh in dict(*args, **kw).items():
+            self[idx] = nh
+
+    def setdefault(self, idx, nh=None):
+        if idx not in self:
+            self[idx] = nh
+        return self[idx]
+
+    def __delitem__(self, idx):
+        super().__delitem__(idx)
+        clib.lib.natgw_dev_write_nh(C.byref(self._m.dev), idx, C.byref(clib.NextHop()))
+
+    def pop(self, idx, *default):
+        if idx in self:
+            v = self[idx]
+            del self[idx]
+            return v
+        return dict.pop(self, idx, *default)
+
+
+class ShimModel:
+    """The whole shim, as the C software model (natgw_model.c) through its
+    register interface: table and next-hop writes go to the model, process()
+    runs a frame through it, statistics and activity are read back."""
+
+    def __init__(self, bucket_w=10, seed0=0xffffffff, seed1=0xffffffff, enable=False, bypass_mask=0xff,
+                 punt_hdr=False, egress_en=0xff, ddr_bucket_w=None):
+        self.bucket_w = bucket_w
+        self.seed0 = seed0
+        self.seed1 = seed1
+        self.h = clib.lib.natgw_model_create(bucket_w)
+        if not self.h:
+            raise ValueError(f"model geometry bucket_w={bucket_w} refused")
+        self.ddr_bucket_w = ddr_bucket_w
+        if ddr_bucket_w is not None:
+            assert clib.lib.natgw_model_set_ddr(self.h, ddr_bucket_w, True) == 0
+        self.io = clib.lib.natgw_model_io(self.h)
+        self.dev = clib.Dev()
+        assert clib.lib.natgw_dev_init(C.byref(self.dev), C.byref(self.io)) == 0
+        clib.lib.natgw_dev_set_seeds(C.byref(self.dev), seed0 & 0xffffffff, seed1 & 0xffffffff)
+        self._ctrl = dict(enable=enable, punt_hdr=punt_hdr, bypass_mask=bypass_mask, egress_en=egress_en)
+        self._write_ctrl()
+        self.table = _ModelTable(CuckooTable(bucket_w, seed0, seed1),
+                                 lambda ops, n: clib.lib.natgw_dev_apply(C.byref(self.dev), ops, n))
+        self.ddr = None
+        self._ddr_active = False
+        if ddr_bucket_w is not None:
+            # DDR starts as junk, like the real memory: clear it first
+            assert clib.lib.natgw_dev_ddr_clear(C.byref(self.dev), 10) == 0
+            self.ddr = _ModelTable(DdrTable(ddr_bucket_w, seed0, seed1),
+                                   lambda ops, n: clib.lib.natgw_dev_apply_ddr(C.byref(self.dev), ops, n))
+        self.nh = _ModelNh(self)
+        self._buf = (C.c_uint8 * 16384)()
+
+    def __del__(self):
+        if getattr(self, "h", None):
+            clib.lib.natgw_model_destroy(self.h)
+            self.h = None
+
+    def _write_ctrl(self):
+        c = self._ctrl
+        clib.lib.natgw_dev_set_ctrl(C.byref(self.dev), bool(c["enable"]), bool(c["punt_hdr"]),
+                                    c["bypass_mask"] & 0xff, c["egress_en"] & 0xff)
+
+    def _ctrl_prop(name):  # noqa: N805
+        def get(self):
+            return self._ctrl[name]
+
+        def set_(self, v):
+            self._ctrl[name] = v
+            self._write_ctrl()
+        return property(get, set_)
+
+    enable = _ctrl_prop("enable")
+    punt_hdr = _ctrl_prop("punt_hdr")
+    bypass_mask = _ctrl_prop("bypass_mask")
+    egress_en = _ctrl_prop("egress_en")
+
+    @property
+    def ddr_active(self):
+        return self._ddr_active
+
+    @ddr_active.setter
+    def ddr_active(self, v):
+        self._ddr_active = bool(v)
+        clib.lib.natgw_dev_ddr_enable(C.byref(self.dev), self._ddr_active)
+
+    @property
+    def stats(self):
+        """{(lane, reason): count} for every non-zero counter"""
+        out = {}
+        for lane in range(LANES):
+            for r in range(18):
+                v = clib.lib.natgw_dev_read_stat(C.byref(self.dev), lane, r)
+                if v:
+                    out[(lane, r)] = v
+        return out
 
     def read_activity(self, word):
         """host read-and-clear of 64 activity bits"""
-        v = 0
-        for b in range(64):
-            if word * 64 + b in self.ddr_activity:
-                v |= 1 << b
-                self.ddr_activity.discard(word * 64 + b)
-        return v
-
-    def count(self, lane, reason):
-        k = (lane, reason)
-        self.stats[k] = self.stats.get(k, 0) + 1
-
-    def punt_header(self, lane, reason, p, h0, hit_idx):
-        flags = (1 if p.l3ok else 0) | (4 if p.vlan else 0) | (8 if hit_idx is not None else 0)
-        return struct.pack(">HBBBBHII", PUNT_MAGIC, PUNT_VER, reason, lane, flags, p.tci,
-                           h0 if p.lookup else 0,
-                           hit_idx if hit_idx is not None else 0xffffffff)
+        return clib.lib.natgw_dev_read_activity(C.byref(self.dev), word)
 
     def process(self, lane, frame):
         frame = bytes(frame)
-        bypass = (not self.enable) or bool((self.bypass_mask >> lane) & 1)
-        p = parse(frame, lane, bypass)
+        b, n = _buf(frame)
+        out = clib.ModelOut(0, 0, 0, 0, 0, C.cast(self._buf, C.POINTER(C.c_uint8)))
+        assert clib.lib.natgw_model_rx(self.h, lane, b, n, C.byref(out)) == 0
+        data = bytes(self._buf[:out.len])
+        hit = None if out.hit_idx == 0xffffffff else out.hit_idx
+        p = parse(frame, lane, (not self.enable) or bool((self.bypass_mask >> lane) & 1))
+        self._sample(lane, p, out, hit)
+        if out.kind == clib.OUT_FWD:
+            return Output("fwd", out.lane, data, RSN_FWD, hit)
+        return Output("punt", out.lane, data, out.reason, hit, p.fin, p.rst)
 
-        if p.reason == RSN_BYPASS:
-            self.count(lane, RSN_BYPASS)
-            return Output("punt", lane, frame, RSN_BYPASS)
+    _RSN_NAME = {RSN_MISS: "miss", RSN_BYPASS: "bypass", RSN_NOT_IPV4: "not_ipv4", RSN_MCAST: "mcast",
+                 RSN_IP_HDR: "ip_hdr", RSN_FRAG: "frag", RSN_TTL: "ttl", RSN_PROTO: "proto", RSN_CSUM: "csum",
+                 RSN_SYN: "syn", RSN_FINRST: "finrst", RSN_VLAN: "vlan", RSN_NH: "nh", RSN_FWD: "fwd"}
 
-        h0 = self.table.hashes(p.key)[0] if p.lookup else 0
-        hit_idx, e = (None, None)
-        if p.lookup:
-            hit_idx, e = self.lookup(p.key)
-
-        reason = p.reason
-        if reason == RSN_MISS and e is not None:
-            nh = self.nh.get(e.nh_idx)
-            if nh is None or not nh.valid or not (self.egress_en >> nh.lane) & 1:
-                reason = RSN_NH
-            elif nh.vlan != p.vlan:
-                reason = RSN_VLAN
-            else:
-                self.count(lane, RSN_FWD)
-                return Output("fwd", nh.lane, self.rewrite(frame, p, e, nh), RSN_FWD, hit_idx)
-
-        self.count(lane, reason)
-        data = frame
-        if self.punt_hdr:
-            data = self.punt_header(lane, reason, p, h0, hit_idx) + frame
-        return Output("punt", lane, data, reason, hit_idx, p.fin, p.rst)
-
-    @staticmethod
-    def rewrite(frame, p, e, nh):
-        f = bytearray(frame)
-        ip = p.ip_off
-        f[0:6] = nh.dst_mac.to_bytes(6, "big")
-        f[6:12] = nh.src_mac.to_bytes(6, "big")
-        if p.vlan:
-            tci = (p.tci & 0xf000) | (nh.vid & 0xfff)
-            f[14:16] = tci.to_bytes(2, "big")
-
-        ttl = f[ip+8]
-        proto = f[ip+9]
-        nttl = (ttl - 1) & 0xff if e.dec_ttl else ttl
-        ip_field = ip + (16 if e.xlate_dst else 12)
-        port_field = ip + (22 if e.xlate_dst else 20)
-        old_ip = int.from_bytes(f[ip_field:ip_field+4], "big")
-        old_port = int.from_bytes(f[port_field:port_field+2], "big")
-        new_ip = e.new_ip
-        new_port = e.new_port
-
-        hc = int.from_bytes(f[ip+10:ip+12], "big")
-        hc = csum_update3(hc, old_ip >> 16, new_ip >> 16, old_ip & 0xffff, new_ip & 0xffff,
-                          (ttl << 8) | proto, (nttl << 8) | proto)
-
-        l4c_off = ip + 20 + (16 if p.tcp else 6)
-        l4c = int.from_bytes(f[l4c_off:l4c_off+2], "big")
-        if p.tcp or l4c != 0:
-            l4c = csum_update3(l4c, old_ip >> 16, new_ip >> 16, old_ip & 0xffff, new_ip & 0xffff,
-                               old_port, new_port)
-            if not p.tcp and l4c == 0:
-                l4c = 0xffff
-
-        f[ip+8] = nttl
-        f[ip+10:ip+12] = hc.to_bytes(2, "big")
-        f[ip_field:ip_field+4] = new_ip.to_bytes(4, "big")
-        f[port_field:port_field+2] = new_port.to_bytes(2, "big")
-        f[l4c_off:l4c_off+2] = l4c.to_bytes(2, "big")
-        return bytes(f)
+    def _sample(self, lane, p, out, hit):
+        if not cov.ENABLED:
+            return
+        fwd = out.kind == clib.OUT_FWD
+        r = self._RSN_NAME.get(RSN_FWD if fwd else out.reason, str(out.reason))
+        cov.hit("outcome x vlan", r, "vlan" if p.vlan else "untagged")
+        cov.hit("outcome x lane", r, lane)
+        if not fwd:
+            cov.hit("punt header", "on" if self.punt_hdr and out.reason != RSN_BYPASS else "off")
+        if hit is None:
+            return
+        if hit & DDR_IDX_FLAG:
+            t, _, sl = self.ddr.split_idx(hit & ~DDR_IDX_FLAG)
+            tier, e = "ddr", self.ddr.slots.get(hit & ~DDR_IDX_FLAG)
+        else:
+            t, _, sl = self.table.split_idx(hit)
+            tier, e = "uram", self.table.slots.get(hit)
+        cov.hit("hit slot", tier, t, sl)
+        if p.fin or p.rst:
+            cov.hit("fin/rst hit", tier)
+        if fwd and e is not None:
+            cov.hit("forward kind", "dnat" if e.xlate_dst else "snat", "tcp" if p.tcp else "udp",
+                    "vlan" if p.vlan else "untagged", "dec_ttl" if e.dec_ttl else "keep_ttl")

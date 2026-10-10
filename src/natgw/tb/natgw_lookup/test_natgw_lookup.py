@@ -322,6 +322,36 @@ async def run_test_fill_lookup(dut):
 
 
 @cocotb.test()
+async def run_test_until_full(dut):
+    """Insert until the host table refuses a key (relocation search exhausted),
+    then every present key still hits with its action and absent keys miss:
+    the deepest relocations and the full table, in hardware."""
+    tb = TB(dut)
+    random.seed(3)
+    await tb.reset()
+    await setup_nh(tb)
+    keys, refused = [], 0
+    while refused < 3:
+        k = rand_key()
+        if k in tb.model.where:
+            continue
+        try:
+            tb.insert(rand_entry(k))
+            keys.append(k)
+        except nm.TableFull:
+            refused += 1
+    await tb.idle()
+    tb.log.info("full at load %.3f, %d keys", tb.model.load(), len(keys))
+    assert tb.model.load() > 0.9
+    for k in keys:
+        tb.send(k)
+    for _ in range(200):
+        tb.send(rand_key())
+    await tb.idle()
+    tb.check()
+
+
+@cocotb.test()
 async def run_test_collisions(dut):
     """Many keys sharing one T0 bucket: overflow into T1 and relocation."""
     tb = TB(dut)
