@@ -148,7 +148,8 @@ uses it automatically when the memory calibrated:
   `demote_idle`, `promote_k`, `promote_n`, `migrate_budget` and
   `min_residency`.
 - **xstats.** `natgw_ddr_flows`, `natgw_ddr_lookups`, `natgw_ddr_hits`,
-  `natgw_ddr_skips` (these three device-wide, wrapping at 32 bits),
+  `natgw_ddr_skips`, `natgw_ddr_read_errors` (these four device-wide,
+  wrapping at 32 bits; a DDR read that returns an error never hits),
   `natgw_promotions`, `natgw_demotions`, `natgw_migrate_failures`,
   `natgw_onchip_load_pct`, `natgw_ddr_skips_last_sweep`.
 

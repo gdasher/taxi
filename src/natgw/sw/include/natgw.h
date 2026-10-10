@@ -61,6 +61,7 @@ extern "C" {
 #define NATGW_REG_DDR_LOOKUPS 0x0068
 #define NATGW_REG_DDR_HITS    0x006C
 #define NATGW_REG_DDR_SKIPS   0x0070
+#define NATGW_REG_DDR_RERR    0x0074   /* DDR reads that returned an error (not trusted) */
 #define NATGW_REG_ACT_LO      0x0148
 #define NATGW_REG_ACT_HI      0x014C
 #define NATGW_REG_ENT_DATA    0x0100   /* 7 words */
@@ -275,6 +276,8 @@ void natgw_dev_read_ddr_entry(struct natgw_dev *d, uint32_t idx, struct natgw_en
 /* read and clear 64 activity bits: bit n is DDR entry 64 * word + n, set by any hit */
 uint64_t natgw_dev_read_activity(struct natgw_dev *d, uint32_t word);
 void natgw_dev_ddr_stats(struct natgw_dev *d, uint32_t *lookups, uint32_t *hits, uint32_t *skips);
+/* DDR reads that returned an error (wraps); such lines never hit */
+uint32_t natgw_dev_ddr_read_errors(struct natgw_dev *d);
 
 /* ------------------------------------------------------------------ */
 /* host copy of the cuckoo table */

@@ -657,7 +657,7 @@ async def run_test_ddr_random(dut):
 
     await tb.check_stats()
     stats = await tb.regs.ddr_stats()
-    assert stats["skips"] == 0 and stats["hits"] > 0, stats
+    assert stats["skips"] == 0 and stats["hits"] > 0 and stats["read_errors"] == 0, stats
     await check_activity(tb)
 
 

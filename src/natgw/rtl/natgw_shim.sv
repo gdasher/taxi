@@ -146,7 +146,7 @@ entry_t           host_ddr_wdata, host_ddr_rdata;
 wire              act_valid, act_ready, act_rvalid;
 wire [DIDX_W-7:0] act_word;
 wire [63:0]       act_rdata;
-wire              stat_ddr_lookup, stat_ddr_hit, stat_ddr_skip;
+wire              stat_ddr_lookup, stat_ddr_hit, stat_ddr_skip, stat_ddr_rerr;
 
 // per-lane key inputs to the lookup engine
 wire         key_valid[LANES];
@@ -601,6 +601,7 @@ if (DDR_ENABLE != 0) begin : ddr
         .stat_lookup(stat_ddr_lookup),
         .stat_hit(stat_ddr_hit),
         .stat_skip(stat_ddr_skip),
+        .stat_rerr(stat_ddr_rerr),
         .err_overflow()
     );
 
@@ -640,6 +641,7 @@ end else begin : no_ddr
     assign stat_ddr_lookup = 1'b0;
     assign stat_ddr_hit = 1'b0;
     assign stat_ddr_skip = 1'b0;
+    assign stat_ddr_rerr = 1'b0;
 
 end
 
@@ -774,7 +776,8 @@ regs_inst (
     .act_rdata(act_rdata),
     .stat_ddr_lookup(stat_ddr_lookup),
     .stat_ddr_hit(stat_ddr_hit),
-    .stat_ddr_skip(stat_ddr_skip)
+    .stat_ddr_skip(stat_ddr_skip),
+    .stat_ddr_rerr(stat_ddr_rerr)
 );
 
 endmodule

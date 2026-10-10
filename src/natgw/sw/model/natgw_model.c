@@ -259,6 +259,7 @@ uint32_t natgw_model_rd(struct natgw_model *m, uint32_t off)
 	case NATGW_REG_DDR_LOOKUPS: return m->ddr_lookups;
 	case NATGW_REG_DDR_HITS: return m->ddr_hits;
 	case NATGW_REG_DDR_SKIPS: return 0;     /* no request cap in the model */
+	case NATGW_REG_DDR_RERR: return 0;      /* no read errors in the model */
 	case NATGW_REG_ACT_LO: return m->act_data[0];
 	case NATGW_REG_ACT_HI: return m->act_data[1];
 	default: return 0;

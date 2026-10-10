@@ -28,6 +28,7 @@ Register map (byte offsets, 32-bit registers):
 0x0068  DDR_LOOKUPS   RO  DDR lookups issued (wraps)
 0x006C  DDR_HITS      RO  DDR hits (wraps)
 0x0070  DDR_SKIPS     RO  misses not looked up in DDR: request cap reached (wraps)
+0x0074  DDR_RERR      RO  DDR reads that returned an error, not trusted (wraps)
 0x0100  ENT_DATA0..6  RW  entry, 216 bits (word 0 = bits 31:0)
 0x0120  ST_DATA0..4   RW  state, 144 bits
 0x0140  INDEX         RW  entry index
@@ -152,7 +153,8 @@ module natgw_regs
     input  wire logic [63:0]       act_rdata,
     input  wire logic              stat_ddr_lookup,
     input  wire logic              stat_ddr_hit,
-    input  wire logic              stat_ddr_skip
+    input  wire logic              stat_ddr_skip,
+    input  wire logic              stat_ddr_rerr
 );
 
 localparam STAT_N = 18;
@@ -238,6 +240,7 @@ logic [31:0] act_data_reg[2];
 logic [31:0] ddr_lookups_reg = '0;
 logic [31:0] ddr_hits_reg = '0;
 logic [31:0] ddr_skips_reg = '0;
+logic [31:0] ddr_rerr_reg = '0;
 
 assign cfg_ddr_en = ddr_en_reg && DDR_ENABLE != 0;
 assign ddr_clear_start = ddr_clear_start_reg;
@@ -356,6 +359,7 @@ always_ff @(posedge clk) begin
     ddr_lookups_reg <= ddr_lookups_reg + 32'(stat_ddr_lookup);
     ddr_hits_reg <= ddr_hits_reg + 32'(stat_ddr_hit);
     ddr_skips_reg <= ddr_skips_reg + 32'(stat_ddr_skip);
+    ddr_rerr_reg <= ddr_rerr_reg + 32'(stat_ddr_rerr);
 
     if (host_ddr_valid && host_ddr_ready) begin
         ddr_pend_reg <= 1'b0;
@@ -597,6 +601,7 @@ always_ff @(posedge clk) begin
             16'h0068: s_axil_rdata_reg <= ddr_lookups_reg;
             16'h006C: s_axil_rdata_reg <= ddr_hits_reg;
             16'h0070: s_axil_rdata_reg <= ddr_skips_reg;
+            16'h0074: s_axil_rdata_reg <= ddr_rerr_reg;
             16'h0148: s_axil_rdata_reg <= act_data_reg[0];
             16'h014C: s_axil_rdata_reg <= act_data_reg[1];
             16'h0140: s_axil_rdata_reg <= index_reg;
@@ -657,6 +662,7 @@ always_ff @(posedge clk) begin
         ddr_lookups_reg <= '0;
         ddr_hits_reg <= '0;
         ddr_skips_reg <= '0;
+        ddr_rerr_reg <= '0;
     end
 end
 

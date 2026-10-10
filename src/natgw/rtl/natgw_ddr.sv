@@ -32,6 +32,11 @@ cover every result a lane can have in flight: the shim's metadata FIFO bounds
 that (a frame is looked up only once its metadata entry is queued); an
 overflow is a configuration error and is flagged.
 
+A read that returns an error (RRESP SLVERR or DECERR, e.g. an uncorrectable
+ECC error) is not trusted: neither slot of that line can hit (the lookup's
+other line still can: an entry lives in one place), a host read returns an
+empty entry, and every such beat is counted.
+
 The host writes, clears and reads DDR entries (writes are complete when their
 write response returns), and a hardware engine zeroes the whole DDR table
 (DDR contents are random after power-up). Host reads use AXI ID 8.
@@ -153,6 +158,7 @@ module natgw_ddr
     output wire logic                   stat_lookup,
     output wire logic                   stat_hit,
     output wire logic                   stat_skip,
+    output wire logic                   stat_rerr,      // a read returned an error
     output wire logic                   err_overflow
 );
 
@@ -423,6 +429,9 @@ always_ff @(posedge clk) begin
     if (m_axi_rvalid && m_axi_rid == HOST_ID) begin
         host_rd_done_reg <= 1'b1;
         host_rdata_reg <= entry_t'(host_slot_reg ? m_axi_rdata[256 +: ENTRY_W] : m_axi_rdata[0 +: ENTRY_W]);
+        if (m_axi_rresp[1]) begin
+            host_rdata_reg <= '0;
+        end
     end
     if (host_valid && host_ready) begin
         host_slot_reg <= host_idx[0];
@@ -442,15 +451,22 @@ end
 entry_t r0_slot0, r0_slot1;
 logic r0_valid_reg = 1'b0;
 logic [LANE_W-1:0] r0_lane_reg = '0;
+logic r0_err_reg = 1'b0;
 entry_t r0_slot0_reg = '0, r0_slot1_reg = '0;
+logic stat_rerr_reg = 1'b0;
+
+assign stat_rerr = stat_rerr_reg;
 
 always_ff @(posedge clk) begin
     r0_valid_reg <= m_axi_rvalid && m_axi_rid < AXI_ID_W'(LANES);
     r0_lane_reg <= LANE_W'(m_axi_rid);
+    r0_err_reg <= m_axi_rresp[1];      // SLVERR or DECERR: the line is not trusted
+    stat_rerr_reg <= m_axi_rvalid && m_axi_rresp[1];
     r0_slot0_reg <= entry_t'(m_axi_rdata[0 +: ENTRY_W]);
     r0_slot1_reg <= entry_t'(m_axi_rdata[256 +: ENTRY_W]);
     if (rst) begin
         r0_valid_reg <= 1'b0;
+        stat_rerr_reg <= 1'b0;
     end
 end
 
@@ -460,6 +476,7 @@ logic [LANES-1:0] second_reg = '0;
 logic r1_valid_reg = 1'b0;
 logic [LANE_W-1:0] r1_lane_reg = '0;
 logic r1_second_reg = 1'b0;
+logic r1_err_reg = 1'b0;
 entry_t r1_slot0_reg = '0, r1_slot1_reg = '0;
 pk_t r1_pk_reg = '0;
 
@@ -481,6 +498,7 @@ always_ff @(posedge clk) begin
     r1_valid_reg <= r0_valid_reg;
     r1_lane_reg <= r0_lane_reg;
     r1_second_reg <= second_reg[r0_lane_reg];
+    r1_err_reg <= r0_err_reg;
     r1_slot0_reg <= r0_slot0_reg;
     r1_slot1_reg <= r0_slot1_reg;
     r1_pk_reg <= pk;
@@ -500,8 +518,8 @@ always_comb begin
     logic h0, h1;
     entry_t e;
     dres_t d;
-    h0 = r1_slot0_reg.valid && r1_slot0_reg.key == r1_pk_reg.key;
-    h1 = r1_slot1_reg.valid && r1_slot1_reg.key == r1_pk_reg.key;
+    h0 = !r1_err_reg && r1_slot0_reg.valid && r1_slot0_reg.key == r1_pk_reg.key;
+    h1 = !r1_err_reg && r1_slot1_reg.valid && r1_slot1_reg.key == r1_pk_reg.key;
     e = h0 ? r1_slot0_reg : r1_slot1_reg;
     d.hit = h0 || h1;
     d.didx = {r1_second_reg, r1_second_reg ? r1_pk_reg.b1 : r1_pk_reg.b0, !h0};
@@ -521,8 +539,8 @@ end
 always_ff @(posedge clk) begin
     logic h0, h1;
     entry_t e;
-    h0 = r1_slot0_reg.valid && r1_slot0_reg.key == r1_pk_reg.key;
-    h1 = r1_slot1_reg.valid && r1_slot1_reg.key == r1_pk_reg.key;
+    h0 = !r1_err_reg && r1_slot0_reg.valid && r1_slot0_reg.key == r1_pk_reg.key;
+    h1 = !r1_err_reg && r1_slot1_reg.valid && r1_slot1_reg.key == r1_pk_reg.key;
     e = h0 ? r1_slot0_reg : r1_slot1_reg;
     if (r1_valid_reg && !r1_second_reg) begin
         first_reg[r1_lane_reg].hit <= h0 || h1;

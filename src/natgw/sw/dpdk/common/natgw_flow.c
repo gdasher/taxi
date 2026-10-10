@@ -1308,7 +1308,7 @@ static const char *const reason_names[NATGW_STAT_COUNT] = {
 
 unsigned natgw_flow_xstats_count(void)
 {
-	return NATGW_STAT_COUNT + 13;
+	return NATGW_STAT_COUNT + 14;
 }
 
 int natgw_flow_xstats_get_names(struct natgw_flow_ctx *ctx, struct rte_eth_xstat_name *names, unsigned size)
@@ -1329,6 +1329,7 @@ int natgw_flow_xstats_get_names(struct natgw_flow_ctx *ctx, struct rte_eth_xstat
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_lookups");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_hits");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_skips");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_read_errors");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_promotions");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_demotions");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_migrate_failures");
@@ -1361,6 +1362,7 @@ int natgw_flow_xstats_get(struct natgw_flow_ctx *ctx, unsigned lane, struct rte_
 		xstats[i].id = i; xstats[i++].value = lk;
 		xstats[i].id = i; xstats[i++].value = ht;
 		xstats[i].id = i; xstats[i++].value = sk;
+		xstats[i].id = i; xstats[i++].value = ctx->td ? natgw_dev_ddr_read_errors(&ctx->dev) : 0;
 	}
 	xstats[i].id = i; xstats[i++].value = ctx->promotions;
 	xstats[i].id = i; xstats[i++].value = ctx->demotions;

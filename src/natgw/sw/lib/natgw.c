@@ -462,6 +462,11 @@ void natgw_dev_ddr_stats(struct natgw_dev *d, uint32_t *lookups, uint32_t *hits,
 	*skips = rd(d, NATGW_REG_DDR_SKIPS);
 }
 
+uint32_t natgw_dev_ddr_read_errors(struct natgw_dev *d)
+{
+	return rd(d, NATGW_REG_DDR_RERR);
+}
+
 void natgw_dev_apply_ddr(struct natgw_dev *d, const struct natgw_write *ops, unsigned n)
 {
 	for (unsigned i = 0; i < n; i++) {

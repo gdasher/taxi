@@ -147,6 +147,7 @@ def test_tiers_match_python(seed):
     lookups, hits, skips = C.c_uint32(), C.c_uint32(), C.c_uint32()
     lib.natgw_dev_ddr_stats(dev(m), C.byref(lookups), C.byref(hits), C.byref(skips))
     assert hits.value >= ddr_fwd and lookups.value > hits.value and skips.value == 0
+    assert lib.natgw_dev_ddr_read_errors(dev(m)) == 0
     for lane in range(8):
         for r in range(16):
             assert lib.natgw_dev_read_stat(dev(m), lane, r) == py.stats.get((lane, r), 0)

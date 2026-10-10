@@ -4,7 +4,7 @@
 Formal: natgw_ddr (DDR tier of the flow table)
 
 The memory is free: AXI read address and data channels stall arbitrarily and
-return arbitrary data, but only for outstanding reads and in order per ID
+return arbitrary data and response codes (errors included), but only for outstanding reads and in order per ID
 (AXI's rule). Calibration and the host enable toggle at any time. Results
 arrive on lanes 0 and 1 (any of them a DDR candidate or not), never more in
 flight per lane than the shim's metadata FIFO allows (QUEUE_DEPTH). The
@@ -46,6 +46,7 @@ module formal_ddr
     input  wire logic               arready,
     input  wire logic [3:0]         rid,
     input  wire logic [511:0]       rdata,
+    input  wire logic [1:0]         rresp,     // free: error responses at any time
     input  wire logic               rvalid,
 
     input  wire logic               ddr_calib,
@@ -122,7 +123,7 @@ dut (
     .m_axi_arready(arready),
     .m_axi_rid(rid),
     .m_axi_rdata(rdata),
-    .m_axi_rresp('0),
+    .m_axi_rresp(rresp),
     .m_axi_rlast(1'b1),
     .m_axi_rvalid(rvalid),
     .m_axi_rready(rready),
@@ -150,6 +151,7 @@ dut (
     .stat_lookup(stat_lookup),
     .stat_hit(stat_hit),
     .stat_skip(stat_skip),
+    .stat_rerr(),
     .err_overflow(err_overflow)
 );
 

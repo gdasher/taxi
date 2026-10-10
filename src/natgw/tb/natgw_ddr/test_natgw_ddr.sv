@@ -97,7 +97,11 @@ logic [63:0] act_rdata;
 logic stat_lookup;
 logic stat_hit;
 logic stat_skip;
+logic stat_rerr;
 logic err_overflow;
+
+// test: force an error response (SLVERR) on the read data channel
+logic rresp_err;
 
 natgw_ddr #(
     .DDR_BUCKET_W(DDR_BUCKET_W),
@@ -107,7 +111,10 @@ natgw_ddr #(
     .QUEUE_DEPTH(QUEUE_DEPTH),
     .ACT_PIPE(ACT_PIPE)
 )
-uut (.*);
+uut (
+    .m_axi_rresp(m_axi_rresp | {rresp_err, 1'b0}),
+    .*
+);
 
 endmodule
 

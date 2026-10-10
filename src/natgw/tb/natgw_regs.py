@@ -30,6 +30,7 @@ REG_DDR_CTRL = 0x0064
 REG_DDR_LOOKUPS = 0x0068
 REG_DDR_HITS = 0x006C
 REG_DDR_SKIPS = 0x0070
+REG_DDR_RERR = 0x0074
 REG_ACT_LO = 0x0148
 REG_ACT_HI = 0x014C
 REG_ENT_DATA = 0x0100
@@ -219,4 +220,5 @@ class NatRegs:
 
     async def ddr_stats(self):
         return {"lookups": await self.rd(REG_DDR_LOOKUPS), "hits": await self.rd(REG_DDR_HITS),
-                "skips": await self.rd(REG_DDR_SKIPS)}
+                "skips": await self.rd(REG_DDR_SKIPS),
+                "read_errors": await self.rd(REG_DDR_RERR)}

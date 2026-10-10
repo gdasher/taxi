@@ -83,7 +83,8 @@ class TB:
         self.table = nm.DdrTable(self.bucket_w, SEED0, SEED1)
         self.nh = {}
         self.out = {l: [] for l in range(8)}
-        self.stats = {"lookup": 0, "hit": 0, "skip": 0, "overflow": 0, "lane_ar": 0}
+        self.stats = {"lookup": 0, "hit": 0, "skip": 0, "overflow": 0, "lane_ar": 0,
+                      "rerr": 0, "rerr_lane": 0, "rerr_host": 0}
         cocotb.start_soon(self._monitor())
 
         dut.s_valid.value = 0
@@ -105,6 +106,7 @@ class TB:
         dut.nh_clear_start.value = 0
         dut.act_valid.value = 0
         dut.act_word.value = 0
+        dut.rresp_err.value = 0
 
     def stall(self, prob):
         """random stalls on every AXI channel"""
@@ -136,6 +138,21 @@ class TB:
             self.stats["overflow"] += int(dut.err_overflow.value)
             if dut.m_axi_arvalid.value and dut.m_axi_arready.value and int(dut.m_axi_arid.value) < 8:
                 self.stats["lane_ar"] += 1
+            self.stats["rerr"] += int(dut.stat_rerr.value)
+            if dut.m_axi_rvalid.value and dut.m_axi_rready.value and dut.rresp_err.value:
+                self.stats["rerr_lane" if int(dut.m_axi_rid.value) < 8 else "rerr_host"] += 1
+
+    def inject_errors(self, prob, seed=0):
+        """force SLVERR on each cycle's read data with probability prob"""
+        async def run():
+            rng = random.Random(seed)
+            while self.err_prob:
+                self.dut.rresp_err.value = int(rng.random() < self.err_prob)
+                await RisingEdge(self.dut.clk)
+            self.dut.rresp_err.value = 0
+        self.err_prob = prob
+        if prob:
+            cocotb.start_soon(run())
 
     async def reset(self):
         self.dut.rst.value = 1
@@ -278,7 +295,7 @@ def make_items(rng, present, n, absent_frac=0.15, uram_frac=0.2, nolookup_frac=0
     return items, expect
 
 
-def check(tb, expect, allow_skips):
+def check(tb, expect, allow_skips, err_misses=0):
     """per lane, in order: unchanged results pass through, DDR hits carry the
     entry; a miss that was skipped (request cap) stays a miss"""
     hits = present_missed = misses = 0
@@ -304,7 +321,8 @@ def check(tb, expect, allow_skips):
                 assert g == want, f"lane {lane} result {n}: miss changed: {g} != {want}"
     assert tb.stats["hit"] == hits
     assert tb.stats["lookup"] + tb.stats["skip"] == misses, "every miss is looked up or skipped"
-    assert present_missed <= tb.stats["skip"], "a present key missed without a skip"
+    # a present key may miss only if skipped, or if one of its lines returned an error
+    assert present_missed <= tb.stats["skip"] + err_misses, "a present key missed without a skip"
     if not allow_skips:
         assert tb.stats["skip"] == 0 and present_missed == 0
     assert tb.stats["overflow"] == 0
@@ -456,3 +474,55 @@ def test_natgw_ddr(request, act_pipe):
         sim_build=sim_build,
         extra_env=extra_env,
     )
+
+
+@cocotb.test()
+async def run_test_read_errors(dut):
+    """reads returning SLVERR are not trusted: every line with an error is a
+    miss (a hit only from the other, good line), host reads with an error
+    return an empty entry, and every error beat is counted"""
+    tb = TB(dut)
+    await tb.reset()
+    await tb.clear()
+    rng = random.Random(21)
+    present = await populate(tb, rng, 2 * (1 << tb.bucket_w) * 2)
+    tb.stall(0.2)
+
+    # every lane read fails: no DDR hits at all
+    tb.inject_errors(1.0, seed=1)
+    items, expect = make_items(rng, present, 600)
+    await tb.drive(items, gap_prob=0.3, rng=rng)
+    await tb.settle(600)
+    tb.err_prob = 0
+    for _ in range(4):
+        await RisingEdge(dut.clk)
+    assert tb.stats["hit"] == 0, "a DDR hit from a line that returned an error"
+    for lane in range(8):
+        for (kind, res, key), g in zip(expect[lane], tb.out[lane]):
+            assert not (kind == "miss" and g["hit"]), "hit from an errored read"
+    assert tb.stats["rerr_lane"] == 2 * tb.stats["lookup"] and tb.stats["rerr"] == tb.stats["rerr_lane"]
+
+    # a host read that fails returns an empty entry
+    idx = next(iter(tb.table.slots))
+    assert await tb.host(3, idx) == tb.table.slots[idx].pack()
+    tb.inject_errors(1.0, seed=2)
+    assert await tb.host(3, idx) == 0
+    tb.err_prob = 0
+    for _ in range(4):
+        await RisingEdge(dut.clk)
+    assert tb.stats["rerr_host"] >= 1
+
+    # random errors: hits only ever come from good lines, misses are accounted for
+    tb.out = {l: [] for l in range(8)}
+    for k in ("lookup", "hit", "skip", "rerr", "rerr_lane", "rerr_host"):
+        tb.stats[k] = 0
+    tb.inject_errors(0.3, seed=3)
+    items, expect = make_items(rng, present, 2000)
+    await tb.drive(items, gap_prob=0.5, rng=rng)
+    await tb.settle(2000)
+    tb.err_prob = 0
+    for _ in range(4):
+        await RisingEdge(dut.clk)
+    hits = check(tb, expect, allow_skips=True, err_misses=tb.stats["rerr_lane"])
+    assert hits > 100 and tb.stats["rerr_lane"] > 100 and tb.stats["rerr"] == tb.stats["rerr_lane"]
+
