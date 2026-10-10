@@ -277,5 +277,10 @@ Expect about a minute of gateway outage per update. If a new image doesn't enume
 ## What has been tested
 
 - **Host scripts:** `tests/` runs the hook and `natgw-fpga-update` against a fake host. It covers update, failure, strict mode, wrong card ID, rebinding and restart.
-- **Guest setup script:** run end to end, from a fresh Ubuntu 24.04 system container to a working VPP install, with `--skip-hw`. That run covers packages, sources, DPDK, VPP, the WAN manager, configuration and services.
+- **Guest setup script:** run end to end with `--skip-hw` in a fresh Ubuntu 24.04 system container (systemd-nspawn), from a bare install through packages, sources, DPDK, VPP, the WAN manager, configuration and services. Then checked:
+  - the rendered configuration, with dnsmasq staged but disabled until cut-over;
+  - the systemd units, which validate with `systemd-analyze verify`;
+  - DPDK built for generic x86-64 (`-march=corei7`) with exactly the intended drivers;
+  - all plugin libraries resolve;
+  - the installed VPP starts with the FPGA model device (`net_natgw_model`), creates `NatgwModel0–2`, and enables the natgw offload and nat44.
 - **Not tested (no hardware or Proxmox here):** the hardware steps (vfio, hugepages, kernel command line), `natgw-host-setup.sh` on a real Proxmox host, Pyrite flashing of a U200, and the VM settings.
