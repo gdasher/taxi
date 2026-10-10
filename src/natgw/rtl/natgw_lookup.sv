@@ -41,6 +41,11 @@ module natgw_lookup
     output wire logic               m_res_valid,
     output wire logic [2:0]         m_res_lane,
     output wire result_t            m_res,
+    // for a second-tier (DDR) lookup: the key, both hashes and whether the
+    // frame was looked up (unused, and removed by synthesis, without one)
+    output wire key_t               m_res_key,
+    output wire logic [31:0]        m_res_h1,
+    output wire logic               m_res_lookup,
 
     /*
      * Hit stream to state block
@@ -292,6 +297,7 @@ assign host_ent_rdata = host_ent_rdata_reg;
 pmeta_t d_meta[RAM_PIPE];
 key_t d_key[RAM_PIPE];
 logic [31:0] d_h0[RAM_PIPE];
+logic [31:0] d_h1[RAM_PIPE];
 logic [BUCKET_W-1:0] d_b0[RAM_PIPE];
 logic [BUCKET_W-1:0] d_b1[RAM_PIPE];
 
@@ -299,12 +305,14 @@ always_ff @(posedge clk) begin
     d_meta[0] <= s2_meta_reg;
     d_key[0] <= s2_key_reg;
     d_h0[0] <= s2_h0_reg;
+    d_h1[0] <= s2_h1_reg;
     d_b0[0] <= s2_h0_reg[BUCKET_W-1:0];
     d_b1[0] <= s2_h1_reg[BUCKET_W-1:0];
     for (int i = 1; i < RAM_PIPE; i++) begin
         d_meta[i] <= d_meta[i-1];
         d_key[i] <= d_key[i-1];
         d_h0[i] <= d_h0[i-1];
+        d_h1[i] <= d_h1[i-1];
         d_b0[i] <= d_b0[i-1];
         d_b1[i] <= d_b1[i-1];
     end
@@ -329,6 +337,8 @@ typedef struct packed {
 
 pmeta_t c_meta_reg = '0;
 logic [31:0] c_h0_reg = '0;
+logic [31:0] c_h1_reg = '0;
+key_t c_key_reg = '0;
 logic [BUCKET_W-1:0] c_b0_reg = '0, c_b1_reg = '0;
 logic [MEMS-1:0] c_match_reg = '0;
 action_t c_act_reg[MEMS];
@@ -336,6 +346,8 @@ action_t c_act_reg[MEMS];
 always_ff @(posedge clk) begin
     c_meta_reg <= d_meta[RAM_PIPE-1];
     c_h0_reg <= d_h0[RAM_PIPE-1];
+    c_h1_reg <= d_h1[RAM_PIPE-1];
+    c_key_reg <= d_key[RAM_PIPE-1];
     c_b0_reg <= d_b0[RAM_PIPE-1];
     c_b1_reg <= d_b1[RAM_PIPE-1];
     for (int m = 0; m < MEMS; m++) begin
@@ -360,6 +372,8 @@ logic p_hit_reg = 1'b0;
 logic [IDX_W-1:0] p_idx_reg = '0;
 action_t p_act_reg = '0;
 logic [31:0] p_h0_reg = '0;
+logic [31:0] p_h1_reg = '0;
+key_t p_key_reg = '0;
 
 always_ff @(posedge clk) begin
     logic hit;
@@ -380,6 +394,8 @@ always_ff @(posedge clk) begin
     p_idx_reg <= hit ? {sel[2], sel[2] ? c_b1_reg : c_b0_reg, sel[1:0]} : '0;
     p_act_reg <= hit ? c_act_reg[sel] : '0;
     p_h0_reg <= c_meta_reg.lookup ? c_h0_reg : '0;
+    p_h1_reg <= c_h1_reg;
+    p_key_reg <= c_key_reg;
 
     if (rst) begin
         p_meta_reg.valid <= 1'b0;
@@ -432,6 +448,8 @@ logic n_hit[NH_PIPE];
 logic [IDX_W-1:0] n_idx[NH_PIPE];
 action_t n_act[NH_PIPE];
 logic [31:0] n_h0[NH_PIPE];
+logic [31:0] n_h1[NH_PIPE];
+key_t n_key[NH_PIPE];
 
 always_ff @(posedge clk) begin
     n_meta[0] <= p_meta_reg;
@@ -439,12 +457,16 @@ always_ff @(posedge clk) begin
     n_idx[0] <= p_idx_reg;
     n_act[0] <= p_act_reg;
     n_h0[0] <= p_h0_reg;
+    n_h1[0] <= p_h1_reg;
+    n_key[0] <= p_key_reg;
     for (int i = 1; i < NH_PIPE; i++) begin
         n_meta[i] <= n_meta[i-1];
         n_hit[i] <= n_hit[i-1];
         n_idx[i] <= n_idx[i-1];
         n_act[i] <= n_act[i-1];
         n_h0[i] <= n_h0[i-1];
+        n_h1[i] <= n_h1[i-1];
+        n_key[i] <= n_key[i-1];
     end
 
     if (rst) begin
@@ -460,6 +482,9 @@ end
 logic out_valid_reg = 1'b0;
 logic [2:0] out_lane_reg = '0;
 result_t out_res_reg = '0;
+key_t out_key_reg = '0;
+logic [31:0] out_h1_reg = '0;
+logic out_lookup_reg = 1'b0;
 logic out_hit_valid_reg = 1'b0;
 logic [15:0] out_len_reg = '0;
 logic out_fin_reg = 1'b0;
@@ -477,6 +502,9 @@ always_ff @(posedge clk) begin
     out_res_reg.nh_idx <= n_act[NH_PIPE-1].nh_idx;
     out_res_reg.nh <= n_hit[NH_PIPE-1] ? nh_a_dout : '0;
     out_res_reg.hash <= n_h0[NH_PIPE-1];
+    out_key_reg <= n_key[NH_PIPE-1];
+    out_h1_reg <= n_h1[NH_PIPE-1];
+    out_lookup_reg <= n_meta[NH_PIPE-1].lookup;
     out_hit_valid_reg <= n_meta[NH_PIPE-1].valid && n_hit[NH_PIPE-1];
     out_len_reg <= n_meta[NH_PIPE-1].len;
     out_fin_reg <= n_meta[NH_PIPE-1].fin;
@@ -491,6 +519,9 @@ end
 assign m_res_valid = out_valid_reg;
 assign m_res_lane = out_lane_reg;
 assign m_res = out_res_reg;
+assign m_res_key = out_key_reg;
+assign m_res_h1 = out_h1_reg;
+assign m_res_lookup = out_lookup_reg;
 
 assign m_hit_valid = out_hit_valid_reg;
 assign m_hit_idx = IDX_W'(out_res_reg.idx);

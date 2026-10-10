@@ -21,7 +21,7 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, Timer, with_timeout
 
-from cocotbext.axi import AxiLiteBus, AxiLiteMaster
+from cocotbext.axi import AxiLiteBus, AxiLiteMaster, AxiBus, AxiRam
 from cocotbext.axi import AxiStreamBus, AxiStreamFrame, AxiStreamSource, AxiStreamSink
 
 from scapy.layers.l2 import Ether, Dot1Q, ARP
@@ -94,7 +94,19 @@ class TB:
             self.core_tx.append(AxiStreamSource(AxiStreamBus.from_entity(dut.core_tx[n]), tclk, trst))
             self.core_cpl.append(AxiStreamSink(AxiStreamBus.from_entity(dut.core_tx_cpl[n]), tclk, trst))
 
-        self.model = nm.ShimModel(bucket_w=self.bucket_w)
+        # DDR tier: an AXI memory model behind the shim's DDR port
+        self.ddr = int(dut.DDR_ENABLE.value) != 0
+        if self.ddr:
+            self.ram = AxiRam(AxiBus.from_prefix(dut, "m_axi_ddr"), dut.clk, dut.rst, size=2**24)
+            for ifc in (self.ram.write_if, self.ram.read_if):
+                ifc.log.setLevel(logging.WARNING)
+            self.model = nm.ShimModel(bucket_w=self.bucket_w, ddr_bucket_w=int(dut.DDR_BUCKET_W.value))
+        else:
+            for sig in ("awready", "wready", "bvalid", "arready", "rvalid", "rlast", "bid", "bresp",
+                        "rid", "rresp", "rdata"):
+                getattr(dut, f"m_axi_ddr_{sig}").setimmediatevalue(0)
+            self.model = nm.ShimModel(bucket_w=self.bucket_w)
+        dut.ddr_calib.setimmediatevalue(1 if self.ddr else 0)
         self.seq = 0
 
         # received traffic
@@ -158,8 +170,13 @@ class TB:
             await self.regs.write_nh(idx, nh)
         await self.regs.set_ctrl(True, punt_hdr=punt_hdr, bypass=0, egress_en=egress_en)
 
-    async def add_session(self, lan_ip, lan_port, rem_ip, rem_port, tcp, wan):
-        """Install both directions of a NAT session; returns the two keys."""
+    async def enable_ddr(self):
+        """clear the DDR table (random after power-up) and enable lookups"""
+        await self.regs.ddr_clear(enable_after=True)
+        self.model.ddr_active = True
+
+    async def add_session(self, lan_ip, lan_port, rem_ip, rem_port, tcp, wan, tier="uram"):
+        """Install both directions of a NAT session in a tier; returns the two keys."""
         pub_ip = PUB_IP[wan]
         pub_port = 1024 + (hash((lan_ip, lan_port, rem_ip, rem_port, tcp)) & 0x7fff)
         out_key = nm.Key(lane=LAN_LANE, vid=0, tcp=tcp, sip=lan_ip, dip=rem_ip, sport=lan_port, dport=rem_port)
@@ -167,7 +184,10 @@ class TB:
         out_e = nm.Entry(key=out_key, xlate_dst=0, new_ip=pub_ip, new_port=pub_port, dec_ttl=1, nh_idx=NH_WAN[wan])
         in_e = nm.Entry(key=in_key, xlate_dst=1, new_ip=lan_ip, new_port=lan_port, dec_ttl=1, nh_idx=NH_LAN)
         for e in (out_e, in_e):
-            await self.regs.apply(self.model.table.insert(e))
+            if tier == "ddr":
+                await self.regs.apply_ddr(self.model.ddr.insert(e))
+            else:
+                await self.regs.apply(self.model.table.insert(e))
         return out_key, in_key
 
     # ---------------------------------------------------------------- traffic
@@ -303,15 +323,22 @@ def lan_ip():
     return 0xc0a80100 | random.randint(2, 254)
 
 
-async def make_sessions(tb, count):
+async def make_sessions(tb, count, ddr_frac=0.0):
     sessions = []
     for _ in range(count):
         tcp = random.randint(0, 1)
         wan = random.randint(0, 1)
         args = (lan_ip(), random.randint(1024, 65535), random_ip(), random.choice([53, 80, 443, random.randint(1, 65535)]), tcp, wan)
-        out_key, in_key = await tb.add_session(*args)
+        tier = "ddr" if random.random() < ddr_frac else "uram"
+        out_key, in_key = await tb.add_session(*args, tier=tier)
         sessions.append((out_key, in_key, wan))
     return sessions
+
+
+def ddr_only(tb):
+    if not tb.ddr:
+        tb.log.info("no DDR tier in this build: skipped")
+    return tb.ddr
 
 
 # ------------------------------------------------------------------ tests
@@ -565,6 +592,126 @@ async def run_test_events(dut):
     assert seen == idle_idx, (seen, idle_idx)
 
 
+# ------------------------------------------------------------------ DDR tier
+
+def random_sends(tb, sessions, n):
+    sends = []
+    for _ in range(n):
+        r = random.random()
+        out_key, in_key, wan = random.choice(sessions)
+        if r < 0.4:
+            sends.append((LAN_LANE, tb.flow_packet(out_key, LAN_LANE)))
+        elif r < 0.75:
+            sends.append((WAN_LANES[wan], tb.flow_packet(in_key, WAN_LANES[wan], src_mac=WAN_GW_MAC[wan])))
+        elif r < 0.85:
+            lane = random.randrange(LANES)
+            sends.append((lane, tb.exception_packet(lane)))
+        else:
+            lane = random.randrange(LANES)
+            k = nm.Key(lane, 0, random.randint(0, 1), random_ip(), random_ip(), random.randint(1, 65535), random.randint(1, 65535))
+            sends.append((lane, tb.flow_packet(k, lane)))
+    return sends
+
+
+async def check_activity(tb):
+    words = (tb.model.ddr.size + 63) // 64
+    for w in range(words):
+        got = await tb.regs.read_activity(w)
+        exp = tb.model.read_activity(w)
+        assert got == exp, f"activity word {w}: {got:#x} != {exp:#x}"
+
+
+@cocotb.test()
+async def run_test_ddr_random(dut):
+    """Sessions in both tiers, random traffic with stalls and churn in both tiers:
+    every frame exactly as the two-tier model predicts, in order"""
+    tb = TB(dut)
+    if not ddr_only(tb):
+        return
+    random.seed(21)
+    await tb.reset()
+    st = await tb.regs.ddr_status()
+    assert st["present"] and st["calibrated"] and not st["enabled"], st
+    await tb.enable_ddr()
+    assert (await tb.regs.ddr_status())["active"]
+    await tb.setup_gateway(punt_hdr=True)
+    sessions = await make_sessions(tb, 120, ddr_frac=0.5)
+    tb.log.info("UltraRAM load %.2f, DDR load %.2f", tb.model.table.load(), tb.model.ddr.load())
+
+    for burst in range(3):
+        tb.begin()
+        for n in range(LANES):
+            tb.mac_rx[n].set_pause_generator(itertools.cycle([random.random() < 0.3 for _ in range(37)]))
+            tb.mac_tx[n].set_pause_generator(itertools.cycle([random.random() < 0.2 for _ in range(41)]))
+        for lane, data in random_sends(tb, sessions, 500):
+            await tb.send(lane, data)
+        await tb.collect()
+        for _ in range(15):
+            out_key, in_key, wan = sessions.pop(random.randrange(len(sessions)))
+            for k in (out_key, in_key):
+                if k in tb.model.ddr.where:
+                    await tb.regs.apply_ddr(tb.model.ddr.delete(k))
+                else:
+                    await tb.regs.apply(tb.model.table.delete(k))
+        sessions += await make_sessions(tb, 15, ddr_frac=0.5)
+
+    await tb.check_stats()
+    stats = await tb.regs.ddr_stats()
+    assert stats["skips"] == 0 and stats["hits"] > 0, stats
+    await check_activity(tb)
+
+
+@cocotb.test()
+async def run_test_ddr_fin_and_entries(dut):
+    """A FIN on a DDR flow is punted with the DDR index; host entry read-back"""
+    tb = TB(dut)
+    if not ddr_only(tb):
+        return
+    random.seed(22)
+    await tb.reset()
+    await tb.enable_ddr()
+    await tb.setup_gateway(punt_hdr=True)
+    sessions = await make_sessions(tb, 6, ddr_frac=1.0)
+    tcp = [s for s in sessions if s[0].tcp] or sessions
+    out_key = tcp[0][0]
+    idx, e = tb.model.ddr.lookup(out_key)
+    assert await tb.regs.read_ddr_entry(idx) == e
+    tb.begin()
+    await tb.send(LAN_LANE, tb.flow_packet(out_key, LAN_LANE, flags='FA' if out_key.tcp else 'A'))
+    await tb.collect()
+    if out_key.tcp:
+        hdr = tb.punt_rx[LAN_LANE][-1][:16]
+        assert int.from_bytes(hdr[12:16], "big") == nm.DDR_IDX_FLAG | idx, hdr.hex()
+        assert hdr[5] & 8, "hit flag"
+    await check_activity(tb)
+
+
+@cocotb.test()
+async def run_test_ddr_no_dimm(dut):
+    """The memory controller never calibrates (no DIMM): the tier stays
+    inactive even when enabled, DDR sessions are punted as misses, and the
+    shim otherwise works as without a DDR tier"""
+    tb = TB(dut)
+    if not ddr_only(tb):
+        return
+    random.seed(23)
+    dut.ddr_calib.value = 0
+    await tb.reset()
+    st = await tb.regs.ddr_status()
+    assert st["present"] and not st["calibrated"], st
+    await tb.regs.ddr_enable(True)
+    assert not (await tb.regs.ddr_status())["active"]
+    tb.model.ddr_active = False
+    await tb.setup_gateway(punt_hdr=True)
+    sessions = await make_sessions(tb, 40, ddr_frac=0.5)
+    tb.begin()
+    for lane, data in random_sends(tb, sessions, 300):
+        await tb.send(lane, data)
+    await tb.collect()
+    await tb.check_stats()
+    assert (await tb.regs.ddr_stats())["lookups"] == 0
+
+
 # ------------------------------------------------------------------ cocotb-test
 
 tests_dir = os.path.dirname(__file__)
@@ -586,9 +733,9 @@ def process_f_files(files):
     return list(lst.values())
 
 
-@pytest.mark.parametrize("ram_pipe", [3, 5])
+@pytest.mark.parametrize("ram_pipe,ddr", [(3, 0), (5, 0), (3, 1)])
 @pytest.mark.parametrize("bucket_w", [8])
-def test_natgw_shim(request, bucket_w, ram_pipe):
+def test_natgw_shim(request, bucket_w, ram_pipe, ddr):
     dut = "natgw_shim"
     module = os.path.splitext(os.path.basename(__file__))[0]
     toplevel = module
@@ -606,6 +753,8 @@ def test_natgw_shim(request, bucket_w, ram_pipe):
     parameters['BUCKET_W'] = bucket_w
     parameters['RAM_PIPE'] = ram_pipe
     parameters['TICK_DIV_RST'] = 64
+    parameters['DDR_ENABLE'] = ddr
+    parameters['DDR_BUCKET_W'] = 8
 
     extra_env = {f'PARAM_{k}': str(v) for k, v in parameters.items()}
 

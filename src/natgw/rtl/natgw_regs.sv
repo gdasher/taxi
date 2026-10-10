@@ -6,7 +6,7 @@ NAT gateway shim: control and status registers (AXI-Lite, BAR0 + 0x800000)
 Register map (byte offsets, 32-bit registers):
 
 0x0000  ID            RO  0x4E415447 ("NATG")
-0x0004  VERSION       RO  0x00010000
+0x0004  VERSION       RO  0x00010100 (1.1: DDR tier registers)
 0x0008  CAPS          RO  [7:0] IDX_W, [15:8] lanes, [23:16] punt header bytes
 0x000C  SCRATCH       RW
 0x0010  CTRL          RW  [0] enable, [1] punt header, [15:8] bypass mask (reset 0xFF),
@@ -20,12 +20,24 @@ Register map (byte offsets, 32-bit registers):
 0x0034  THRESH_UDP    RW  idle threshold, ticks (reset 300000)
 0x0038  SCAN          RW  [31] enable (reset 1), [15:0] interval in cycles (reset 5)
 0x003C  BUBBLE        RW  [15:0] cycles between forced idle slots (reset 16, 0 = never)
+0x0060  DDR_STATUS    RO  [0] DDR tier in this build, [1] memory calibrated (a DIMM is
+                          fitted and working), [2] enabled, [3] clearing, [4] active
+                          (looked up), [15:8] DDR_BUCKET_W, [23:16] lookups in flight
+                          per lane (cap); all zero without a DDR tier
+0x0064  DDR_CTRL      RW  [0] enable; W [1] start clearing the DDR table and bitmap
+0x0068  DDR_LOOKUPS   RO  DDR lookups issued (wraps)
+0x006C  DDR_HITS      RO  DDR hits (wraps)
+0x0070  DDR_SKIPS     RO  misses not looked up in DDR: request cap reached (wraps)
 0x0100  ENT_DATA0..6  RW  entry, 216 bits (word 0 = bits 31:0)
 0x0120  ST_DATA0..4   RW  state, 144 bits
 0x0140  INDEX         RW  entry index
 0x0144  CMD           W:  1 write entry (and init its state), 2 write state, 3 read entry,
-                          4 read state, 5 clear entry (entry and state zeroed)
+                          4 read state, 5 clear entry (entry and state zeroed),
+                          6 write DDR entry (ENT_DATA at DDR index INDEX), 7 clear DDR entry,
+                          8 read DDR entry into ENT_DATA, 9 read and clear activity word INDEX
                       R:  [0] busy
+0x0148  ACT_LO        RO  activity bits 31:0 of the last word read (DDR entries 64*INDEX + n)
+0x014C  ACT_HI        RO  activity bits 63:32
 0x0200  NH_INDEX      RW
 0x0204  NH_CMD        W:  1 write, 2 read; R: [0] busy
 0x0210  NH_DATA0..3   RW  next hop, 128 bits
@@ -51,7 +63,11 @@ module natgw_regs
     import natgw_pkg::*;
 #(
     parameter IDX_W = 19,
-    parameter TICK_DIV_RST = 250000
+    parameter TICK_DIV_RST = 250000,
+    parameter DDR_ENABLE = 0,
+    parameter DDR_BUCKET_W = 20,
+    parameter DDR_MAX_OUT = 16,
+    parameter DIDX_W = DDR_BUCKET_W + 2
 )
 (
     input  wire logic              clk,
@@ -114,7 +130,29 @@ module natgw_regs
     input  wire logic [7:0]        stat_reason[LANES],
     input  wire logic              stat_ingress_drop[LANES],
     input  wire logic              stat_ingress_bad[LANES],
-    input  wire logic              stat_evt_drop
+    input  wire logic              stat_evt_drop,
+
+    // DDR tier (unused without one)
+    input  wire logic              ddr_calib,
+    input  wire logic              ddr_active,
+    output wire logic              cfg_ddr_en,
+    output wire logic              ddr_clear_start,
+    input  wire logic              ddr_clear_busy,
+    output wire logic              host_ddr_valid,
+    input  wire logic              host_ddr_ready,
+    output wire logic [1:0]        host_ddr_op,
+    output wire logic [DIDX_W-1:0] host_ddr_idx,
+    output wire entry_t            host_ddr_wdata,
+    input  wire logic              host_ddr_done,
+    input  wire entry_t            host_ddr_rdata,
+    output wire logic              act_valid,
+    input  wire logic              act_ready,
+    output wire logic [DIDX_W-7:0] act_word,
+    input  wire logic              act_rvalid,
+    input  wire logic [63:0]       act_rdata,
+    input  wire logic              stat_ddr_lookup,
+    input  wire logic              stat_ddr_hit,
+    input  wire logic              stat_ddr_skip
 );
 
 localparam STAT_N = 18;
@@ -160,13 +198,17 @@ logic [31:0] nh_data_reg[4];
 logic [9:0]  nh_index_reg = '0;
 
 // command engine
-typedef enum logic [2:0] {
-    CMD_NONE = 3'd0,
-    CMD_WR_ENT = 3'd1,
-    CMD_WR_ST = 3'd2,
-    CMD_RD_ENT = 3'd3,
-    CMD_RD_ST = 3'd4,
-    CMD_CLR = 3'd5
+typedef enum logic [3:0] {
+    CMD_NONE = 4'd0,
+    CMD_WR_ENT = 4'd1,
+    CMD_WR_ST = 4'd2,
+    CMD_RD_ENT = 4'd3,
+    CMD_RD_ST = 4'd4,
+    CMD_CLR = 4'd5,
+    CMD_DDR_WR = 4'd6,
+    CMD_DDR_CLR = 4'd7,
+    CMD_DDR_RD = 4'd8,
+    CMD_ACT_RC = 4'd9
 } cmd_t;
 
 logic        ent_pend_reg = 1'b0;
@@ -183,7 +225,31 @@ logic        nh_we_reg = 1'b0;
 logic        nh_wait_reg = 1'b0;
 nh_t         nh_wdata_reg = '0;
 
-wire busy = ent_pend_reg || ent_wait_reg || st_pend_reg || st_wait_reg || nh_pend_reg || nh_wait_reg;
+// DDR tier
+logic        ddr_en_reg = 1'b0;
+logic        ddr_clear_start_reg = 1'b0;
+logic        ddr_pend_reg = 1'b0;
+logic        ddr_wait_reg = 1'b0;
+logic [1:0]  ddr_op_reg = '0;
+entry_t      ddr_wdata_reg = '0;
+logic        act_pend_reg = 1'b0;
+logic        act_wait_reg = 1'b0;
+logic [31:0] act_data_reg[2];
+logic [31:0] ddr_lookups_reg = '0;
+logic [31:0] ddr_hits_reg = '0;
+logic [31:0] ddr_skips_reg = '0;
+
+assign cfg_ddr_en = ddr_en_reg && DDR_ENABLE != 0;
+assign ddr_clear_start = ddr_clear_start_reg;
+assign host_ddr_valid = ddr_pend_reg;
+assign host_ddr_op = ddr_op_reg;
+assign host_ddr_idx = DIDX_W'(index_reg);
+assign host_ddr_wdata = ddr_wdata_reg;
+assign act_valid = act_pend_reg;
+assign act_word = (DIDX_W-6)'(index_reg);
+
+wire busy = ent_pend_reg || ent_wait_reg || st_pend_reg || st_wait_reg || nh_pend_reg || nh_wait_reg ||
+    ddr_pend_reg || ddr_wait_reg || act_pend_reg || act_wait_reg;
 
 assign host_ent_valid = ent_pend_reg;
 assign host_ent_we = ent_we_reg;
@@ -285,6 +351,33 @@ always_ff @(posedge clk) begin
 
     s_evt_ready_reg <= 1'b0;
     clear_start_reg <= 1'b0;
+    ddr_clear_start_reg <= 1'b0;
+
+    ddr_lookups_reg <= ddr_lookups_reg + 32'(stat_ddr_lookup);
+    ddr_hits_reg <= ddr_hits_reg + 32'(stat_ddr_hit);
+    ddr_skips_reg <= ddr_skips_reg + 32'(stat_ddr_skip);
+
+    if (host_ddr_valid && host_ddr_ready) begin
+        ddr_pend_reg <= 1'b0;
+        ddr_wait_reg <= 1'b1;
+    end
+    if (ddr_wait_reg && host_ddr_done) begin
+        ddr_wait_reg <= 1'b0;
+        if (ddr_op_reg == 2'd3) begin
+            for (int k = 0; k < 7; k++) begin
+                ent_data_reg[k] <= 32'(ENTRY_W'(host_ddr_rdata) >> (32*k));
+            end
+        end
+    end
+    if (act_valid && act_ready) begin
+        act_pend_reg <= 1'b0;
+        act_wait_reg <= 1'b1;
+    end
+    if (act_wait_reg && act_rvalid) begin
+        act_wait_reg <= 1'b0;
+        act_data_reg[0] <= act_rdata[31:0];
+        act_data_reg[1] <= act_rdata[63:32];
+    end
 
     // initial table clear after reset
     if (init_clear_reg) begin
@@ -371,6 +464,10 @@ always_ff @(posedge clk) begin
                 scan_interval_reg <= wdata[15:0];
             end
             16'h003C: bubble_reg <= wdata[15:0];
+            16'h0064: begin
+                ddr_en_reg <= wdata[0];
+                ddr_clear_start_reg <= wdata[1] && DDR_ENABLE != 0;
+            end
             16'h0140: index_reg <= wdata;
             16'h0144: begin
                 entry_t e;
@@ -379,7 +476,7 @@ always_ff @(posedge clk) begin
                     ent_data_reg[2], ent_data_reg[1], ent_data_reg[0]});
                 s = state_t'({st_data_reg[4], st_data_reg[3], st_data_reg[2], st_data_reg[1], st_data_reg[0]});
                 cmd_idx_reg <= IDX_W'(index_reg);
-                case (cmd_t'(wdata[2:0]))
+                case (cmd_t'(wdata[3:0]))
                     CMD_WR_ENT: begin
                         ent_pend_reg <= 1'b1;
                         ent_we_reg <= 1'b1;
@@ -411,6 +508,19 @@ always_ff @(posedge clk) begin
                         st_pend_reg <= 1'b1;
                         st_we_reg <= 1'b1;
                         st_wdata_reg <= '0;
+                    end
+                    // DDR tier: ignored without one (no request, no wait)
+                    CMD_DDR_WR, CMD_DDR_CLR, CMD_DDR_RD: begin
+                        if (DDR_ENABLE != 0) begin
+                            ddr_pend_reg <= 1'b1;
+                            ddr_op_reg <= wdata[3:0] == 4'd6 ? 2'd1 : wdata[3:0] == 4'd7 ? 2'd2 : 2'd3;
+                            ddr_wdata_reg <= e;
+                        end
+                    end
+                    CMD_ACT_RC: begin
+                        if (DDR_ENABLE != 0) begin
+                            act_pend_reg <= 1'b1;
+                        end
                     end
                     default: begin end
                 endcase
@@ -464,7 +574,7 @@ always_ff @(posedge clk) begin
 
         case (rd_addr_reg)
             16'h0000: s_axil_rdata_reg <= 32'h4E415447;
-            16'h0004: s_axil_rdata_reg <= 32'h00010000;
+            16'h0004: s_axil_rdata_reg <= 32'h00010100;
             16'h0008: s_axil_rdata_reg <= {8'd0, 8'd16, 8'(LANES), 8'(IDX_W)};
             16'h000C: s_axil_rdata_reg <= scratch_reg;
             16'h0010: s_axil_rdata_reg <= {8'd0, egress_en_reg, bypass_reg, 6'd0, punt_hdr_reg, enable_reg};
@@ -477,6 +587,18 @@ always_ff @(posedge clk) begin
             16'h0034: s_axil_rdata_reg <= thresh_udp_reg;
             16'h0038: s_axil_rdata_reg <= {scan_en_reg, 15'd0, scan_interval_reg};
             16'h003C: s_axil_rdata_reg <= {16'd0, bubble_reg};
+            16'h0060: begin
+                if (DDR_ENABLE != 0) begin
+                    s_axil_rdata_reg <= {8'd0, 8'(DDR_MAX_OUT), 8'(DDR_BUCKET_W), 3'd0, ddr_active,
+                        ddr_clear_busy || ddr_clear_start_reg, ddr_en_reg, ddr_calib, 1'b1};
+                end
+            end
+            16'h0064: s_axil_rdata_reg <= {31'd0, ddr_en_reg};
+            16'h0068: s_axil_rdata_reg <= ddr_lookups_reg;
+            16'h006C: s_axil_rdata_reg <= ddr_hits_reg;
+            16'h0070: s_axil_rdata_reg <= ddr_skips_reg;
+            16'h0148: s_axil_rdata_reg <= act_data_reg[0];
+            16'h014C: s_axil_rdata_reg <= act_data_reg[1];
             16'h0140: s_axil_rdata_reg <= index_reg;
             16'h0144: s_axil_rdata_reg <= {31'd0, busy};
             16'h0200: s_axil_rdata_reg <= {22'd0, nh_index_reg};
@@ -526,6 +648,15 @@ always_ff @(posedge clk) begin
         nh_pend_reg <= 1'b0;
         nh_wait_reg <= 1'b0;
         evt_drop_reg <= '0;
+        ddr_en_reg <= 1'b0;
+        ddr_clear_start_reg <= 1'b0;
+        ddr_pend_reg <= 1'b0;
+        ddr_wait_reg <= 1'b0;
+        act_pend_reg <= 1'b0;
+        act_wait_reg <= 1'b0;
+        ddr_lookups_reg <= '0;
+        ddr_hits_reg <= '0;
+        ddr_skips_reg <= '0;
     end
 end
 

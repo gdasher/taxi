@@ -352,6 +352,11 @@ class CuckooTable:
     def split_idx(self, idx):
         return idx >> (self.bucket_w + 2), (idx >> 2) & (self.buckets - 1), idx & 3
 
+    def line_of(self, idx):
+        """(table, bucket) of an index"""
+        t, b, _ = self.split_idx(idx)
+        return t, b
+
     def candidates(self, key):
         for t in range(self.TABLES):
             b = self.bucket_of(key, t)
@@ -436,6 +441,34 @@ class CuckooTable:
         return len(self.slots) / self.size
 
 
+class DdrTable(CuckooTable):
+    """Host copy of the DDR tier: two tables of 64-byte lines holding two
+    entries each; buckets come from the top bits of the hashes (the UltraRAM
+    tier uses the low bits). Index = {table, bucket, slot}."""
+
+    SLOTS = 2
+
+    @property
+    def idx_w(self):
+        return self.bucket_w + 2
+
+    def bucket_of(self, key, t):
+        return self.hashes(key)[t] >> (32 - self.bucket_w)
+
+    def idx(self, t, bucket, slot):
+        return (t << (self.bucket_w + 1)) | (bucket << 1) | slot
+
+    def split_idx(self, idx):
+        return idx >> (self.bucket_w + 1), (idx >> 1) & (self.buckets - 1), idx & 1
+
+    def line(self, t, bucket):
+        """line number {table, bucket}: the line's address is base + 64 * line"""
+        return (t << self.bucket_w) | bucket
+
+
+DDR_IDX_FLAG = 0x80000000
+
+
 # ---------------------------------------------------------------------------
 # full shim model
 
@@ -462,10 +495,37 @@ class ShimModel:
     table: CuckooTable = None
     nh: dict = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
+    # DDR tier: present when ddr_bucket_w is set; looked up after an on-chip
+    # miss while active (calibrated, enabled, not clearing)
+    ddr_bucket_w: int = None
+    ddr: DdrTable = None
+    ddr_active: bool = False
+    ddr_activity: set = field(default_factory=set)
 
     def __post_init__(self):
         if self.table is None:
             self.table = CuckooTable(self.bucket_w, self.seed0, self.seed1)
+        if self.ddr is None and self.ddr_bucket_w is not None:
+            self.ddr = DdrTable(self.ddr_bucket_w, self.seed0, self.seed1)
+
+    def lookup(self, key):
+        """(hit index, entry): UltraRAM tier, then the DDR tier"""
+        hit_idx, e = self.table.lookup(key)
+        if e is None and self.ddr is not None and self.ddr_active:
+            i, e = self.ddr.lookup(key)
+            if e is not None:
+                hit_idx = DDR_IDX_FLAG | i
+                self.ddr_activity.add(i)
+        return hit_idx, e
+
+    def read_activity(self, word):
+        """host read-and-clear of 64 activity bits"""
+        v = 0
+        for b in range(64):
+            if word * 64 + b in self.ddr_activity:
+                v |= 1 << b
+                self.ddr_activity.discard(word * 64 + b)
+        return v
 
     def count(self, lane, reason):
         k = (lane, reason)
@@ -489,7 +549,7 @@ class ShimModel:
         h0 = self.table.hashes(p.key)[0] if p.lookup else 0
         hit_idx, e = (None, None)
         if p.lookup:
-            hit_idx, e = self.table.lookup(p.key)
+            hit_idx, e = self.lookup(p.key)
 
         reason = p.reason
         if reason == RSN_MISS and e is not None:

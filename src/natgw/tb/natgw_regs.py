@@ -25,6 +25,13 @@ REG_THRESH_TCP = 0x0030
 REG_THRESH_UDP = 0x0034
 REG_SCAN = 0x0038
 REG_BUBBLE = 0x003C
+REG_DDR_STATUS = 0x0060
+REG_DDR_CTRL = 0x0064
+REG_DDR_LOOKUPS = 0x0068
+REG_DDR_HITS = 0x006C
+REG_DDR_SKIPS = 0x0070
+REG_ACT_LO = 0x0148
+REG_ACT_HI = 0x014C
 REG_ENT_DATA = 0x0100
 REG_ST_DATA = 0x0120
 REG_INDEX = 0x0140
@@ -43,6 +50,10 @@ CMD_WR_ST = 2
 CMD_RD_ENT = 3
 CMD_RD_ST = 4
 CMD_CLR = 5
+CMD_DDR_WR = 6
+CMD_DDR_CLR = 7
+CMD_DDR_RD = 8
+CMD_ACT_RC = 9
 
 NAT_ID = 0x4E415447
 
@@ -151,3 +162,61 @@ class NatRegs:
         lo = await self.rd(a)
         hi = await self.rd(a + 4)
         return (hi << 32) | lo
+
+    # ---------------------------------------------------------------- DDR tier
+
+    async def ddr_status(self):
+        v = await self.rd(REG_DDR_STATUS)
+        return {"present": bool(v & 1), "calibrated": bool(v & 2), "enabled": bool(v & 4),
+                "clearing": bool(v & 8), "active": bool(v & 16), "bucket_w": (v >> 8) & 0xff,
+                "max_out": (v >> 16) & 0xff}
+
+    async def ddr_enable(self, enable):
+        await self.wr(REG_DDR_CTRL, 1 if enable else 0)
+        await self.flush()
+
+    async def ddr_clear(self, enable_after=False, poll=None):
+        """zero the DDR table and the activity bitmap (DDR is random after power-up)"""
+        await self.wr(REG_DDR_CTRL, 2)
+        while (await self.ddr_status())["clearing"]:
+            if poll:
+                await poll()
+        if enable_after:
+            await self.ddr_enable(True)
+
+    async def write_ddr_entry(self, idx, entry):
+        for k, w in enumerate(to_words(entry.pack(), 7)):
+            await self.wr(REG_ENT_DATA + 4*k, w)
+        await self.wr(REG_INDEX, idx)
+        await self.wr(REG_CMD, CMD_DDR_WR)
+
+    async def clear_ddr_entry(self, idx):
+        await self.wr(REG_INDEX, idx)
+        await self.wr(REG_CMD, CMD_DDR_CLR)
+
+    async def read_ddr_entry(self, idx):
+        await self.wr(REG_INDEX, idx)
+        await self.wr(REG_CMD, CMD_DDR_RD)
+        words = [await self.rd(REG_ENT_DATA + 4*k) for k in range(7)]
+        return Entry.unpack(from_words(words))
+
+    async def apply_ddr(self, writes):
+        """Apply DdrTable insert/delete writes in order."""
+        for idx, entry in writes:
+            if entry is None:
+                await self.clear_ddr_entry(idx)
+            else:
+                await self.write_ddr_entry(idx, entry)
+        await self.flush()
+
+    async def read_activity(self, word):
+        """read and clear 64 activity bits (DDR entries 64*word + n)"""
+        await self.wr(REG_INDEX, word)
+        await self.wr(REG_CMD, CMD_ACT_RC)
+        lo = await self.rd(REG_ACT_LO)
+        hi = await self.rd(REG_ACT_HI)
+        return lo | (hi << 32)
+
+    async def ddr_stats(self):
+        return {"lookups": await self.rd(REG_DDR_LOOKUPS), "hits": await self.rd(REG_DDR_HITS),
+                "skips": await self.rd(REG_DDR_SKIPS)}

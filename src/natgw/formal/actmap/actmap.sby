@@ -1,0 +1,28 @@
+[tasks]
+p2_bmc
+p3_bmc
+p2_cover
+
+[options]
+p2_bmc: mode bmc
+p3_bmc: mode bmc
+p2_bmc: depth 24
+p3_bmc: depth 24
+p2_cover: mode cover
+p2_cover: depth 30
+
+[engines]
+smtbmc bitwuzla
+
+[script]
+plugin -i slang
+p2_bmc: read_slang natgw_fifo.sv natgw_ram.sv natgw_actmap.sv formal_actmap.sv --top formal_actmap -G RAM_PIPE=2
+p3_bmc: read_slang natgw_fifo.sv natgw_ram.sv natgw_actmap.sv formal_actmap.sv --top formal_actmap -G RAM_PIPE=3
+p2_cover: read_slang natgw_fifo.sv natgw_ram.sv natgw_actmap.sv formal_actmap.sv --top formal_actmap -G RAM_PIPE=2
+prep -top formal_actmap
+
+[files]
+../../rtl/natgw_fifo.sv
+../../rtl/natgw_ram.sv
+../../rtl/natgw_actmap.sv
+formal_actmap.sv

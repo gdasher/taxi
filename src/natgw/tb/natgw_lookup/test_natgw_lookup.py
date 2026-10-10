@@ -177,6 +177,10 @@ class TB:
             # sample outputs
             if int(dut.m_res_valid.value):
                 res = unpack_res(int(dut.m_res.value))
+                # sideband for a DDR tier
+                res["_key"] = int(dut.m_res_key.value)
+                res["_h1"] = int(dut.m_res_h1.value)
+                res["_lookup"] = int(dut.m_res_lookup.value)
                 hit = None
                 if int(dut.m_hit_valid.value):
                     hit = (int(dut.m_hit_idx.value), int(dut.m_hit_len.value),
@@ -243,6 +247,11 @@ class TB:
 
     def expect_model(self, it, res, hit):
         key = it["key"]
+        # the sideband a DDR tier uses: the key, h1 and whether it was looked up
+        assert res["_lookup"] == it["lookup"]
+        assert res["_key"] == key.pack(), "sideband key"
+        if it["lookup"]:
+            assert res["_h1"] == self.model.hashes(key)[1], "sideband h1"
         if not it["lookup"]:
             assert res["hit"] == 0 and res["hash"] == 0 and hit is None
             return

@@ -8,6 +8,11 @@ logic runs on clk (pcie_clk, 250 MHz) at 128 bits per lane. Frames cross in
 from each lane's RX clock, are parsed and looked up, and are either forwarded
 (rewritten) to their egress lane or punted to the core on their ingress port.
 
+With DDR_ENABLE, a frame that misses on chip is looked up again in a DDR tier
+(natgw_ddr) through the m_axi_ddr_* AXI4 master, in the shim's clock; the
+board crosses it to the memory controller's clock. Without it the DDR ports
+are unused and the shim is unchanged.
+
 */
 
 `resetall
@@ -22,7 +27,13 @@ module natgw_shim
     parameter TICK_DIV_RST = 250000,
     parameter HOLD_DEPTH = 16384,
     parameter DESC_DEPTH = 32,
-    parameter CDC_DEPTH = 16384
+    parameter CDC_DEPTH = 16384,
+    // DDR tier
+    parameter DDR_ENABLE = 0,
+    parameter DDR_BUCKET_W = 20,
+    parameter DDR_AXI_ADDR_W = 34,
+    parameter DDR_AXI_ID_W = 4,
+    parameter DDR_MAX_OUT = 16
 )
 (
     input  wire logic  clk,
@@ -54,12 +65,49 @@ module natgw_shim
     taxi_axis_if.src     m_axis_core_rx[LANES],
 
     /*
+     * DDR tier: AXI4 master (512-bit) and the controller's calibration status
+     */
+    output wire logic [DDR_AXI_ID_W-1:0]   m_axi_ddr_awid,
+    output wire logic [DDR_AXI_ADDR_W-1:0] m_axi_ddr_awaddr,
+    output wire logic [7:0]                m_axi_ddr_awlen,
+    output wire logic [2:0]                m_axi_ddr_awsize,
+    output wire logic [1:0]                m_axi_ddr_awburst,
+    output wire logic                      m_axi_ddr_awvalid,
+    input  wire logic                      m_axi_ddr_awready,
+    output wire logic [511:0]              m_axi_ddr_wdata,
+    output wire logic [63:0]               m_axi_ddr_wstrb,
+    output wire logic                      m_axi_ddr_wlast,
+    output wire logic                      m_axi_ddr_wvalid,
+    input  wire logic                      m_axi_ddr_wready,
+    input  wire logic [DDR_AXI_ID_W-1:0]   m_axi_ddr_bid,
+    input  wire logic [1:0]                m_axi_ddr_bresp,
+    input  wire logic                      m_axi_ddr_bvalid,
+    output wire logic                      m_axi_ddr_bready,
+    output wire logic [DDR_AXI_ID_W-1:0]   m_axi_ddr_arid,
+    output wire logic [DDR_AXI_ADDR_W-1:0] m_axi_ddr_araddr,
+    output wire logic [7:0]                m_axi_ddr_arlen,
+    output wire logic [2:0]                m_axi_ddr_arsize,
+    output wire logic [1:0]                m_axi_ddr_arburst,
+    output wire logic                      m_axi_ddr_arvalid,
+    input  wire logic                      m_axi_ddr_arready,
+    input  wire logic [DDR_AXI_ID_W-1:0]   m_axi_ddr_rid,
+    input  wire logic [511:0]              m_axi_ddr_rdata,
+    input  wire logic [1:0]                m_axi_ddr_rresp,
+    input  wire logic                      m_axi_ddr_rlast,
+    input  wire logic                      m_axi_ddr_rvalid,
+    output wire logic                      m_axi_ddr_rready,
+    input  wire logic                      ddr_calib,
+
+    /*
      * Status
      */
     output wire logic    clear_busy
 );
 
 localparam IDX_W = BUCKET_W + 3;
+localparam DIDX_W = DDR_BUCKET_W + 2;
+// results in flight per lane are bounded by the metadata FIFO (DESC_DEPTH)
+localparam RES_DEPTH = DESC_DEPTH + 8;
 localparam RX_USER_W = s_axis_mac_rx[0].USER_W;
 localparam DATA_W = 128;
 localparam KEEP_W = DATA_W/8;
@@ -81,6 +129,25 @@ wire lookup_clear_busy;
 wire state_clear_busy;
 assign clear_busy = lookup_clear_busy || state_clear_busy;
 
+// results from the lookup engine, then (with a DDR tier) from natgw_ddr
+wire              lres_in_valid;
+wire [LANE_W-1:0] lres_in_lane;
+result_t          lres_in_data;
+
+// DDR tier control and status
+wire              ddr_active;
+wire              cfg_ddr_en;
+wire              ddr_clear_start;
+wire              ddr_clear_busy;
+wire              host_ddr_valid, host_ddr_ready, host_ddr_done;
+wire [1:0]        host_ddr_op;
+wire [DIDX_W-1:0] host_ddr_idx;
+entry_t           host_ddr_wdata, host_ddr_rdata;
+wire              act_valid, act_ready, act_rvalid;
+wire [DIDX_W-7:0] act_word;
+wire [63:0]       act_rdata;
+wire              stat_ddr_lookup, stat_ddr_hit, stat_ddr_skip;
+
 // per-lane key inputs to the lookup engine
 wire         key_valid[LANES];
 wire         key_ready[LANES];
@@ -94,6 +161,9 @@ wire [15:0]  key_len[LANES];
 wire              res_valid;
 wire [LANE_W-1:0] res_lane;
 result_t          res_data;
+key_t             res_key;
+wire [31:0]       res_h1;
+wire              res_lookup;
 
 // hits
 wire              hit_valid;
@@ -270,14 +340,14 @@ for (genvar n = 0; n < LANES; n = n + 1) begin : lane
 
     natgw_fifo #(
         .DATA_W(RESULT_W),
-        .DEPTH(DESC_DEPTH + 8)
+        .DEPTH(RES_DEPTH)
     )
     res_fifo_inst (
         .clk(clk),
         .rst(rst),
-        .s_valid(res_valid && res_lane == LANE_W'(n)),
+        .s_valid(lres_in_valid && lres_in_lane == LANE_W'(n)),
         .s_ready(),
-        .s_data(res_data),
+        .s_data(lres_in_data),
         .m_valid(lres_valid),
         .m_ready(lres_ready),
         .m_data(lres_data),
@@ -424,6 +494,9 @@ lookup_inst (
     .m_res_valid(res_valid),
     .m_res_lane(res_lane),
     .m_res(res_data),
+    .m_res_key(res_key),
+    .m_res_h1(res_h1),
+    .m_res_lookup(res_lookup),
     .m_hit_valid(hit_valid),
     .m_hit_idx(hit_idx),
     .m_hit_len(hit_len),
@@ -450,6 +523,125 @@ lookup_inst (
     .clear_start(clear_start),
     .clear_busy(lookup_clear_busy)
 );
+
+// ---------------------------------------------------------------------------
+// DDR tier
+
+if (DDR_ENABLE != 0) begin : ddr
+
+    natgw_ddr #(
+        .DDR_BUCKET_W(DDR_BUCKET_W),
+        .AXI_ADDR_W(DDR_AXI_ADDR_W),
+        .AXI_ID_W(DDR_AXI_ID_W),
+        .MAX_OUT(DDR_MAX_OUT),
+        .QUEUE_DEPTH(RES_DEPTH)
+    )
+    ddr_inst (
+        .clk(clk),
+        .rst(rst),
+        .s_valid(res_valid),
+        .s_lane(res_lane),
+        .s_res(res_data),
+        .s_key(res_key),
+        .s_h1(res_h1),
+        .s_lookup(res_lookup),
+        .m_valid(lres_in_valid),
+        .m_lane(lres_in_lane),
+        .m_res(lres_in_data),
+        .m_axi_awid(m_axi_ddr_awid),
+        .m_axi_awaddr(m_axi_ddr_awaddr),
+        .m_axi_awlen(m_axi_ddr_awlen),
+        .m_axi_awsize(m_axi_ddr_awsize),
+        .m_axi_awburst(m_axi_ddr_awburst),
+        .m_axi_awvalid(m_axi_ddr_awvalid),
+        .m_axi_awready(m_axi_ddr_awready),
+        .m_axi_wdata(m_axi_ddr_wdata),
+        .m_axi_wstrb(m_axi_ddr_wstrb),
+        .m_axi_wlast(m_axi_ddr_wlast),
+        .m_axi_wvalid(m_axi_ddr_wvalid),
+        .m_axi_wready(m_axi_ddr_wready),
+        .m_axi_bid(m_axi_ddr_bid),
+        .m_axi_bresp(m_axi_ddr_bresp),
+        .m_axi_bvalid(m_axi_ddr_bvalid),
+        .m_axi_bready(m_axi_ddr_bready),
+        .m_axi_arid(m_axi_ddr_arid),
+        .m_axi_araddr(m_axi_ddr_araddr),
+        .m_axi_arlen(m_axi_ddr_arlen),
+        .m_axi_arsize(m_axi_ddr_arsize),
+        .m_axi_arburst(m_axi_ddr_arburst),
+        .m_axi_arvalid(m_axi_ddr_arvalid),
+        .m_axi_arready(m_axi_ddr_arready),
+        .m_axi_rid(m_axi_ddr_rid),
+        .m_axi_rdata(m_axi_ddr_rdata),
+        .m_axi_rresp(m_axi_ddr_rresp),
+        .m_axi_rlast(m_axi_ddr_rlast),
+        .m_axi_rvalid(m_axi_ddr_rvalid),
+        .m_axi_rready(m_axi_ddr_rready),
+        .ddr_calib(ddr_calib),
+        .cfg_ddr_en(cfg_ddr_en),
+        .ddr_active(ddr_active),
+        .clear_start(ddr_clear_start),
+        .clear_busy(ddr_clear_busy),
+        .host_valid(host_ddr_valid),
+        .host_ready(host_ddr_ready),
+        .host_op(host_ddr_op),
+        .host_idx(host_ddr_idx),
+        .host_wdata(host_ddr_wdata),
+        .host_done(host_ddr_done),
+        .host_rdata(host_ddr_rdata),
+        .nh_wr_valid(host_nh_valid && host_nh_ready && host_nh_we),
+        .nh_wr_idx(host_nh_idx),
+        .nh_wr_data(host_nh_wdata),
+        .nh_clear_start(clear_start),
+        .act_valid(act_valid),
+        .act_ready(act_ready),
+        .act_word(act_word),
+        .act_rvalid(act_rvalid),
+        .act_rdata(act_rdata),
+        .stat_lookup(stat_ddr_lookup),
+        .stat_hit(stat_ddr_hit),
+        .stat_skip(stat_ddr_skip),
+        .err_overflow()
+    );
+
+end else begin : no_ddr
+
+    assign lres_in_valid = res_valid;
+    assign lres_in_lane = res_lane;
+    assign lres_in_data = res_data;
+
+    assign m_axi_ddr_awid = '0;
+    assign m_axi_ddr_awaddr = '0;
+    assign m_axi_ddr_awlen = '0;
+    assign m_axi_ddr_awsize = '0;
+    assign m_axi_ddr_awburst = '0;
+    assign m_axi_ddr_awvalid = 1'b0;
+    assign m_axi_ddr_wdata = '0;
+    assign m_axi_ddr_wstrb = '0;
+    assign m_axi_ddr_wlast = 1'b0;
+    assign m_axi_ddr_wvalid = 1'b0;
+    assign m_axi_ddr_bready = 1'b1;
+    assign m_axi_ddr_arid = '0;
+    assign m_axi_ddr_araddr = '0;
+    assign m_axi_ddr_arlen = '0;
+    assign m_axi_ddr_arsize = '0;
+    assign m_axi_ddr_arburst = '0;
+    assign m_axi_ddr_arvalid = 1'b0;
+    assign m_axi_ddr_rready = 1'b1;
+
+    assign ddr_active = 1'b0;
+    assign ddr_clear_busy = 1'b0;
+    assign host_ddr_ready = 1'b1;
+    assign host_ddr_done = 1'b0;
+    assign host_ddr_rdata = '0;
+    assign act_ready = 1'b1;
+    assign act_rvalid = 1'b0;
+    assign act_rdata = '0;
+    assign stat_ddr_lookup = 1'b0;
+    assign stat_ddr_hit = 1'b0;
+    assign stat_ddr_skip = 1'b0;
+
+end
 
 // hit stream and bubble request cross between the lookup and state blocks
 // through registers, so the two can sit in different SLRs
@@ -510,7 +702,10 @@ state_inst (
 
 natgw_regs #(
     .IDX_W(IDX_W),
-    .TICK_DIV_RST(TICK_DIV_RST)
+    .TICK_DIV_RST(TICK_DIV_RST),
+    .DDR_ENABLE(DDR_ENABLE),
+    .DDR_BUCKET_W(DDR_BUCKET_W),
+    .DDR_MAX_OUT(DDR_MAX_OUT)
 )
 regs_inst (
     .clk(clk),
@@ -559,7 +754,27 @@ regs_inst (
     .stat_reason(stat_reason),
     .stat_ingress_drop(stat_ingress_drop),
     .stat_ingress_bad(stat_ingress_bad),
-    .stat_evt_drop(stat_evt_drop)
+    .stat_evt_drop(stat_evt_drop),
+    .ddr_calib(DDR_ENABLE != 0 && ddr_calib),
+    .ddr_active(ddr_active),
+    .cfg_ddr_en(cfg_ddr_en),
+    .ddr_clear_start(ddr_clear_start),
+    .ddr_clear_busy(ddr_clear_busy),
+    .host_ddr_valid(host_ddr_valid),
+    .host_ddr_ready(host_ddr_ready),
+    .host_ddr_op(host_ddr_op),
+    .host_ddr_idx(host_ddr_idx),
+    .host_ddr_wdata(host_ddr_wdata),
+    .host_ddr_done(host_ddr_done),
+    .host_ddr_rdata(host_ddr_rdata),
+    .act_valid(act_valid),
+    .act_ready(act_ready),
+    .act_word(act_word),
+    .act_rvalid(act_rvalid),
+    .act_rdata(act_rdata),
+    .stat_ddr_lookup(stat_ddr_lookup),
+    .stat_ddr_hit(stat_ddr_hit),
+    .stat_ddr_skip(stat_ddr_skip)
 );
 
 endmodule

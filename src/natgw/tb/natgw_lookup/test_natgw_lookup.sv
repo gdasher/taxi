@@ -35,6 +35,9 @@ logic [LANES*16-1:0] s_key_len;
 logic m_res_valid;
 logic [2:0] m_res_lane;
 logic [RESULT_W-1:0] m_res;
+logic [natgw_pkg::KEY_W-1:0] m_res_key;
+logic [31:0] m_res_h1;
+logic m_res_lookup;
 
 logic m_hit_valid;
 logic [IDX_W-1:0] m_hit_idx;
@@ -104,6 +107,9 @@ uut (
     .m_res_valid(m_res_valid),
     .m_res_lane(m_res_lane),
     .m_res(m_res),
+    .m_res_key(m_res_key),
+    .m_res_h1(m_res_h1),
+    .m_res_lookup(m_res_lookup),
 
     .m_hit_valid(m_hit_valid),
     .m_hit_idx(m_hit_idx),
