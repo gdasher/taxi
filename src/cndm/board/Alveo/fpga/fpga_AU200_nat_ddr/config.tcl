@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: CERN-OHL-S-2.0
 #
-# NAT build with the DDR tier: the NAT build's configuration with a 128k-entry
-# on-chip table, plus the DDR table size. NAT_DDR_BUCKET_W: 2 x 2^w lines of two entries
+# NAT build with the DDR tier: the NAT build's configuration (256k on-chip
+# entries) plus the DDR table size. NAT_DDR_BUCKET_W: 2 x 2^w lines of two entries
 # (20 = 4M entries, 256 MB of the DIMM); override in the environment.
 
 source ../fpga_AU200_nat/config.tcl
 
-# 128k on-chip entries behind the DDR tier: 256k plus the tier missed timing
-# (WNS -0.234 ns, MAC receive and core paths in a congested design)
-if {![info exists ::env(NAT_BUCKET_W)]} { dict set params NAT_BUCKET_W 14 }
+# On-chip size: the NAT build's 256k (NAT_BUCKET_W=15) meets timing with the
+# compare-on-arrival DDR stage (WNS +0.011 ns). Fallback with more slack:
+# NAT_BUCKET_W=14 (128k, WNS +0.019 ns) in the environment.
 
 set nat_ddr_bucket_w 20
 if {[info exists ::env(NAT_DDR_BUCKET_W)]} { set nat_ddr_bucket_w $::env(NAT_DDR_BUCKET_W) }

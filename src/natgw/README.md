@@ -169,8 +169,8 @@ unchanged and every DDR register reads zero.
   calibrated, enabled and not clearing. The host places flows in DDR only
   when the tier is present and calibrated, after a clear; with no DIMM it
   behaves exactly as without the tier.
-- **Board.** `fpga_AU200_nat_ddr` builds the AU200 NAT design with a
-  128k-entry on-chip table (256k plus the tier did not meet timing) and the
-  tier on DDR4 channel C2 (one RDIMM; `ddr4_0` controller, 512-bit AXI at
+- **Board.** `fpga_AU200_nat_ddr` builds the AU200 NAT design with the
+  usual 256k-entry on-chip table (`NAT_BUCKET_W=14` gives 128k, with a little
+  more timing slack) and the tier on DDR4 channel C2 (one RDIMM; `ddr4_0` controller, 512-bit AXI at
   300 MHz, Xilinx AXI clock converter to the 250 MHz shim clock).
   `NAT_DDR_BUCKET_W` (default 20: 4M entries, 256 MB) sets the size.

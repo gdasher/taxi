@@ -301,7 +301,7 @@ without a DIMM).
   the tier (first full build, 2026-10-10) it routes but misses: WNS -0.234 ns,
   593 endpoints, in Ethernet MAC receive (390 MHz) and the 250 MHz core, with
   heavy routing congestion; no DDR-tier path failed. With 128k on-chip
-  entries (now the variant's default) and 4M in DDR it **meets timing** (same
+  entries and 4M in DDR it **meets timing** (same
   day, RTL of commit `ae12f94`): WNS 0.000 ns, TNS 0, WHS +0.006 ns after
   post-route phys_opt; 169k LUTs, 176 URAM. The margin is zero, and routing
   took about two hours through congestion. With the compare-on-arrival DDR
@@ -310,7 +310,8 @@ without a DIMM).
   meets timing with WNS +0.019 ns, WHS +0.008 ns (tightest: the 250 MHz
   core, +0.019 ns, and MAC receive on lane 1, +0.021 ns). With that stage
   (and the read-error check, commit `7f04c97`), 256k on-chip entries plus
-  the tier also meet timing (`NAT_BUCKET_W=15`): WNS +0.011 ns, WHS +0.004 ns
+  the tier also meet timing (`NAT_BUCKET_W=15`, the variant's default again):
+  WNS +0.011 ns, WHS +0.004 ns
   (tightest: the 250 MHz core, +0.011 ns, and MAC receive on lane 4,
   +0.013 ns); 171k LUTs, 336 URAM. Its synthesis peaked near this build
   machine's memory (about 17 GB across Vivado's synthesis workers).
