@@ -1,0 +1,47 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# natgw FPGA updates from inside the gateway VM.
+#
+#   natgw-fpga stage <fpga.bit>   copy a bitstream to the Proxmox host's staging area
+#   natgw-fpga apply              ask the host to restart this VM; before it starts
+#                                 again the host flashes the staged image and
+#                                 reloads the FPGA (natgw-fpga-hook)
+#   natgw-fpga status             the card's PCI address, driver and the host's
+#                                 staging state
+#
+# Needs root ssh access from this VM to the Proxmox host (NATGW_PVE_HOST in
+# /etc/natgw/deploy.env), e.g. a key in /root/.ssh authorized on the host.
+set -eu
+# shellcheck source=deploy.env.example
+. /etc/natgw/deploy.env
+host=${NATGW_PVE_HOST:?set NATGW_PVE_HOST in /etc/natgw/deploy.env}
+vmid=${NATGW_VMID:?set NATGW_VMID in /etc/natgw/deploy.env}
+ssh="ssh -o BatchMode=yes root@$host"
+
+case "${1:-}" in
+stage)
+	f=${2:?usage: natgw-fpga stage <fpga.bit>}
+	case "$f" in *.bit|*.bin) ;; *) echo "expected a .bit or .bin file" >&2; exit 2;; esac
+	[ -s "$f" ] || { echo "$f: missing or empty" >&2; exit 2; }
+	$ssh "mkdir -p /var/lib/natgw-fpga/pending && rm -f /var/lib/natgw-fpga/pending/*"
+	scp -o BatchMode=yes "$f" "root@$host:/var/lib/natgw-fpga/pending/"
+	$ssh "cd /var/lib/natgw-fpga/pending && sha256sum *"
+	echo "staged; run 'natgw-fpga apply' to flash it and restart this VM"
+	;;
+apply)
+	$ssh "ls /var/lib/natgw-fpga/pending/*.bit /var/lib/natgw-fpga/pending/*.bin 2>/dev/null" \
+		|| echo "nothing staged: the VM restarts without an FPGA update"
+	# the host restarts the VM through Proxmox (a reboot from inside the
+	# guest keeps the same QEMU process and skips the hook)
+	$ssh "natgw-fpga-update --restart $vmid --detach"
+	echo "the host restarts this VM shortly"
+	;;
+status)
+	lspci -D -nn -d 1234:c001 -k || true
+	$ssh "natgw-fpga-update --status" || true
+	;;
+*)
+	sed -n '3,14p' "$0"
+	exit 2
+	;;
+esac

@@ -12,11 +12,13 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 cd "$vpp"
 for p in "$here"/patches/*.patch; do
-	subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$p")
-	if git log --format=%s | grep -qxF "$subject"; then
-		echo "already applied: $subject"
+	# already applied when it reverses cleanly (e.g. on the natgw branch of
+	# the VPP fork, which carries these commits)
+	if git apply --reverse --check "$p" 2>/dev/null; then
+		echo "already applied: $(basename "$p")"
 	else
-		git am -q "$p"
+		git -c user.name="${GIT_AUTHOR_NAME:-natgw setup}" -c user.email="${GIT_AUTHOR_EMAIL:-natgw@localhost}" \
+			am -q "$p"
 	fi
 done
 [ -e src/plugins/natgw_offload ] || ln -s "$here/natgw_offload" src/plugins/natgw_offload

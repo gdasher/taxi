@@ -1,0 +1,55 @@
+#!/bin/bash
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# natgw FPGA updates on the Proxmox host.
+#
+#   natgw-fpga-update --stage <fpga.bit>   stage an image for the next VM start
+#   natgw-fpga-update --restart <vmid> [--detach]
+#                                          shut the VM down and start it again
+#                                          (the hook flashes and reloads)
+#   natgw-fpga-update --status             staged image, current image, card
+#
+# Typical update: --stage the new bitstream, then --restart the gateway VM.
+# Expect a gateway outage of about a minute (shutdown, flash, reload, boot).
+
+set -euo pipefail
+STATE=${NATGW_FPGA_STATE:-/var/lib/natgw-fpga}
+CONF=${NATGW_FPGA_CONF:-/etc/natgw/fpga.conf}
+
+usage() { sed -n '4,13p' "$0"; exit 2; }
+
+case "${1:-}" in
+--stage)
+	f=${2:?$(usage)}
+	case "$f" in *.bit|*.bin) ;; *) echo "expected a .bit or .bin file" >&2; exit 2;; esac
+	install -d "$STATE/pending"
+	rm -f "$STATE"/pending/*
+	install -m 0644 "$f" "$STATE/pending/"
+	sha256sum "$STATE"/pending/*
+	echo "staged: restart the gateway VM to flash it (natgw-fpga-update --restart <vmid>)"
+	;;
+--restart)
+	vmid=${2:?$(usage)}
+	if [ "${3:-}" = --detach ]; then
+		# requested from inside the VM over ssh: run independently of the
+		# ssh session, which ends when the VM shuts down
+		systemd-run --unit="natgw-fpga-restart-$vmid" --collect "$0" --restart "$vmid"
+		exit 0
+	fi
+	echo "shutting down VM $vmid"
+	qm shutdown "$vmid" --timeout 120 || qm stop "$vmid"
+	echo "starting VM $vmid (the hook flashes any staged image)"
+	qm start "$vmid"
+	;;
+--status)
+	# shellcheck source=fpga.conf.example
+	[ -r "$CONF" ] && . "$CONF"
+	echo "staged:  $(find "$STATE/pending" -maxdepth 1 -type f -printf '%f ' 2>/dev/null)"
+	echo "current: $(find "$STATE" -maxdepth 1 -name 'current.*' -printf '%f, written %TF %TH:%TM' 2>/dev/null)"
+	if [ -n "${NATGW_CARD_BDF:-}" ]; then
+		lspci -nn -k -s "$NATGW_CARD_BDF" || true
+	fi
+	journalctl -t natgw-fpga -n 8 --no-pager 2>/dev/null || true
+	;;
+*) usage ;;
+esac

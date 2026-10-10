@@ -1,0 +1,16 @@
+# natgw WAN manager (installed by natgw-guest-setup.sh)
+[Unit]
+Description=natgw WAN manager (health checks, failover, alerts)
+After=vpp.service
+Wants=vpp.service
+
+[Service]
+Environment=PYTHONPATH=@NATGW_PREFIX@/wanmgr
+ExecStartPre=@NATGW_PREFIX@/venv/bin/python -m wanmgr --check -c /etc/natgw/wanmgr.toml
+ExecStart=@NATGW_PREFIX@/venv/bin/python -m wanmgr -c /etc/natgw/wanmgr.toml --status-file /run/natgw-wanmgr.json
+# a stale override route cannot route around new failures: always come back
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

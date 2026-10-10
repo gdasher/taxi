@@ -1,0 +1,18 @@
+# natgw VPP (installed by natgw-guest-setup.sh)
+[Unit]
+Description=VPP with natgw FPGA offload
+After=network-pre.target systemd-modules-load.service
+Before=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/natgw-card-check
+ExecStartPre=-/sbin/modprobe vfio-pci
+ExecStart=@NATGW_PREFIX@/vpp/bin/vpp -c /etc/vpp/startup.conf
+Restart=always
+RestartSec=2
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

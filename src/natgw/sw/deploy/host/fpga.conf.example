@@ -1,0 +1,12 @@
+# natgw FPGA settings on the Proxmox host (/etc/natgw/fpga.conf),
+# read by natgw-fpga-hook.sh and natgw-fpga-update.
+
+# the gateway VM
+NATGW_VMID=100
+# the U200's PCI address on the host (lspci -D -d 1234:c001)
+NATGW_CARD_BDF=0000:41:00.0
+# reload the FPGA from flash at every VM start, not only after an update
+# (a full reset of the card; adds about 10 s to the start)
+NATGW_RELOAD_ON_START=no
+# refuse to start the VM when the card does not come back after a reload
+NATGW_STRICT=no

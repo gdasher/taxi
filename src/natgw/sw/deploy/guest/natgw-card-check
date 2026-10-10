@@ -1,0 +1,33 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Run before VPP starts: the natgw card must be present and bound to vfio-pci.
+# Binds it if it is not (a fresh PCI rescan or a new card).
+set -eu
+ID=1234:c001
+bdf=$(lspci -D -n -d "$ID" | awk '{print $1; exit}')
+if [ -z "$bdf" ]; then
+	echo "natgw-card-check: no natgw card ($ID) visible; is it passed through to this VM?" >&2
+	exit 1
+fi
+modprobe vfio-pci 2>/dev/null || true
+
+driver_of() {
+	if [ -e "/sys/bus/pci/devices/$1/driver" ]; then
+		basename "$(readlink -f "/sys/bus/pci/devices/$1/driver")"
+	fi
+}
+
+drv=$(driver_of "$bdf")
+if [ "$drv" != vfio-pci ]; then
+	echo "natgw-card-check: $bdf bound to '${drv:-none}', moving it to vfio-pci" >&2
+	if [ -n "$drv" ]; then
+		echo "$bdf" > "/sys/bus/pci/devices/$bdf/driver/unbind"
+	fi
+	echo vfio-pci > "/sys/bus/pci/devices/$bdf/driver_override"
+	echo "$bdf" > /sys/bus/pci/drivers_probe
+fi
+if [ "$(driver_of "$bdf")" != vfio-pci ]; then
+	echo "natgw-card-check: could not bind $bdf to vfio-pci" >&2
+	exit 1
+fi
+echo "natgw-card-check: $bdf on vfio-pci"
