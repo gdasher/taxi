@@ -15,3 +15,8 @@ dict for {name value} $params {
     lappend param_list $name=$value
 }
 set_property generic $param_list [get_filesets sources_1]
+
+# the DDR top-level ports, controller and clock converter (fpga_au200_nat.sv).
+# Set on the fileset: a `define in the generated defines.v does not reach
+# the other SystemVerilog files, each of which is its own compilation unit.
+set_property verilog_define {NAT_DDR} [get_filesets sources_1]

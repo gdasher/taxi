@@ -13,8 +13,6 @@ FPGA_PART = xcu200-fsgd2104-2-e
 FPGA_TOP = fpga
 FPGA_ARCH = virtexuplus
 
-DEFS = NAT_DDR
-
 RTL_DIR = ../rtl
 LIB_DIR = ../lib
 TAXI_SRC_DIR = $(LIB_DIR)/taxi/src
