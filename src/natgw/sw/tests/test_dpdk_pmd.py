@@ -17,9 +17,9 @@ BIN = os.path.join(TESTDIR, "build", "test_natgw_pmd")
 TESTS = ["ports", "validate_rejects", "snat_dnat_forwarding", "udp_zero_checksum", "punts", "count",
          "age", "destroy_and_duplicates", "fill_table", "host_tx", "no_punt_header", "concurrent",
          "ddr_spill", "ddr_punt_and_count", "ddr_age", "ddr_no_dimm", "ddr_disabled",
-         "policy_admission", "policy_moves", "policy_counters", "policy_fill"]
+         "policy_admission", "policy_moves", "policy_counters", "policy_fill", "lock_stress"]
 
-EAL = ["-l", "0-1", "--no-pci", "--file-prefix", "natgw_pytest",
+EAL = ["-l", "0-2", "--no-pci", "--file-prefix", "natgw_pytest",
        "--vdev", "net_natgw_modelA,lanes=3,bucket_w=4,clock=manual",
        "--vdev", "net_natgw_modelB,lanes=2,punt_hdr=0,clock=manual",
        "--vdev", "net_natgw_modelC,lanes=2,bucket_w=2,ddr_bucket_w=6,clock=manual",
@@ -27,7 +27,9 @@ EAL = ["-l", "0-1", "--no-pci", "--file-prefix", "natgw_pytest",
        "--vdev", "net_natgw_modelE,lanes=2,bucket_w=2,ddr_bucket_w=6,no_ddr=1,clock=manual",
        "--vdev", "net_natgw_modelF,lanes=2,bucket_w=2,ddr_bucket_w=6,clock=manual,onchip_high=50,onchip_low=25,"
                  "demote_idle=2,promote_k=2,promote_n=3,min_residency=1",
-       "--vdev", "net_natgw_modelG,lanes=2,bucket_w=2,ddr_bucket_w=6,clock=manual,tier_policy=fill,onchip_high=50"]
+       "--vdev", "net_natgw_modelG,lanes=2,bucket_w=2,ddr_bucket_w=6,clock=manual,tier_policy=fill,onchip_high=50",
+       "--vdev", "net_natgw_modelH,lanes=2,bucket_w=3,ddr_bucket_w=8,clock=manual,onchip_high=60,onchip_low=30,"
+                 "demote_idle=1,promote_k=2,promote_n=3,min_residency=1"]
 
 
 def _skip_reason():

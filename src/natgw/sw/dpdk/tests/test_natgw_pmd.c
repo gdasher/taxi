@@ -12,6 +12,8 @@
  *   dev F: net_natgw_modelF, 2 lanes (ports 11-12), DDR tier, balanced policy with
  *          short timings (on chip 50%/25%, demote after 2 s idle, promote 2 of 3)
  *   dev G: net_natgw_modelG, 2 lanes (ports 13-14), DDR tier, tier_policy=fill
+ *   dev H: net_natgw_modelH, 2 lanes (ports 15-16), 64 entries on chip, DDR tier, short
+ *          policy timings (the multi-threaded lock stress test)
  * Each test prints PASS/FAIL; the exit status is the number of failed tests.
  */
 
@@ -58,6 +60,8 @@ struct punt_meta {
 #define PF0 11
 #define PF1 12
 #define PG0 13
+#define PH0 15
+#define PH1 16
 #define IDX_DDR 0x80000000u
 
 static struct rte_mempool *mp;
@@ -280,8 +284,8 @@ static void test_ports(void)
 	struct rte_eth_link link;
 	struct rte_eth_dev_info info;
 
-	CHECK(rte_eth_dev_count_avail() == 15, "ports: %u", rte_eth_dev_count_avail());
-	for (uint16_t p = 0; p < 15; p++) {
+	CHECK(rte_eth_dev_count_avail() == 17, "ports: %u", rte_eth_dev_count_avail());
+	for (uint16_t p = 0; p < 17; p++) {
 		CHECK(rte_eth_link_get_nowait(p, &link) == 0 && link.link_status == RTE_ETH_LINK_UP, "port %u down", p);
 		CHECK(rte_eth_dev_info_get(p, &info) == 0 && strcmp(info.driver_name, "net_natgw_model") == 0,
 		      "driver %s", info.driver_name);
@@ -992,6 +996,209 @@ static void test_policy_fill(void)
 	drain();
 }
 
+/* ------------------------------------------------------------------ */
+/* the flow context lock under load (dev H)
+ *
+ * Three threads at once: the main thread creates, destroys and queries
+ * "churn" flows and queries the stable ones; a poll thread advances the clock
+ * and runs the policy poll (events, the activity sweep, tier moves in batches
+ * of 8 under the lock); a traffic thread sends frames for a busy window of 10
+ * of 40 stable flows, moving the window every 20000 frames, and checks every
+ * frame is forwarded with its exact rewrite while the policy promotes the
+ * newly busy flows and demotes the newly idle ones. Idle filler flows created
+ * first keep the chip near its high-water mark, so busy flows start in DDR. */
+
+#define ST_STABLE 40
+#define ST_FILL 34
+#define ST_CHURN 30
+#define ST_WINDOW 10
+#define ST_SHIFT 20000
+
+static volatile int stress_stop;
+static volatile uint64_t st_ok, st_bad, st_punt, st_polls;
+static char st_first_bad[160];
+
+static struct tuple stable_tuple(unsigned i)
+{
+	return (struct tuple){ .sip = 0x0a200000 + i * 104729, .dip = 0x0b0b0b0b ^ (i * 7919),
+			       .sport = (uint16_t)(3000 + i), .dport = 443, .tcp = (int)(i & 1), .vid = -1 };
+}
+
+static struct nat stable_nat(unsigned i)
+{
+	return snat_to(PH1, 0xc6336404, (uint16_t)(51000 + i));
+}
+
+static bool check_fwd(const uint8_t *got, int n, uint16_t len, uint16_t want_port)
+{
+	struct rte_ipv4_hdr *ip;
+
+	if (n != len)
+		return false;
+	ip = (struct rte_ipv4_hdr *)(uintptr_t)(got + 14);
+	return rte_be_to_cpu_32(ip->src_addr) == 0xc6336404 &&
+	       rte_be_to_cpu_16(((struct rte_tcp_hdr *)(ip + 1))->src_port) == want_port &&
+	       ip_csum_ok(ip) && l4_csum_ok(ip);
+}
+
+static int stress_traffic(void *arg __rte_unused)
+{
+	uint8_t frame[256], got[9600];
+	struct rte_mbuf *m[32];
+	unsigned i = 0;
+
+	while (!stress_stop) {
+		unsigned base = (i / ST_SHIFT) * ST_WINDOW % ST_STABLE;
+		unsigned k = (base + i++ % ST_WINDOW) % ST_STABLE;       /* the busy window */
+		struct tuple t = stable_tuple(k);
+		uint16_t len = build(frame, &t, 0, 64);
+		int fwd = 0, n;
+
+		if (rte_pmd_natgw_model_wire_inject(PH0, frame, len) != 0)
+			continue;
+		rte_pmd_natgw_model_service(PH0);
+		n = rte_pmd_natgw_model_wire_recv(PH1, got, sizeof(got), &fwd);
+		if (n > 0 && fwd && check_fwd(got, n, len, (uint16_t)(51000 + k))) {
+			st_ok++;
+		} else {
+			if (!st_bad)
+				snprintf(st_first_bad, sizeof(st_first_bad), "flow %u: recv %d fwd %d", k, n, fwd);
+			st_bad++;
+		}
+		uint16_t np = rte_eth_rx_burst(PH0, 0, m, 32);
+		if (np) {
+			st_punt += np;
+			rte_pktmbuf_free_bulk(m, np);
+		}
+	}
+	return 0;
+}
+
+static int stress_poll(void *arg __rte_unused)
+{
+	while (!stress_stop) {
+		rte_pmd_natgw_model_advance(PH0, 50);           /* 50 ms of device time */
+		rte_pmd_natgw_model_poll(PH0);
+		st_polls++;
+		rte_delay_us(20);
+	}
+	return 0;
+}
+
+static void test_lock_stress(void)
+{
+	struct rte_flow_action q[] = { { .type = RTE_FLOW_ACTION_TYPE_COUNT }, { .type = RTE_FLOW_ACTION_TYPE_END } };
+	struct rte_flow *stable[ST_STABLE], *fill_f[ST_FILL], *churn[ST_CHURN] = {0};
+	unsigned churn_id[ST_CHURN] = {0}, next_id = 1000;
+	unsigned lc1 = rte_get_next_lcore(-1, 1, 0), lc2;
+	uint64_t creates = 0, destroys = 0, queries = 0, qerr = 0, cerr = 0, max_create = 0;
+	struct rte_flow_query_count c;
+	struct rte_flow_error err;
+	uint8_t frame[256], got[9600];
+
+	lc2 = lc1 < RTE_MAX_LCORE ? rte_get_next_lcore(lc1, 1, 0) : RTE_MAX_LCORE;
+	if (lc2 >= RTE_MAX_LCORE) {
+		printf("  (skipped: needs three lcores)\n");
+		return;
+	}
+	for (unsigned i = 0; i < ST_FILL; i++) {
+		struct tuple t = stable_tuple(500 + i);
+		struct nat n = stable_nat(500 + i);
+		fill_f[i] = create(PH0, &t, &n, &err);
+		CHECK(fill_f[i], "filler %u: %s", i, err.message);
+	}
+	for (unsigned i = 0; i < ST_STABLE; i++) {
+		struct tuple t = stable_tuple(i);
+		struct nat n = stable_nat(i);
+		stable[i] = create(PH0, &t, &n, &err);
+		CHECK(stable[i], "stable %u: %s", i, err.message);
+		if (!stable[i])
+			return;
+	}
+	stress_stop = 0;
+	st_ok = st_bad = st_punt = st_polls = 0;
+	rte_eal_remote_launch(stress_traffic, NULL, lc1);
+	rte_eal_remote_launch(stress_poll, NULL, lc2);
+
+	uint64_t end = rte_get_timer_cycles() + 3 * rte_get_timer_hz();
+	srand(42);
+	while (rte_get_timer_cycles() < end) {
+		unsigned r = (unsigned)rand() % 10, s = (unsigned)rand() % ST_CHURN;
+		if (r < 5 && !churn[s]) {
+			struct tuple t = stable_tuple(next_id);
+			struct nat n = stable_nat(next_id);
+			uint64_t t0 = rte_get_timer_cycles();
+			churn[s] = create(PH0, &t, &n, &err);
+			uint64_t dt = rte_get_timer_cycles() - t0;
+			max_create = RTE_MAX(max_create, dt);
+			if (churn[s]) {
+				churn_id[s] = next_id++;
+				creates++;
+			} else {
+				cerr += rte_errno != ENOSPC;
+			}
+		} else if (r < 8 && churn[s]) {
+			CHECK(rte_flow_destroy(PH0, churn[s], &err) == 0, "destroy: %s", err.message);
+			churn[s] = NULL;
+			destroys++;
+		} else {
+			struct rte_flow *f = (r & 1) ? stable[(unsigned)rand() % ST_STABLE] : churn[s];
+			if (!f)
+				continue;
+			memset(&c, 0, sizeof(c));
+			qerr += rte_flow_query(PH0, f, q, &c, &err) != 0;
+			queries++;
+		}
+	}
+	stress_stop = 1;
+	rte_eal_wait_lcore(lc1);
+	rte_eal_wait_lcore(lc2);
+
+	unsigned live = 0;
+	for (unsigned s = 0; s < ST_CHURN; s++)
+		live += churn[s] != NULL;
+	printf("  %" PRIu64 " creates (max %.0f us), %" PRIu64 " destroys, %" PRIu64 " queries, %" PRIu64
+	       " polls; %" PRIu64 " frames checked; %" PRIu64 " promotions, %" PRIu64 " demotions\n",
+	       creates, (double)max_create * 1e6 / (double)rte_get_timer_hz(), destroys, queries, st_polls, st_ok,
+	       xstat(PH0, "natgw_promotions"), xstat(PH0, "natgw_demotions"));
+	CHECK(st_bad == 0 && st_punt == 0, "%" PRIu64 " busy-flow frames not forwarded correctly, %" PRIu64
+	      " punted (%s)", st_bad, st_punt, st_first_bad);
+	CHECK(st_ok > 1000 && creates > 100 && destroys > 50 && queries > 100 && st_polls > 100,
+	      "too little concurrency: %" PRIu64 " frames, %" PRIu64 " creates, %" PRIu64 " polls", st_ok, creates,
+	      st_polls);
+	CHECK(qerr == 0 && cerr == 0, "%" PRIu64 " query errors, %" PRIu64 " create errors", qerr, cerr);
+	CHECK(xstat(PH0, "natgw_promotions") > 50 && xstat(PH0, "natgw_demotions") > 50,
+	      "too few moves: %" PRIu64 " promotions, %" PRIu64 " demotions", xstat(PH0, "natgw_promotions"),
+	      xstat(PH0, "natgw_demotions"));
+	CHECK(xstat(PH0, "natgw_migrate_failures") == 0, "migrate failures");
+	CHECK(xstat(PH0, "natgw_flows") == ST_FILL + ST_STABLE + live, "flows %" PRIu64 ", expected %u",
+	      xstat(PH0, "natgw_flows"), ST_FILL + ST_STABLE + live);
+	CHECK((double)max_create / (double)rte_get_timer_hz() < 0.02, "a create waited %.1f ms",
+	      (double)max_create * 1e3 / (double)rte_get_timer_hz());
+	/* afterwards every flow, stable or churn, forwards with its own rewrite */
+	unsigned ok = 0, want = 0;
+	for (unsigned i = 0; i < ST_STABLE + ST_CHURN; i++) {
+		unsigned id;
+		if (i < ST_STABLE) {
+			id = i;
+		} else if (churn[i - ST_STABLE]) {
+			id = churn_id[i - ST_STABLE];
+		} else {
+			continue;
+		}
+		struct tuple t = stable_tuple(id);
+		uint16_t len = build(frame, &t, 0, 64);
+		int fwd = 0;
+		want++;
+		inject(PH0, frame, len);
+		int n = wire_take(PH1, got, &fwd);
+		ok += n > 0 && fwd && check_fwd(got, n, len, (uint16_t)(51000 + id));
+	}
+	CHECK(ok == want, "%u of %u flows forward correctly after the stress", ok, want);
+	rte_flow_flush(PH0, &err);
+	drain();
+}
+
 /* a worker polls the datapath while the main core creates and destroys flows */
 static volatile int stop_worker;
 static volatile uint64_t worker_frames;
@@ -1099,6 +1306,7 @@ int main(int argc, char **argv)
 	run("policy_moves", test_policy_moves);
 	run("policy_counters", test_policy_counters);
 	run("policy_fill", test_policy_fill);
+	run("lock_stress", test_lock_stress);
 
 	uint16_t pid;
 	RTE_ETH_FOREACH_DEV(pid) {

@@ -21,7 +21,7 @@ except ImportError:          # cocotb 2.0 keeps them in _bridge
 
 import natgw_clib as clib
 from natgw_model import (Entry, NextHop, State, to_words, from_words, CuckooTable,  # noqa: F401
-                         _entry_c, _entry_py, _nh_c)
+                         _entry_c, _entry_py, _key_c, _nh_c)
 
 REG_ID = 0x0000
 REG_VERSION = 0x0004
@@ -218,6 +218,37 @@ class NatRegs:
 
     async def read_stat(self, lane, n):
         return await self._call(clib.lib.natgw_dev_read_stat, lane, n)
+
+    # ---------------------------------------------------------------- tier moves
+
+    async def _tier_move(self, model, key, promote):
+        """libnatgw's hitless move of key's entry between model.table (on
+        chip) and model.ddr, on the device; every batch of writes is mirrored
+        into the model (the C model's registers and the Python table copies)
+        right after it reaches the device. 0 or a negative errno."""
+        t, td = model.table, model.ddr
+
+        def hook(arg, before, ddr, ops, n):
+            if before:
+                return
+            (td if ddr else t)._t._mirror(ops, n)
+            (clib.lib.natgw_dev_apply_ddr if ddr else clib.lib.natgw_dev_apply)(C.byref(model.dev), ops, n)
+
+        c_hook = clib.APPLY_HOOK(hook)
+        ops = (clib.Write * (t.max_ops + 2))()
+        k = _key_c(key)
+        if promote:
+            return await self._call(clib.lib.natgw_tier_promote, t._t.h, td._t.h, C.byref(k), ops, len(ops),
+                                    c_hook, None)
+        st = clib.State()
+        return await self._call(clib.lib.natgw_tier_demote, t._t.h, td._t.h, C.byref(k), ops, len(ops), c_hook,
+                                None, C.byref(st))
+
+    async def tier_promote(self, model, key):
+        return await self._tier_move(model, key, True)
+
+    async def tier_demote(self, model, key):
+        return await self._tier_move(model, key, False)
 
     # ---------------------------------------------------------------- DDR tier
 

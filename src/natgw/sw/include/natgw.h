@@ -335,6 +335,27 @@ void natgw_dev_apply(struct natgw_dev *d, const struct natgw_write *ops, unsigne
 /* the same for the DDR tier (each write completes before the next starts) */
 void natgw_dev_apply_ddr(struct natgw_dev *d, const struct natgw_write *ops, unsigned n);
 
+/*
+ * Moving an entry between the on-chip table t and the DDR table td without a
+ * miss: the new copy is written before the old one is cleared, and lookups
+ * try on chip first, so the flow hits throughout. hook (may be NULL) is
+ * called before (before = true) and after each batch of writes is applied to
+ * the device, for the caller's bookkeeping. ops is scratch space for max_ops
+ * writes (NATGW_MAX_INSERT_OPS).
+ */
+typedef void natgw_apply_hook_t(void *arg, bool before, bool ddr, const struct natgw_write *ops, unsigned n);
+
+/* DDR -> chip. 0, or the on-chip insert's error (the entry stays in DDR) */
+int natgw_tier_promote(struct natgw_dev *d, struct natgw_table *t, struct natgw_table *td,
+		       const struct natgw_key *k, struct natgw_write *ops, unsigned max_ops,
+		       natgw_apply_hook_t *hook, void *arg);
+/* chip -> DDR. On success *st is the entry's last on-chip state (counts,
+ * last hit). 0, -ENOENT, the DDR insert's error, or -EIO when the DDR tier
+ * stopped being looked up (the move is undone; the entry stays on chip) */
+int natgw_tier_demote(struct natgw_dev *d, struct natgw_table *t, struct natgw_table *td,
+		      const struct natgw_key *k, struct natgw_write *ops, unsigned max_ops,
+		      natgw_apply_hook_t *hook, void *arg, struct natgw_state *st);
+
 /* largest number of writes a single insert can need */
 #define NATGW_MAX_INSERT_OPS(max_depth) ((max_depth) + 2)
 

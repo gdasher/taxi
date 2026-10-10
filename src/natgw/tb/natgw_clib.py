@@ -175,6 +175,11 @@ class Parsed(C.Structure):
 
 
 _sig("natgw_table_candidates", C.c_uint, C.c_void_p, P(Key), P(C.c_uint32))
+APPLY_HOOK = C.CFUNCTYPE(None, C.c_void_p, C.c_bool, C.c_bool, P(Write), C.c_uint)
+_sig("natgw_tier_promote", C.c_int, P(Dev), C.c_void_p, C.c_void_p, P(Key), P(Write), C.c_uint, APPLY_HOOK,
+     C.c_void_p)
+_sig("natgw_tier_demote", C.c_int, P(Dev), C.c_void_p, C.c_void_p, P(Key), P(Write), C.c_uint, APPLY_HOOK,
+     C.c_void_p, P(State))
 _sig("natgw_oc_sum16", C.c_uint16, P(C.c_uint8), C.c_size_t)
 _sig("natgw_csum_update3", C.c_uint16, *([C.c_uint16] * 7))
 _sig("natgw_model_parse", None, P(C.c_uint8), C.c_size_t, C.c_uint, C.c_bool, P(Parsed))

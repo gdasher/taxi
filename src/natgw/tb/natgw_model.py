@@ -349,9 +349,13 @@ class CuckooTable:
         return idx.value, self.slots[idx.value]
 
     def _writes(self, n):
+        return self._mirror(self._ops, n)
+
+    def _mirror(self, ops, n):
+        """update slots/where from n writes (as the C table already has)"""
         out = []
         for i in range(n):
-            op = self._ops[i]
+            op = ops[i]
             if op.clear:
                 out.append((op.idx, None))
                 old = self.slots.pop(op.idx, None)

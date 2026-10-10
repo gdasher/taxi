@@ -462,6 +462,73 @@ void natgw_dev_ddr_stats(struct natgw_dev *d, uint32_t *lookups, uint32_t *hits,
 	*skips = rd(d, NATGW_REG_DDR_SKIPS);
 }
 
+static void apply_hooked(struct natgw_dev *d, bool ddr, const struct natgw_write *ops, unsigned n,
+			 natgw_apply_hook_t *hook, void *arg)
+{
+	if (hook)
+		hook(arg, true, ddr, ops, n);
+	if (ddr)
+		natgw_dev_apply_ddr(d, ops, n);
+	else
+		natgw_dev_apply(d, ops, n);
+	if (hook)
+		hook(arg, false, ddr, ops, n);
+}
+
+int natgw_tier_promote(struct natgw_dev *d, struct natgw_table *t, struct natgw_table *td,
+		       const struct natgw_key *k, struct natgw_write *ops, unsigned max_ops,
+		       natgw_apply_hook_t *hook, void *arg)
+{
+	struct natgw_entry e;
+	uint32_t idx;
+	int n;
+
+	if (natgw_table_find(td, k, &idx) != 0)
+		return -ENOENT;
+	e = *natgw_table_slot(td, idx);
+	n = natgw_table_insert(t, &e, ops, max_ops, &idx);
+	if (n < 0)
+		return n;
+	apply_hooked(d, false, ops, (unsigned)n, hook, arg);
+	/* the on-chip copy now wins; the DDR copy can go */
+	n = natgw_table_delete(td, k, ops, max_ops);
+	if (n > 0)
+		apply_hooked(d, true, ops, (unsigned)n, hook, arg);
+	return 0;
+}
+
+int natgw_tier_demote(struct natgw_dev *d, struct natgw_table *t, struct natgw_table *td,
+		      const struct natgw_key *k, struct natgw_write *ops, unsigned max_ops,
+		      natgw_apply_hook_t *hook, void *arg, struct natgw_state *st)
+{
+	struct natgw_ddr_status ds;
+	struct natgw_entry e;
+	uint32_t idx;
+	int n;
+
+	if (natgw_table_find(t, k, &idx) != 0)
+		return -ENOENT;
+	e = *natgw_table_slot(t, idx);
+	natgw_dev_read_state(d, idx, st);
+	n = natgw_table_insert(td, &e, ops, max_ops, &idx);
+	if (n < 0)
+		return n;
+	apply_hooked(d, true, ops, (unsigned)n, hook, arg);
+	/* both copies exist and the on-chip one still wins; clear it only while
+	 * the DDR tier is still looked up, or the flow would miss */
+	natgw_dev_ddr_status(d, &ds);
+	if (!ds.active) {
+		n = natgw_table_delete(td, k, ops, max_ops);
+		if (n > 0)
+			apply_hooked(d, true, ops, (unsigned)n, hook, arg);
+		return -EIO;
+	}
+	n = natgw_table_delete(t, k, ops, max_ops);
+	if (n > 0)
+		apply_hooked(d, false, ops, (unsigned)n, hook, arg);
+	return 0;
+}
+
 uint32_t natgw_dev_ddr_read_errors(struct natgw_dev *d)
 {
 	return rd(d, NATGW_REG_DDR_RERR);

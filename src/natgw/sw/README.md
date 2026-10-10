@@ -54,7 +54,7 @@ The second option matters for shared builds. A shared DPDK autoloads every mempo
 | Suite | Command | Covers |
 | --- | --- | --- |
 | libnatgw and C model | `make test` (`tests/test_{layout,table,model,dev,ddr}.py`) | <ul><li>Layouts are bit-exact with the Python data types; hashes match the CRC written out from the spec.</li><li>Cuckoo placement stays relocation-safe after every write, for both the on-chip and the DDR table geometry.</li><li>The C model's forwarded frames, decoded with scapy, carry exactly the rewrite of the entry and next hop that hit (addresses, ports, MACs, VLAN, TTL, valid checksums), also with flows split between the two tiers; punts are unchanged; every punt reason is reachable.</li><li>Registers, events, aging and overflow; DDR status when absent, present without a DIMM and working; DDR entry access, clear and the activity bitmap.</li></ul> |
-| DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li><li>DDR tier: spill to DDR once on-chip is full, DDR punts carry the DDR index flag, no counters for DDR flows, DDR aging from the activity bitmap; with no DIMM or `no_ddr=1`, ENOSPC at on-chip capacity and no DDR lookups.</li><li>Tier policy: admission at the high-water mark and bulk flows to DDR; idle flows demoted and busy DDR flows promoted, with a probe frame run through the model after every single table command forwarding unchanged throughout; no ping-pong once settled; counters monotonic across demote and promote; `fill` ignores the watermark.</li></ul> |
+| DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li><li>DDR tier: spill to DDR once on-chip is full, DDR punts carry the DDR index flag, no counters for DDR flows, DDR aging from the activity bitmap; with no DIMM or `no_ddr=1`, ENOSPC at on-chip capacity and no DDR lookups.</li><li>Tier policy: admission at the high-water mark and bulk flows to DDR; idle flows demoted and busy DDR flows promoted, with a probe frame run through the model after every single table command forwarding unchanged throughout; no ping-pong once settled; counters monotonic across demote and promote; `fill` ignores the watermark.</li><li>The flow context lock under load (`lock_stress`, three threads for 3 s): the main thread creates, destroys and queries flows (about 370k each of creates and destroys) while a poll thread runs the policy (over 1,000 promotions and demotions) and a traffic thread checks that every frame of a rotating set of busy flows is forwarded with its exact rewrite (about 2.7M frames). Then flow accounting, no migration failures, every flow forwarding, and a create never waiting more than 20 ms (about 0.2–0.3 ms seen). Moving without the lock crashes it; leaving destroyed flows on the candidate queues hangs it.</li></ul> |
 | VPP integration | `pytest vpp/tests` (VPP and passwordless sudo; skipped otherwise) | Kernel TCP/UDP from namespaces on the model's TAP lanes, through VPP and the model. See below. |
 | WAN manager | `pytest wanmgr/tests` | <ul><li>Unit tests against a fake VPP that models routing and NAT for probes: thresholds, flapping, target fallback, steering, flushing, lease changes, restarts, alert rate limiting and SMTP.</li><li>Integration tests with real VPP, the offload plugin, dnsmasq "modems" and an SMTP sink: startup, an ISP outage, all WANs down, and a VPP restart.</li></ul> |
 
@@ -123,7 +123,15 @@ uses it automatically when the memory calibrated:
     tier before moving again.
   - **Hitless moves.** The new copy is written before the old one is
     cleared; on-chip lookups win, so the flow hits throughout. A demotion is
-    abandoned if the DDR tier stops being looked up.
+    abandoned if the DDR tier stops being looked up. The moves are
+    libnatgw's `natgw_tier_promote` and `natgw_tier_demote`, so the RTL
+    system test exercises the same code.
+  - **Locking.** One spinlock per device (`ctx->lock`) covers the host
+    tables, the index maps and key hash, next hops, the flow list and
+    candidate queues, per-flow state, and every multi-register device
+    sequence. The rte_flow calls, the poll and xstats take it; the packet
+    path never does. The poll does its moves in batches of 8, releasing the
+    lock in between, so flow creates wait for at most one batch.
   - **Counters.** On-chip counts are carried across a stay in DDR, so COUNT
     totals never go backwards.
   - **Bulk hint.** rte_flow priority 1 places a flow in DDR and never

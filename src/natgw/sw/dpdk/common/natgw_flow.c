@@ -701,28 +701,31 @@ static void ddr_read_word(struct natgw_flow_ctx *ctx, uint32_t w, uint32_t now)
 	}
 }
 
-static void apply_ops(struct natgw_flow_ctx *ctx, unsigned n, bool ddr)
+/*
+ * Bookkeeping around every batch of table writes (natgw_apply_hook_t):
+ * before, collect the activity word of any empty DDR slot about to be filled
+ * (it may still hold the bit of the flow that left; a stale bit would keep
+ * the newcomer alive); after, point the index maps at the flows now there.
+ */
+static void flow_hook(void *arg, bool before, bool ddr, const struct natgw_write *ops, unsigned n)
 {
+	struct natgw_flow_ctx *ctx = arg;
 	struct rte_flow **by_idx = ddr ? ctx->by_idx_ddr : ctx->by_idx;
 	uint32_t now = ddr ? natgw_dev_tick(&ctx->dev) : 0;
 
-	/* an empty DDR slot may still have the activity bit of the flow that
-	 * left it: collect that word before a new flow moves in, or the stale
-	 * bit would keep the newcomer alive */
-	for (unsigned i = 0; ddr && i < n; i++) {
-		if (!ctx->ops[i].clear && !by_idx[ctx->ops[i].idx])
-			ddr_read_word(ctx, ctx->ops[i].idx / 64, now);
+	if (before) {
+		for (unsigned i = 0; ddr && i < n; i++) {
+			if (!ops[i].clear && !by_idx[ops[i].idx])
+				ddr_read_word(ctx, ops[i].idx / 64, now);
+		}
+		return;
 	}
-	if (ddr)
-		natgw_dev_apply_ddr(&ctx->dev, ctx->ops, n);
-	else
-		natgw_dev_apply(&ctx->dev, ctx->ops, n);
 	for (unsigned i = 0; i < n; i++) {
-		uint32_t idx = ctx->ops[i].idx;
+		uint32_t idx = ops[i].idx;
 		struct rte_flow *f = NULL;
 
-		if (!ctx->ops[i].clear) {
-			struct hkey hk = mk_hkey(&ctx->ops[i].entry.key);
+		if (!ops[i].clear) {
+			struct hkey hk = mk_hkey(&ops[i].entry.key);
 			void *d = NULL;
 			rte_hash_lookup_data(ctx->by_key, &hk, &d);
 			f = d;
@@ -736,6 +739,16 @@ static void apply_ops(struct natgw_flow_ctx *ctx, unsigned n, bool ddr)
 		}
 		by_idx[idx] = f;
 	}
+}
+
+static void apply_ops(struct natgw_flow_ctx *ctx, unsigned n, bool ddr)
+{
+	flow_hook(ctx, true, ddr, ctx->ops, n);
+	if (ddr)
+		natgw_dev_apply_ddr(&ctx->dev, ctx->ops, n);
+	else
+		natgw_dev_apply(&ctx->dev, ctx->ops, n);
+	flow_hook(ctx, false, ddr, ctx->ops, n);
 }
 
 static int natgw_flow_validate(struct rte_eth_dev *dev, const struct rte_flow_attr *attr,
@@ -1109,16 +1122,10 @@ static void ddr_sweep_locked(struct natgw_flow_ctx *ctx, uint32_t now, bool *not
 
 static int promote_locked(struct natgw_flow_ctx *ctx, struct rte_flow *f, uint32_t now)
 {
-	uint32_t idx;
-	int n = natgw_table_insert(ctx->t, &f->e, ctx->ops, ctx->max_ops, &idx);
+	int rc = natgw_tier_promote(&ctx->dev, ctx->t, ctx->td, &f->e.key, ctx->ops, ctx->max_ops, flow_hook, ctx);
 
-	if (n < 0)
-		return n;
-	apply_ops(ctx, (unsigned)n, false);
-	/* the on-chip copy now wins; the DDR copy can go */
-	n = natgw_table_delete(ctx->td, &f->e.key, ctx->ops, ctx->max_ops);
-	if (n > 0)
-		apply_ops(ctx, (unsigned)n, true);
+	if (rc != 0)
+		return rc;
 	f->ddr = false;
 	ctx->nflows_ddr--;
 	f->tier_since = now;
@@ -1131,30 +1138,12 @@ static int promote_locked(struct natgw_flow_ctx *ctx, struct rte_flow *f, uint32
 
 static int demote_locked(struct natgw_flow_ctx *ctx, struct rte_flow *f, uint32_t now)
 {
-	struct natgw_ddr_status st;
 	struct natgw_state s;
-	uint32_t idx;
-	int n;
+	int rc = natgw_tier_demote(&ctx->dev, ctx->t, ctx->td, &f->e.key, ctx->ops, ctx->max_ops, flow_hook, ctx,
+				   &s);
 
-	if (natgw_table_find(ctx->t, &f->e.key, &idx) != 0)
-		return -ENOENT;
-	natgw_dev_read_state(&ctx->dev, idx, &s);
-	n = natgw_table_insert(ctx->td, &f->e, ctx->ops, ctx->max_ops, &idx);
-	if (n < 0)
-		return n;
-	apply_ops(ctx, (unsigned)n, true);
-	/* both copies exist and the on-chip one still wins; clear it only while
-	 * the DDR tier is still looked up, or the flow would miss */
-	natgw_dev_ddr_status(&ctx->dev, &st);
-	if (!st.active) {
-		n = natgw_table_delete(ctx->td, &f->e.key, ctx->ops, ctx->max_ops);
-		if (n > 0)
-			apply_ops(ctx, (unsigned)n, true);
-		return -EIO;
-	}
-	n = natgw_table_delete(ctx->t, &f->e.key, ctx->ops, ctx->max_ops);
-	if (n > 0)
-		apply_ops(ctx, (unsigned)n, false);
+	if (rc != 0)
+		return rc;
 	/* carry the on-chip counts; aging continues from its last on-chip hit */
 	f->acc_pkts += s.pkts;
 	f->acc_bytes += s.bytes;

@@ -777,22 +777,50 @@ async def exchange(tb, driver, nat, items):
     # Ethernet frames are at least 60 bytes (without FCS); the MACs pad
     # shorter ones, so send them padded
     items = [(lane, data.ljust(60, b"\0")) for lane, data in items]
+    for lane, data in items:
+        await tb.qsfp_sources[lane].send(XgmiiFrame.from_payload(data))
+    return await expect_and_collect(tb, driver, nat, items)
+
+
+async def expect_and_collect(tb, driver, nat, items):
+    """the model's outcome for every (lane, frame) already sent, compared with
+    what arrived on the wire and at the host, per destination"""
+    m = nat.model
     want_wire = {lane: [] for lane in range(8)}
     want_host = {lane: [] for lane in range(8)}
     for lane, data in items:
         exp = m.process(lane, data)
         (want_wire if exp.kind == "fwd" else want_host)[exp.lane].append(exp.data)
-    for lane, data in items:
-        await tb.qsfp_sources[lane].send(XgmiiFrame.from_payload(data))
+    # gather from every destination at once until everything expected has
+    # arrived, or nothing new has for 50 us; then report the difference
+    got_wire = {lane: [] for lane in range(8)}
+    got_host = {lane: [] for lane in range(8)}
+    total = sum(map(len, want_wire.values())) + sum(map(len, want_host.values()))
+    idle = 0
+    while idle < 50:
+        progress = False
+        for lane in range(8):
+            while not tb.qsfp_sinks[lane].empty():
+                pkt = tb.qsfp_sinks[lane].recv_nowait()
+                assert pkt.check_fcs()
+                got_wire[lane].append(bytes(pkt.get_payload()))
+                progress = True
+            while not driver.ports[lane].rx_queue.empty():
+                got_host[lane].append(bytes(driver.ports[lane].rx_queue.get_nowait()))
+                progress = True
+        if sum(map(len, got_wire.values())) + sum(map(len, got_host.values())) >= total:
+            await Timer(5, 'us')          # then anything extra shows up too
+            for lane in range(8):
+                while not tb.qsfp_sinks[lane].empty():
+                    got_wire[lane].append(bytes(tb.qsfp_sinks[lane].recv_nowait().get_payload()))
+                while not driver.ports[lane].rx_queue.empty():
+                    got_host[lane].append(bytes(driver.ports[lane].rx_queue.get_nowait()))
+            break
+        idle = 0 if progress else idle + 1
+        await Timer(1, 'us')
     for lane in range(8):
-        got = [await recv_wire(tb, lane, timeout_us=2000) for _ in want_wire[lane]]
-        diff_report(tb, f"wire lane {lane}", got, want_wire[lane])
-        got = [await recv_port(driver, lane, timeout_us=2000) for _ in want_host[lane]]
-        diff_report(tb, f"host port {lane}", got, want_host[lane])
-    await Timer(5, 'us')
-    for lane in range(8):
-        assert tb.qsfp_sinks[lane].empty(), f"unexpected frame on wire lane {lane}"
-        assert driver.ports[lane].rx_queue.empty(), f"unexpected punt on port {lane}"
+        diff_report(tb, f"wire lane {lane}", got_wire[lane], want_wire[lane])
+        diff_report(tb, f"host port {lane}", got_host[lane], want_host[lane])
     return sum(map(len, want_wire.values())), sum(map(len, want_host.values()))
 
 
@@ -848,6 +876,76 @@ async def run_test_ddr(dut):
     await check_ddr_activity(nat)
     stats = await nat.regs.ddr_stats()
     assert stats["hits"] > 0 and stats["skips"] == 0 and stats["read_errors"] == 0, stats
+
+
+@cocotb.test()
+async def run_test_tier_moves(dut):
+    """Hitless tier moves on the hardware under traffic: libnatgw moves every
+    session's entries between the on-chip table and DDR (three full rounds:
+    natgw_tier_promote / natgw_tier_demote, the code the flow layer uses) while
+    frames for those sessions flow continuously in both directions. Every
+    frame must be forwarded exactly as the model says (a miss during a move
+    would be punted instead), and afterwards every entry is in the tier the
+    table says, in the hardware's own memory."""
+    random.seed(16)
+    tb, driver = await init_all(dut)
+    if not tb.ddr:
+        tb.log.info("no DDR tier in this configuration")
+        return
+    nat = NatHarness(tb, driver)
+    await nat.setup(punt_hdr=True)
+    m = nat.model
+    sessions = []
+    for k in range(12):
+        tier = "ddr" if k % 2 else "uram"
+        o, i = await nat.add_session(0xc0a80300 + k, 42000 + k, 0x0a0a0a00 + k, 443, k % 2, (k // 2) % 2, tier)
+        sessions.append([o, i, tier])
+
+    sent = []
+    running = [True]
+
+    async def traffic():
+        while running[0]:
+            o, i, _ = random.choice(sessions)
+            if random.random() < 0.5:
+                lane, key, src = LAN_LANE, o, LAN_HOST_MAC
+            else:
+                lane, key, src = i.lane, i, WAN_GW_MAC[WAN_LANES.index(i.lane)]
+            data = nat.packet(key, size=random.randint(20, 120), src_mac=src).ljust(60, b"\0")
+            sent.append((lane, data))
+            await tb.qsfp_sources[lane].send(XgmiiFrame.from_payload(data))
+            await Timer(random.choice([50, 100, 200]), 'ns')
+
+    task = cocotb.start_soon(traffic())
+    moves = 0
+    for rnd in range(3):
+        for s in sessions:
+            for key in s[:2]:
+                if s[2] == "uram":
+                    rc = await nat.regs.tier_demote(m, key)
+                else:
+                    rc = await nat.regs.tier_promote(m, key)
+                assert rc == 0, f"move of {key} failed: {rc}"
+                moves += 1
+            s[2] = "ddr" if s[2] == "uram" else "uram"
+        tb.log.info("round %d: %d moves, %d frames sent so far", rnd, moves, len(sent))
+    running[0] = False
+    await task
+    fwd, punt = await expect_and_collect(tb, driver, nat, sent)
+    tb.log.info("%d moves under %d frames: %d forwarded, %d punted", moves, len(sent), fwd, punt)
+    assert punt == 0 and fwd == len(sent)
+    assert len(sent) > 10 * moves // 4
+
+    for o, i, tier in sessions:
+        for key in (o, i):
+            if tier == "ddr":
+                idx = m.ddr.where[key]
+                assert key not in m.table.where
+                assert await nat.regs.read_ddr_entry(idx) == m.ddr.slots[idx]
+            else:
+                idx = m.table.where[key]
+                assert key not in m.ddr.where
+                assert await nat.regs.read_entry(idx) == m.table.slots[idx]
 
 
 @cocotb.test()
