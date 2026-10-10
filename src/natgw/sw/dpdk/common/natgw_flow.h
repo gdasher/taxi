@@ -23,6 +23,18 @@
  * query returns hits_set = bytes_set = 0); their AGE comes from the activity
  * bitmap, swept a budget of words per poll, so idle times are accurate to one
  * sweep.
+ *
+ * Tier policy ("balanced", the default with a DDR tier; "fill" = first come,
+ * first served): new flows go on chip while it is below onchip_high percent
+ * full, else to DDR. On-chip flows idle for demote_idle seconds move to DDR
+ * while the chip is above onchip_low percent; DDR flows seen active in
+ * promote_k of the last promote_n bitmap sweeps move on chip (swapping out an
+ * idle flow when the chip is at onchip_high). A flow stays at least
+ * min_residency seconds in a tier; at most migrate_budget moves per poll.
+ * Moves are hitless: the new copy is written before the old one is cleared,
+ * and on-chip lookups win. A flow created with attribute priority 1 ("bulk")
+ * is placed in DDR and never promoted. Counters stay monotonic: on-chip
+ * counts are carried across a stay in DDR.
  */
 
 #ifndef NATGW_FLOW_H
@@ -49,7 +61,28 @@ struct natgw_flow_cfg {
 	bool     no_ddr;            /* never place flows in a DDR tier */
 	unsigned ddr_scan_words;    /* activity words read per poll (0: 4096) */
 	unsigned ddr_clear_polls;   /* status reads waiting for the DDR clear (0: 50M) */
+
+	/* tier policy (0 = default for every field) */
+	unsigned tier_policy;       /* NATGW_TIER_* */
+	unsigned onchip_high;       /* percent (85) */
+	unsigned onchip_low;        /* percent (70) */
+	unsigned demote_idle;       /* seconds (10) */
+	unsigned promote_k;         /* sweeps seen active (6) ... */
+	unsigned promote_n;         /* ... out of the last n, at most 8 (8) */
+	unsigned migrate_budget;    /* moves per poll (64) */
+	unsigned min_residency;     /* seconds (30) */
 };
+
+#define NATGW_TIER_DEFAULT  0   /* balanced */
+#define NATGW_TIER_FILL     1
+#define NATGW_TIER_BALANCED 2
+
+/* driver option keys handled by natgw_flow_cfg_set (NULL-terminated) */
+extern const char *const natgw_flow_cfg_keys[];
+
+/* set one option by name (from a PMD's devargs); 0 or -EINVAL */
+__rte_internal
+int natgw_flow_cfg_set(struct natgw_flow_cfg *cfg, const char *key, const char *val);
 
 /* create a context over a device's register window; resets the NAT block */
 __rte_internal

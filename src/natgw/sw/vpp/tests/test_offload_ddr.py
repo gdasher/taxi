@@ -11,11 +11,11 @@ from conftest import WAN1_ADDR, Gateway, vppenv, wait_for
 from test_offload import udp_args
 
 
-def _gateway(tag, vdev_args):
+def _gateway(tag, vdev_args, offload_extra=""):
     reason = vppenv.skip_reason()
     if reason:
         pytest.skip(reason)
-    return Gateway(tag, bucket_w=2, vdev_args=vdev_args)
+    return Gateway(tag, bucket_w=2, vdev_args=vdev_args, offload_extra=offload_extra)
 
 
 @pytest.fixture(scope="module")
@@ -94,3 +94,58 @@ def test_no_dimm_leaves_extra_sessions_in_software(no_dimm):
     assert 8 <= between.n <= 16, between.n
     assert gw.xstat("natgw_ddr_flows") == 0
     assert gw.xstat("natgw_ddr_lookups") == 0
+
+
+@pytest.fixture(scope="module")
+def bulk():
+    """a DDR tier, with UDP to port 5000 offloaded as bulk"""
+    g = _gateway("f", ",ddr_bucket_w=8", "bulk-udp-port 5000")
+    yield g
+    g.close()
+
+
+def test_bulk_udp_port_goes_to_ddr(bulk):
+    """the plugin's bulk hint (rte_flow priority 1) places sessions in DDR
+    even with the chip empty, and they are still fully offloaded"""
+    gw = bulk
+    gw.reset()
+    seen = {}
+
+    def between(phase):
+        wait_for(lambda: gw.offloaded() == 4, what="4 sessions offloaded")
+        seen["rx"] = gw.lan_rx()
+
+    r = gw.client_phased(udp_args(flows=4, count=4, phases=2), between)
+    assert r["received"] == r["sent"]
+    assert gw.offload()["sessions offloaded as bulk (DDR tier)"] == 4
+    assert gw.xstat("natgw_ddr_flows") == 8
+    assert gw.lan_rx() - seen["rx"] <= 2
+
+
+
+@pytest.fixture(scope="module")
+def policy():
+    """32 entries on chip (high-water mark 16 = 8 sessions), DDR, short timings"""
+    g = _gateway("g", ",ddr_bucket_w=8,onchip_high=50,onchip_low=25,demote_idle=2,promote_k=2,promote_n=3,"
+                      "min_residency=1")
+    yield g
+    g.close()
+
+
+def test_busy_session_promoted_over_idle_ones(policy):
+    """with the chip full of idle sessions a busy new one starts in DDR; the
+    idle ones are demoted and the busy one is promoted, without losing a
+    packet"""
+    gw = policy
+    gw.reset()
+    r = gw.client(*udp_args(flows=12, count=4, phases=1))
+    assert r["received"] == r["sent"]
+    wait_for(lambda: gw.offloaded() == 12, what="12 sessions offloaded")
+    assert gw.xstat("natgw_ddr_flows") == 8          # 8 sessions on chip, 4 in DDR
+    before = gw.xstat("natgw_promotions")
+    # one busy session, ~4 s of traffic
+    r = gw.client(*udp_args(flows=1, count=200, phases=1, gap=0.02))
+    assert r["received"] == r["sent"]
+    assert gw.xstat("natgw_promotions") - before >= 2, "busy session not promoted"
+    assert gw.xstat("natgw_demotions") >= 2
+    assert gw.xstat("natgw_migrate_failures") == 0

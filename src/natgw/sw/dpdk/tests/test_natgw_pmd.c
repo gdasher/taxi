@@ -9,6 +9,9 @@
  *   dev C: net_natgw_modelC, 2 lanes (ports 5-6), 32 entries on chip, DDR tier of 256
  *   dev D: net_natgw_modelD, 2 lanes (ports 7-8), DDR tier present, memory not calibrated
  *   dev E: net_natgw_modelE, 2 lanes (ports 9-10), DDR tier present, no_ddr=1
+ *   dev F: net_natgw_modelF, 2 lanes (ports 11-12), DDR tier, balanced policy with
+ *          short timings (on chip 50%/25%, demote after 2 s idle, promote 2 of 3)
+ *   dev G: net_natgw_modelG, 2 lanes (ports 13-14), DDR tier, tier_policy=fill
  * Each test prints PASS/FAIL; the exit status is the number of failed tests.
  */
 
@@ -52,6 +55,9 @@ struct punt_meta {
 #define PC1 6
 #define PD0 7
 #define PE0 9
+#define PF0 11
+#define PF1 12
+#define PG0 13
 #define IDX_DDR 0x80000000u
 
 static struct rte_mempool *mp;
@@ -165,9 +171,11 @@ struct nat {
 	int set_vid;         /* -1: keep */
 };
 
+static uint32_t create_priority;    /* 1: bulk (DDR) */
+
 static struct rte_flow *create(uint16_t port, const struct tuple *t, const struct nat *n, struct rte_flow_error *err)
 {
-	struct rte_flow_attr attr = { .ingress = 1 };
+	struct rte_flow_attr attr = { .ingress = 1, .priority = create_priority };
 	struct rte_flow_item_vlan vs = {0}, vm = {0};
 	struct rte_flow_item_ipv4 ips = {0}, ipm = {0};
 	struct rte_flow_item_tcp ts = {0}, tm = {0};
@@ -272,8 +280,8 @@ static void test_ports(void)
 	struct rte_eth_link link;
 	struct rte_eth_dev_info info;
 
-	CHECK(rte_eth_dev_count_avail() == 11, "ports: %u", rte_eth_dev_count_avail());
-	for (uint16_t p = 0; p < 11; p++) {
+	CHECK(rte_eth_dev_count_avail() == 15, "ports: %u", rte_eth_dev_count_avail());
+	for (uint16_t p = 0; p < 15; p++) {
 		CHECK(rte_eth_link_get_nowait(p, &link) == 0 && link.link_status == RTE_ETH_LINK_UP, "port %u down", p);
 		CHECK(rte_eth_dev_info_get(p, &info) == 0 && strcmp(info.driver_name, "net_natgw_model") == 0,
 		      "driver %s", info.driver_name);
@@ -835,6 +843,155 @@ static void test_ddr_disabled(void)
 	check_no_ddr_use(PE0);
 }
 
+/* ------------------------------------------------------------------ */
+/* tier policy (dev F: 32 on chip, high 16, low 8; dev G: fill) */
+
+static void step(uint16_t port, uint32_t ms)
+{
+	rte_pmd_natgw_model_advance(port, ms);
+	rte_pmd_natgw_model_poll(port);
+}
+
+/* one frame of flow i of ddr_tuple() through dev F; true when forwarded */
+static bool send_f(unsigned i)
+{
+	struct tuple t = ddr_tuple(i);
+	uint8_t frame[256], got[9600];
+	int fwd = 0;
+	uint16_t len = build(frame, &t, 0, 64);
+
+	inject(PF0, frame, len);
+	bool ok = wire_take(PF1, got, &fwd) == len && fwd;
+	drain();
+	return ok;
+}
+
+static struct rte_flow *create_f(unsigned i, struct rte_flow_error *err)
+{
+	struct tuple t = ddr_tuple(i);
+	struct nat n = snat_to(PF1, 0xc6336403, (uint16_t)(50000 + i));
+	return create(PF0, &t, &n, err);
+}
+
+static void test_policy_admission(void)
+{
+	struct rte_flow_error err;
+
+	for (unsigned i = 0; i < 24; i++)
+		CHECK(create_f(i, &err), "create %u: %s", i, err.message);
+	CHECK(xstat(PF0, "natgw_onchip_load_pct") == 50 && xstat(PF0, "natgw_ddr_flows") == 8,
+	      "on chip %" PRIu64 "%%, DDR %" PRIu64, xstat(PF0, "natgw_onchip_load_pct"), xstat(PF0, "natgw_ddr_flows"));
+	rte_flow_flush(PF0, &err);
+	/* bulk (priority 1) goes to DDR even with the chip empty */
+	create_priority = 1;
+	struct rte_flow *b = create_f(100, &err);
+	create_priority = 0;
+	CHECK(b && xstat(PF0, "natgw_ddr_flows") == 1, "bulk flow in DDR");
+	CHECK(send_f(100), "bulk flow forwards");
+	rte_flow_flush(PF0, &err);
+	drain();
+}
+
+static void test_policy_moves(void)
+{
+	struct rte_flow_action q[] = { { .type = RTE_FLOW_ACTION_TYPE_COUNT }, { .type = RTE_FLOW_ACTION_TYPE_END } };
+	struct rte_flow_query_count c;
+	struct rte_flow_error err;
+	struct rte_flow *hot[4];
+	uint8_t frame[256];
+	uint64_t fwd, punt, diff;
+	unsigned lost = 0;
+
+	/* 16 cold flows fill the chip to its high-water mark; 4 hot ones land in DDR */
+	for (unsigned i = 0; i < 16; i++)
+		CHECK(create_f(i, &err), "cold %u", i);
+	for (unsigned i = 0; i < 4; i++)
+		CHECK((hot[i] = create_f(16 + i, &err)) != NULL, "hot %u", i);
+	CHECK(xstat(PF0, "natgw_ddr_flows") == 4, "hot flows in DDR");
+	/* every table command from here on: hot flow 0 must forward, unchanged */
+	struct tuple tp = ddr_tuple(16);
+	rte_pmd_natgw_model_probe_set(PF0, frame, build(frame, &tp, 0, 64));
+
+	step(PF0, 1500);
+	for (int r = 0; r < 6; r++) {
+		for (unsigned i = 0; i < 4; i++)
+			lost += !send_f(16 + i);
+		step(PF0, 600);
+	}
+	CHECK(lost == 0, "%u hot frames not forwarded", lost);
+	CHECK(xstat(PF0, "natgw_promotions") == 4, "promotions %" PRIu64, xstat(PF0, "natgw_promotions"));
+	CHECK(xstat(PF0, "natgw_demotions") >= 8, "demotions %" PRIu64, xstat(PF0, "natgw_demotions"));
+	CHECK(xstat(PF0, "natgw_migrate_failures") == 0, "migrate failures");
+	for (unsigned i = 0; i < 4; i++) {
+		memset(&c, 0, sizeof(c));
+		CHECK(rte_flow_query(PF0, hot[i], q, &c, &err) == 0 && c.hits_set, "hot flow %u not on chip", i);
+	}
+	rte_pmd_natgw_model_probe_get(PF0, &fwd, &punt, &diff);
+	CHECK(fwd > 20 && punt == 0 && diff == 0, "probe: %" PRIu64 " forwarded, %" PRIu64 " punted, %" PRIu64
+	      " rewritten differently", fwd, punt, diff);
+	rte_pmd_natgw_model_probe_set(PF0, NULL, 0);
+
+	/* settled: the hot flows stay on chip, no ping-pong */
+	uint64_t prom = xstat(PF0, "natgw_promotions");
+	for (int r = 0; r < 6; r++) {
+		for (unsigned i = 0; i < 4; i++)
+			lost += !send_f(16 + i);
+		step(PF0, 600);
+	}
+	CHECK(lost == 0 && xstat(PF0, "natgw_promotions") == prom, "promotions %" PRIu64 " -> %" PRIu64,
+	      prom, xstat(PF0, "natgw_promotions"));
+	rte_flow_flush(PF0, &err);
+	drain();
+}
+
+static void test_policy_counters(void)
+{
+	struct rte_flow_action q[] = { { .type = RTE_FLOW_ACTION_TYPE_COUNT }, { .type = RTE_FLOW_ACTION_TYPE_END } };
+	struct rte_flow_query_count c;
+	struct rte_flow_error err;
+	struct rte_flow *x;
+
+	/* 8 busy fillers (the low-water mark) and flow x, which goes idle */
+	for (unsigned i = 0; i < 8; i++)
+		CHECK(create_f(i, &err), "filler %u", i);
+	x = create_f(40, &err);
+	CHECK(x, "create x");
+	for (int k = 0; k < 5; k++)
+		CHECK(send_f(40), "x forwards");
+	memset(&c, 0, sizeof(c));
+	CHECK(rte_flow_query(PF0, x, q, &c, &err) == 0 && c.hits_set && c.hits == 5, "x count %" PRIu64, c.hits);
+	for (int r = 0; r < 6; r++) {
+		for (unsigned i = 0; i < 8; i++)
+			send_f(i);
+		step(PF0, 500);
+	}
+	memset(&c, 0, sizeof(c));
+	CHECK(rte_flow_query(PF0, x, q, &c, &err) == 0 && !c.hits_set, "x was not demoted");
+	/* busy again: promoted, and its count carries on from 5 */
+	for (int r = 0; r < 4; r++) {
+		CHECK(send_f(40), "x forwards in DDR / after promotion");
+		step(PF0, 600);
+	}
+	memset(&c, 0, sizeof(c));
+	CHECK(rte_flow_query(PF0, x, q, &c, &err) == 0 && c.hits_set && c.hits >= 5,
+	      "x after promotion: set %u hits %" PRIu64, c.hits_set, c.hits);
+	rte_flow_flush(PF0, &err);
+	drain();
+}
+
+static void test_policy_fill(void)
+{
+	struct tuple t[64];
+	struct rte_flow_error err;
+	unsigned created = fill(PG0, PG0 + 1, t, RTE_DIM(t));
+
+	/* fill ignores the 50% mark: the chip fills first */
+	CHECK(created > 32 && xstat(PG0, "natgw_onchip_load_pct") >= 80, "created %u, on chip %" PRIu64 "%%",
+	      created, xstat(PG0, "natgw_onchip_load_pct"));
+	rte_flow_flush(PG0, &err);
+	drain();
+}
+
 /* a worker polls the datapath while the main core creates and destroys flows */
 static volatile int stop_worker;
 static volatile uint64_t worker_frames;
@@ -938,6 +1095,10 @@ int main(int argc, char **argv)
 	run("ddr_age", test_ddr_age);
 	run("ddr_no_dimm", test_ddr_no_dimm);
 	run("ddr_disabled", test_ddr_disabled);
+	run("policy_admission", test_policy_admission);
+	run("policy_moves", test_policy_moves);
+	run("policy_counters", test_policy_counters);
+	run("policy_fill", test_policy_fill);
 
 	uint16_t pid;
 	RTE_ETH_FOREACH_DEV(pid) {

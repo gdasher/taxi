@@ -74,6 +74,15 @@ struct model_dev {
 	uint64_t cycles_per_tick;
 	unsigned started;
 	uint8_t scratch[MAX_FRAME + NATGW_PUNT_HDR_LEN];
+
+	/* test probe: a frame run through the model after every table command */
+	uint16_t probe_len;
+	uint8_t probe_lane;
+	uint8_t probe[256];
+	uint8_t probe_out[256 + NATGW_PUNT_HDR_LEN];
+	uint8_t probe_ref[256];
+	uint16_t probe_ref_len;
+	uint64_t probe_fwd, probe_punt, probe_diff;
 };
 
 struct port_priv {
@@ -101,12 +110,33 @@ static uint32_t io_rd(void *ctx, uint32_t off)
 	return v;
 }
 
+static void probe_run(struct model_dev *md)
+{
+	struct natgw_model_out o = { .data = md->probe_out };
+
+	if (natgw_model_rx(md->model, md->probe_lane, md->probe, md->probe_len, &o) != 0)
+		return;
+	if (o.kind != NATGW_OUT_FWD) {
+		md->probe_punt++;
+		return;
+	}
+	md->probe_fwd++;
+	if (!md->probe_ref_len) {
+		md->probe_ref_len = (uint16_t)o.len;
+		memcpy(md->probe_ref, o.data, o.len);
+	} else if (o.len != md->probe_ref_len || memcmp(o.data, md->probe_ref, o.len) != 0) {
+		md->probe_diff++;
+	}
+}
+
 static void io_wr(void *ctx, uint32_t off, uint32_t val)
 {
 	struct model_dev *md = ctx;
 
 	rte_spinlock_lock(&md->mlock);
 	natgw_model_wr(md->model, off, val);
+	if (md->probe_len && off == NATGW_REG_CMD)
+		probe_run(md);
 	rte_spinlock_unlock(&md->mlock);
 }
 
@@ -551,6 +581,7 @@ struct model_args {
 	unsigned ddr_bucket_w;     /* 0: no DDR tier in the "bitstream" */
 	bool ddr_calib;            /* false: tier present, no working DIMM */
 	bool no_ddr;               /* flow layer told not to use the tier */
+	struct natgw_flow_cfg tier; /* tier policy options (natgw_flow_cfg_keys) */
 };
 
 static int arg_uint(const char *key __rte_unused, const char *val, void *out)
@@ -600,8 +631,16 @@ static int arg_clock(const char *key __rte_unused, const char *val, void *out)
 	return 0;
 }
 
+static int arg_tier(const char *key, const char *val, void *out)
+{
+	return natgw_flow_cfg_set(out, key, val);
+}
+
 static const char *const valid_args[] = {"lanes", "bucket_w", "wire", "tap_prefix", "punt_hdr", "clock",
-					 "ddr_bucket_w", "ddr_calib", "no_ddr", NULL};
+					 "ddr_bucket_w", "ddr_calib", "no_ddr",
+					 /* natgw_flow_cfg_keys */
+					 "tier_policy", "onchip_high", "onchip_low", "demote_idle", "promote_k",
+					 "promote_n", "migrate_budget", "min_residency", NULL};
 
 static int parse_args(const char *params, struct model_args *a)
 {
@@ -617,6 +656,7 @@ static int parse_args(const char *params, struct model_args *a)
 	a->ddr_bucket_w = 0;
 	a->ddr_calib = true;
 	a->no_ddr = false;
+	memset(&a->tier, 0, sizeof(a->tier));
 	if (!params || !*params)
 		return 0;
 	kv = rte_kvargs_parse(params, valid_args);
@@ -632,6 +672,10 @@ static int parse_args(const char *params, struct model_args *a)
 	    rte_kvargs_process(kv, "ddr_calib", arg_bool, &a->ddr_calib) < 0 ||
 	    rte_kvargs_process(kv, "no_ddr", arg_bool, &a->no_ddr) < 0)
 		ret = -EINVAL;
+	for (unsigned i = 0; !ret && natgw_flow_cfg_keys[i]; i++) {
+		if (rte_kvargs_process(kv, natgw_flow_cfg_keys[i], arg_tier, &a->tier) < 0)
+			ret = -EINVAL;
+	}
 	rte_kvargs_free(kv);
 	if (!ret && (a->lanes < 1 || a->lanes > NATGW_LANES || a->bucket_w < 2 || a->bucket_w > 18 ||
 		     (a->ddr_bucket_w && (a->ddr_bucket_w < 5 || a->ddr_bucket_w > 20))))
@@ -694,6 +738,14 @@ static int model_probe(struct rte_vdev_device *vdev)
 	fc.max_depth = 6;
 	fc.punt_hdr = a.punt_hdr;
 	fc.no_ddr = a.no_ddr;
+	fc.tier_policy = a.tier.tier_policy;
+	fc.onchip_high = a.tier.onchip_high;
+	fc.onchip_low = a.tier.onchip_low;
+	fc.demote_idle = a.tier.demote_idle;
+	fc.promote_k = a.tier.promote_k;
+	fc.promote_n = a.tier.promote_n;
+	fc.migrate_budget = a.tier.migrate_budget;
+	fc.min_residency = a.tier.min_residency;
 	md->flow = natgw_flow_ctx_create(&io, &fc, rte_socket_id());
 	if (!md->flow) {
 		ret = -EIO;
@@ -807,7 +859,8 @@ static struct rte_vdev_driver natgw_model_drv = {
 RTE_PMD_REGISTER_VDEV(net_natgw_model, natgw_model_drv);
 RTE_PMD_REGISTER_PARAM_STRING(net_natgw_model,
 	"lanes=<1-8> bucket_w=<2-18> wire=queue|tap tap_prefix=<name> punt_hdr=0|1 clock=wall|manual "
-	"ddr_bucket_w=<5-20> ddr_calib=0|1 no_ddr=0|1");
+	"ddr_bucket_w=<5-20> ddr_calib=0|1 no_ddr=0|1 tier_policy=fill|balanced onchip_high=<%> "
+	"onchip_low=<%> demote_idle=<s> promote_k=<n> promote_n=<n> migrate_budget=<n> min_residency=<s>");
 
 /* ------------------------------------------------------------------ */
 /* test API */
@@ -902,5 +955,40 @@ int rte_pmd_natgw_model_poll(uint16_t port_id)
 	if (!l)
 		return -EINVAL;
 	natgw_flow_poll(l->md->flow);
+	return 0;
+}
+
+RTE_EXPORT_SYMBOL(rte_pmd_natgw_model_probe_set)
+int rte_pmd_natgw_model_probe_set(uint16_t port_id, const void *frame, uint16_t len)
+{
+	struct lane *l = port_lane(port_id);
+	struct model_dev *md;
+
+	if (!l || len > sizeof(l->md->probe))
+		return -EINVAL;
+	md = l->md;
+	rte_spinlock_lock(&md->mlock);
+	md->probe_len = len;
+	md->probe_lane = (uint8_t)l->idx;
+	if (len)
+		memcpy(md->probe, frame, len);
+	md->probe_ref_len = 0;
+	md->probe_fwd = md->probe_punt = md->probe_diff = 0;
+	rte_spinlock_unlock(&md->mlock);
+	return 0;
+}
+
+RTE_EXPORT_SYMBOL(rte_pmd_natgw_model_probe_get)
+int rte_pmd_natgw_model_probe_get(uint16_t port_id, uint64_t *fwd, uint64_t *punt, uint64_t *diff)
+{
+	struct lane *l = port_lane(port_id);
+
+	if (!l)
+		return -EINVAL;
+	rte_spinlock_lock(&l->md->mlock);
+	*fwd = l->md->probe_fwd;
+	*punt = l->md->probe_punt;
+	*diff = l->md->probe_diff;
+	rte_spinlock_unlock(&l->md->mlock);
 	return 0;
 }

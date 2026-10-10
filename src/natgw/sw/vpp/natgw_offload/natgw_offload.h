@@ -39,7 +39,8 @@ struct rte_flow;
   _ (SYNCED, "flows synced")                                                  \
   _ (EXPIRED, "sessions expired after sync")                                  \
   _ (AGED_EVENTS, "hardware age events")                                      \
-  _ (STALE, "sync skipped: session gone")
+  _ (STALE, "sync skipped: session gone")                                     \
+  _ (BULK, "sessions offloaded as bulk (DDR tier)")
 
 typedef enum
 {
@@ -100,6 +101,7 @@ typedef struct
   u32 max_queue;      /* install events queued per thread */
   u8 max_retries;
   u8 dec_ttl;
+  u16 *bulk_udp_ports; /* UDP server ports offloaded as bulk (rte_flow priority 1) */
 
   /* sessions: offloaded and pending (waiting for a neighbour or space) */
   ngo_session_t *sessions;

@@ -19,30 +19,42 @@
 #define NATGW_TICK_DIV    250000     /* 250 MHz core clock / 1000 */
 
 /* devarg natgw_ddr=0: never place flows in the DDR tier (default: use it
- * when the bitstream has one and its memory calibrated) */
+ * when the bitstream has one and its memory calibrated); the flow layer's
+ * tier policy options (natgw_flow_cfg_keys) pass through by name */
 static int natgw_arg_bool(const char *key __rte_unused, const char *val, void *out)
 {
 	*(bool *)out = !strcmp(val, "1") || !strcmp(val, "true");
 	return 0;
 }
 
-static bool natgw_ddr_allowed(struct cndm_dev *cdev)
+static int natgw_arg_tier(const char *key, const char *val, void *out)
 {
-	static const char *const keys[] = {"natgw_ddr", NULL};
+	return natgw_flow_cfg_set(out, key, val);
+}
+
+static void natgw_devargs(struct cndm_dev *cdev, struct natgw_flow_cfg *cfg)
+{
+	static const char *const keys[] = {"natgw_ddr", "tier_policy", "onchip_high", "onchip_low",
+					   "demote_idle", "promote_k", "promote_n", "migrate_budget",
+					   "min_residency", NULL};
 	struct rte_devargs *da = cdev->pdev->device.devargs;
 	struct rte_kvargs *kv;
 	bool allowed = true;
 
 	if (!da || !da->args || !*da->args)
-		return true;
+		return;
 	kv = rte_kvargs_parse(da->args, keys);
 	if (!kv) {
-		DRV_LOG(ERR, "invalid devargs '%s' (known: natgw_ddr=0|1)", da->args);
-		return true;
+		DRV_LOG(ERR, "invalid devargs '%s'", da->args);
+		return;
 	}
 	rte_kvargs_process(kv, "natgw_ddr", natgw_arg_bool, &allowed);
+	cfg->no_ddr = !allowed;
+	for (unsigned i = 0; natgw_flow_cfg_keys[i]; i++) {
+		if (rte_kvargs_process(kv, natgw_flow_cfg_keys[i], natgw_arg_tier, cfg) < 0)
+			DRV_LOG(ERR, "invalid value for devarg %s", natgw_flow_cfg_keys[i]);
+	}
 	rte_kvargs_free(kv);
-	return allowed;
 }
 
 static uint32_t natgw_io_rd(void *ctx, uint32_t off)
@@ -94,7 +106,7 @@ int cndm_natgw_init(struct cndm_dev *cdev)
 	cfg.seed1 = 0xffffffff;
 	cfg.max_depth = 6;
 	cfg.punt_hdr = cdev->natgw_punt_hdr;
-	cfg.no_ddr = !natgw_ddr_allowed(cdev);
+	natgw_devargs(cdev, &cfg);
 	cdev->natgw = natgw_flow_ctx_create(&io, &cfg, cdev->pdev->device.numa_node);
 	if (!cdev->natgw) {
 		DRV_LOG(ERR, "NAT block present but could not be initialised");

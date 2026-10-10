@@ -343,5 +343,6 @@ static struct rte_pci_driver rte_cndm_pmd = {
 RTE_PMD_REGISTER_PCI(net_cndm, rte_cndm_pmd);
 RTE_PMD_REGISTER_PCI_TABLE(net_cndm, pci_id_cndm_map);
 RTE_PMD_REGISTER_KMOD_DEP(net_cndm, "* vfio-pci");
-RTE_PMD_REGISTER_PARAM_STRING(net_cndm, "natgw_ddr=0|1");
+RTE_PMD_REGISTER_PARAM_STRING(net_cndm, "natgw_ddr=0|1 tier_policy=fill|balanced onchip_high=<%> "
+	"onchip_low=<%> demote_idle=<s> promote_k=<n> promote_n=<n> migrate_budget=<n> min_residency=<s>");
 RTE_LOG_REGISTER_DEFAULT(cndm_logtype_driver, NOTICE);

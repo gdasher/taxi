@@ -253,13 +253,29 @@ ngo_nh_equal (const ngo_nh_t *a, const ngo_nh_t *b)
 /* ------------------------------------------------------------------ */
 /* rte_flow */
 
+/* a session the hardware may keep in its slower, larger tier: UDP to one of
+ * the configured server ports (e.g. DNS) */
+static int
+ngo_is_bulk (const ngo_event_t *e)
+{
+  ngo_main_t *ngm = &ngo_main;
+  u16 *p, port = clib_net_to_host_u16 (e->i2o.match.dport);
+
+  if (e->proto != IP_PROTOCOL_UDP)
+    return 0;
+  vec_foreach (p, ngm->bulk_udp_ports)
+    if (*p == port)
+      return 1;
+  return 0;
+}
+
 static struct rte_flow *
 ngo_flow_create (u16 in_port, i16 in_vid, const nat_6t_flow_t *f, u8 proto,
 		 int dnat, const ngo_nh_t *nh, u32 age, void *age_ctx,
-		 struct rte_flow_error *err)
+		 int bulk, struct rte_flow_error *err)
 {
   ngo_main_t *ngm = &ngo_main;
-  struct rte_flow_attr attr = { .ingress = 1 };
+  struct rte_flow_attr attr = { .ingress = 1, .priority = bulk ? 1 : 0 };
   struct rte_flow_item_vlan vs = {}, vm = {};
   struct rte_flow_item_ipv4 ips = {}, ipm = {};
   struct rte_flow_item_tcp ts = {}, tm = {};
@@ -428,13 +444,14 @@ ngo_install (ngo_session_t *ngs, u32 pool_index)
   /* each direction enters where the other leaves */
   ngs->in_port[0] = ngs->nh[1].port_id;
   ngs->in_port[1] = ngs->nh[0].port_id;
+  int bulk = ngo_is_bulk (e);
   ngs->flow[0] = ngo_flow_create (ngs->in_port[0], ngs->nh[1].vid, &e->i2o,
 				  e->proto, 0, &ngs->nh[0], e->timeout, ctx,
-				  &err);
+				  bulk, &err);
   if (ngs->flow[0])
     ngs->flow[1] = ngo_flow_create (ngs->in_port[1], ngs->nh[0].vid,
 				    &e->o2i, e->proto, 1, &ngs->nh[1],
-				    e->timeout, ctx, &err);
+				    e->timeout, ctx, bulk, &err);
   if (!ngs->flow[0] || !ngs->flow[1])
     {
       int code = rte_errno;
@@ -447,6 +464,8 @@ ngo_install (ngo_session_t *ngs, u32 pool_index)
     }
   ngs->installed = vlib_time_now (ngm->vm);
   ngs->pkts = ngs->bytes = 0;
+  if (bulk)
+    NGO_COUNT (BULK);
   return NGO_OK;
 }
 
@@ -961,6 +980,8 @@ ngo_config (vlib_main_t *vm, unformat_input_t *input)
 	ngm->max_retries = v;
       else if (unformat (input, "no-dec-ttl"))
 	ngm->dec_ttl = 0;
+      else if (unformat (input, "bulk-udp-port %u", &v) && v && v < 65536)
+	vec_add1 (ngm->bulk_udp_ports, (u16) v);
       else
 	return clib_error_return (0, "unknown input '%U'",
 				  format_unformat_error, input);

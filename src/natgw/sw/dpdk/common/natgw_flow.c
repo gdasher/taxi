@@ -26,6 +26,9 @@ RTE_LOG_REGISTER_DEFAULT(natgw_logtype, NOTICE);
 #define NO_THRESH 0xffffffffu
 #define DDR_SCAN_WORDS 4096
 #define DDR_CLEAR_POLLS 50000000u
+#define MOVE_BATCH 8               /* moves per lock hold */
+
+enum { CAND_NONE, CAND_PROMOTE, CAND_DEMOTE };
 
 struct hkey {
 	uint32_t sip, dip;
@@ -48,6 +51,15 @@ struct rte_flow {
 	uint32_t pending_ts;
 	uint32_t ddr_seen;         /* DDR tier: tick of the last sweep that saw activity */
 	uint64_t cnt_base_pkts, cnt_base_bytes;
+
+	/* tier policy */
+	bool     bulk;             /* priority 1: DDR, never promoted */
+	bool     seen_sweep;       /* DDR: activity seen in the current sweep */
+	uint8_t  act_hist;         /* DDR: seen in each of the last 8 sweeps (bit 0 newest) */
+	uint8_t  cand;             /* CAND_*: on the matching candidate list */
+	uint32_t tier_since;       /* tick of the last placement or move */
+	uint64_t acc_pkts, acc_bytes;   /* on-chip counts carried across moves */
+	TAILQ_ENTRY(rte_flow) cnext;
 };
 
 TAILQ_HEAD(natgw_flow_list, rte_flow);
@@ -76,6 +88,16 @@ struct natgw_flow_ctx {
 	uint8_t *ddr_word_cnt;     /* flows per activity word: empty words are not read */
 	unsigned nflows_ddr;
 	uint32_t ddr_words, scan_pos, scan_start;
+
+	/* tier policy (resolved from cfg) */
+	bool balanced;
+	unsigned hi_cnt, lo_cnt;   /* on-chip flow counts for onchip_high / onchip_low */
+	uint32_t demote_ticks, resid_ticks;
+	unsigned promote_k, promote_n, budget;
+	struct natgw_flow_list promote_q, demote_q;
+	uint64_t promotions, demotions, migrate_fail;
+	uint32_t last_skips, last_skip_delta;
+	bool skips_rising;
 };
 
 static struct {
@@ -103,9 +125,107 @@ static struct hkey mk_hkey(const struct natgw_key *k)
 	return h;
 }
 
+/* hardware idle thresholds: the shortest AGE timeout, or the demotion idle
+ * time when that is shorter (idle events also find demotion candidates) */
 static void write_thresholds(struct natgw_flow_ctx *ctx)
 {
-	natgw_dev_set_thresholds(&ctx->dev, ctx->thresh[1], ctx->thresh[0]);
+	uint32_t t[2] = { ctx->thresh[0], ctx->thresh[1] };
+
+	if (ctx->balanced) {
+		for (unsigned i = 0; i < 2; i++)
+			t[i] = RTE_MIN(t[i], ctx->demote_ticks);
+	}
+	natgw_dev_set_thresholds(&ctx->dev, t[1], t[0]);
+}
+
+static unsigned onchip_count(const struct natgw_flow_ctx *ctx)
+{
+	return ctx->nflows - ctx->nflows_ddr;
+}
+
+static void cand_set(struct natgw_flow_ctx *ctx, struct rte_flow *f, uint8_t kind)
+{
+	if (f->cand != CAND_NONE)
+		return;
+	f->cand = kind;
+	TAILQ_INSERT_TAIL(kind == CAND_PROMOTE ? &ctx->promote_q : &ctx->demote_q, f, cnext);
+}
+
+static void cand_clear(struct natgw_flow_ctx *ctx, struct rte_flow *f)
+{
+	if (f->cand == CAND_NONE)
+		return;
+	TAILQ_REMOVE(f->cand == CAND_PROMOTE ? &ctx->promote_q : &ctx->demote_q, f, cnext);
+	f->cand = CAND_NONE;
+}
+
+/* ------------------------------------------------------------------ */
+/* configuration */
+
+const char *const natgw_flow_cfg_keys[] = {
+	"tier_policy", "onchip_high", "onchip_low", "demote_idle", "promote_k", "promote_n",
+	"migrate_budget", "min_residency", NULL
+};
+
+int natgw_flow_cfg_set(struct natgw_flow_cfg *cfg, const char *key, const char *val)
+{
+	char *end;
+	unsigned long v;
+
+	if (!strcmp(key, "tier_policy")) {
+		if (!strcmp(val, "fill"))
+			cfg->tier_policy = NATGW_TIER_FILL;
+		else if (!strcmp(val, "balanced"))
+			cfg->tier_policy = NATGW_TIER_BALANCED;
+		else
+			return -EINVAL;
+		return 0;
+	}
+	v = strtoul(val, &end, 0);
+	if (!*val || *end || v == 0 || v > 1000000)
+		return -EINVAL;
+	if (!strcmp(key, "onchip_high") && v <= 100)
+		cfg->onchip_high = (unsigned)v;
+	else if (!strcmp(key, "onchip_low") && v <= 100)
+		cfg->onchip_low = (unsigned)v;
+	else if (!strcmp(key, "demote_idle"))
+		cfg->demote_idle = (unsigned)v;
+	else if (!strcmp(key, "promote_k") && v <= 8)
+		cfg->promote_k = (unsigned)v;
+	else if (!strcmp(key, "promote_n") && v <= 8)
+		cfg->promote_n = (unsigned)v;
+	else if (!strcmp(key, "migrate_budget"))
+		cfg->migrate_budget = (unsigned)v;
+	else if (!strcmp(key, "min_residency"))
+		cfg->min_residency = (unsigned)v;
+	else
+		return -EINVAL;
+	return 0;
+}
+
+/* resolve the policy once the tiers are known */
+static int policy_setup(struct natgw_flow_ctx *ctx)
+{
+	const struct natgw_flow_cfg *c = &ctx->cfg;
+	unsigned size = natgw_table_size(ctx->t);
+	unsigned hi = c->onchip_high ? c->onchip_high : 85;
+	unsigned lo = c->onchip_low ? c->onchip_low : RTE_MIN(70u, hi);   /* never above high */
+	uint64_t demote = (uint64_t)(c->demote_idle ? c->demote_idle : 10) * c->ticks_per_sec;
+	uint64_t resid = (uint64_t)(c->min_residency ? c->min_residency : 30) * c->ticks_per_sec;
+
+	ctx->promote_k = c->promote_k ? c->promote_k : 6;
+	ctx->promote_n = c->promote_n ? c->promote_n : 8;
+	if (lo > hi || ctx->promote_k > ctx->promote_n)
+		return -EINVAL;
+	TAILQ_INIT(&ctx->promote_q);
+	TAILQ_INIT(&ctx->demote_q);
+	ctx->balanced = ctx->td && c->tier_policy != NATGW_TIER_FILL;
+	ctx->hi_cnt = (unsigned)((uint64_t)size * hi / 100);
+	ctx->lo_cnt = (unsigned)((uint64_t)size * lo / 100);
+	ctx->demote_ticks = (uint32_t)RTE_MIN(demote, (uint64_t)NO_THRESH - 1);
+	ctx->resid_ticks = (uint32_t)RTE_MIN(resid, (uint64_t)NO_THRESH - 1);
+	ctx->budget = c->migrate_budget ? c->migrate_budget : 64;
+	return 0;
 }
 
 /*
@@ -194,8 +314,9 @@ struct natgw_flow_ctx *natgw_flow_ctx_create(const struct natgw_io *io, const st
 	natgw_nh_table_init(ctx->nht);
 	ctx->by_idx = rte_zmalloc_socket("natgw_by_idx", natgw_table_size(ctx->t) * sizeof(*ctx->by_idx), 0,
 					 socket_id);
-	if (ddr_setup(ctx, socket_id) != 0)
+	if (ddr_setup(ctx, socket_id) != 0 || policy_setup(ctx) != 0)
 		goto fail;
+	write_thresholds(ctx);
 	snprintf(name, sizeof(name), "natgw_flows_%d", __atomic_fetch_add(&ctx_seq, 1, __ATOMIC_RELAXED));
 	hp.name = name;
 	/* headroom: a nearly full rte_hash relocates keys (a deep, stack-hungry
@@ -289,6 +410,7 @@ unsigned natgw_flow_ddr_capacity(struct natgw_flow_ctx *ctx)
 /* flow parsing */
 
 struct parsed_flow {
+	bool bulk;
 	struct natgw_entry e;
 	struct natgw_nh nh;
 	bool has_age;
@@ -544,9 +666,10 @@ static int parse_flow(struct rte_eth_dev *dev, const struct rte_flow_attr *attr,
 		return FAIL(err, EINVAL, UNSPECIFIED, NULL, "missing attr, pattern or actions");
 	if (!attr->ingress || attr->egress || attr->transfer)
 		return FAIL(err, ENOTSUP, ATTR, attr, "only ingress flows are supported");
-	if (attr->group || attr->priority)
-		return FAIL(err, ENOTSUP, ATTR, attr, "group and priority must be 0");
+	if (attr->group || attr->priority > 1)
+		return FAIL(err, ENOTSUP, ATTR, attr, "group must be 0, priority 0 or 1 (bulk)");
 	memset(pf, 0, sizeof(*pf));
+	pf->bulk = attr->priority == 1;
 	pf->e.key.lane = (uint8_t)port_map[pid].lane;
 	ret = parse_pattern(pattern, pf, &vlan, err);
 	if (ret)
@@ -571,8 +694,10 @@ static void ddr_read_word(struct natgw_flow_ctx *ctx, uint32_t w, uint32_t now)
 		unsigned b = (unsigned)__builtin_ctzll(bits);
 		struct rte_flow *f = ctx->by_idx_ddr[w * 64 + b];
 		bits &= bits - 1;
-		if (f)
+		if (f) {
 			f->ddr_seen = now;
+			f->seen_sweep = true;
+		}
 	}
 }
 
@@ -684,6 +809,8 @@ static struct rte_flow *natgw_flow_create(struct rte_eth_dev *dev, const struct 
 	f->has_age = pf.has_age;
 	f->age_timeout = pf.age_timeout;
 	f->age_ctx = pf.age_ctx ? pf.age_ctx : f;
+	f->bulk = pf.bulk;
+	f->tier_since = natgw_dev_tick(&ctx->dev);
 
 	if (rte_hash_add_key_data(ctx->by_key, &hk, f) < 0) {
 		natgw_nh_put(ctx->nht, (uint16_t)nh_idx);
@@ -692,11 +819,21 @@ static struct rte_flow *natgw_flow_create(struct rte_eth_dev *dev, const struct 
 		FAIL(err, ENOSPC, UNSPECIFIED, NULL, "flow table full");
 		return NULL;
 	}
-	n = natgw_table_insert(ctx->t, &f->e, ctx->ops, ctx->max_ops, &idx);
-	if (n == -ENOSPC && ctx->td) {
-		/* on-chip table full: the DDR tier */
+	if (ctx->td && (f->bulk || (ctx->balanced && onchip_count(ctx) >= ctx->hi_cnt))) {
+		/* bulk, or the chip is at its high-water mark: DDR, else on chip */
 		n = natgw_table_insert(ctx->td, &f->e, ctx->ops, ctx->max_ops, &idx);
 		f->ddr = true;
+		if (n == -ENOSPC) {
+			n = natgw_table_insert(ctx->t, &f->e, ctx->ops, ctx->max_ops, &idx);
+			f->ddr = false;
+		}
+	} else {
+		n = natgw_table_insert(ctx->t, &f->e, ctx->ops, ctx->max_ops, &idx);
+		if (n == -ENOSPC && ctx->td) {
+			/* on-chip table full: the DDR tier */
+			n = natgw_table_insert(ctx->td, &f->e, ctx->ops, ctx->max_ops, &idx);
+			f->ddr = true;
+		}
 	}
 	if (n < 0) {
 		rte_hash_del_key(ctx->by_key, &hk);
@@ -724,6 +861,7 @@ static void flow_remove_locked(struct natgw_flow_ctx *ctx, struct rte_flow *f)
 	struct hkey hk = mk_hkey(&f->e.key);
 	int n = natgw_table_delete(f->ddr ? ctx->td : ctx->t, &f->e.key, ctx->ops, ctx->max_ops);
 
+	cand_clear(ctx, f);
 	if (n > 0)
 		apply_ops(ctx, (unsigned)n, f->ddr);
 	rte_hash_del_key(ctx->by_key, &hk);
@@ -818,13 +956,14 @@ static int natgw_flow_query(struct rte_eth_dev *dev, struct rte_flow *f, const s
 				q->bytes = 0;
 				break;
 			}
+			/* totals include counts carried from before a stay in DDR */
 			q->hits_set = 1;
 			q->bytes_set = 1;
-			q->hits = s.pkts - f->cnt_base_pkts;
-			q->bytes = s.bytes - f->cnt_base_bytes;
+			q->hits = f->acc_pkts + s.pkts - f->cnt_base_pkts;
+			q->bytes = f->acc_bytes + s.bytes - f->cnt_base_bytes;
 			if (q->reset) {
-				f->cnt_base_pkts = s.pkts;
-				f->cnt_base_bytes = s.bytes;
+				f->cnt_base_pkts = f->acc_pkts + s.pkts;
+				f->cnt_base_bytes = f->acc_bytes + s.bytes;
 			}
 			break;
 		}
@@ -934,13 +1073,162 @@ static void ddr_sweep_locked(struct natgw_flow_ctx *ctx, uint32_t now, bool *not
 	}
 	if (!wrapped)
 		return;
+	if (ctx->balanced) {
+		/* request-cap pressure: promote more readily while DDR skips rise */
+		uint32_t lk, ht, sk, delta;
+		natgw_dev_ddr_stats(&ctx->dev, &lk, &ht, &sk);
+		delta = sk - ctx->last_skips;
+		ctx->skips_rising = delta > 0 && delta > ctx->last_skip_delta;
+		ctx->last_skips = sk;
+		ctx->last_skip_delta = delta;
+	}
+	unsigned k = ctx->promote_k;
+	if (ctx->skips_rising)
+		k = k > 2 ? k - 2 : 1;
+	uint8_t nmask = (uint8_t)((1u << ctx->promote_n) - 1);
 	TAILQ_FOREACH(f, &ctx->flows, next) {
-		if (f->ddr && f->has_age && !f->aged &&
+		if (!f->ddr)
+			continue;
+		f->act_hist = (uint8_t)((f->act_hist << 1) | f->seen_sweep);
+		f->seen_sweep = false;
+		if (f->has_age && !f->aged &&
 		    (uint64_t)(uint32_t)(now - f->ddr_seen) >= (uint64_t)f->age_timeout * ctx->cfg.ticks_per_sec) {
 			f->aged = true;
 			notify[f->e.key.lane] = true;
 		}
+		if (ctx->balanced && !f->bulk && f->cand == CAND_NONE &&
+		    (unsigned)__builtin_popcount(f->act_hist & nmask) >= k &&
+		    (uint32_t)(now - f->tier_since) >= ctx->resid_ticks)
+			cand_set(ctx, f, CAND_PROMOTE);
 	}
+}
+
+/* ------------------------------------------------------------------ */
+/* tier moves: write the new copy, then clear the old one (on-chip lookups
+ * win, so the flow hits throughout) */
+
+static int promote_locked(struct natgw_flow_ctx *ctx, struct rte_flow *f, uint32_t now)
+{
+	uint32_t idx;
+	int n = natgw_table_insert(ctx->t, &f->e, ctx->ops, ctx->max_ops, &idx);
+
+	if (n < 0)
+		return n;
+	apply_ops(ctx, (unsigned)n, false);
+	/* the on-chip copy now wins; the DDR copy can go */
+	n = natgw_table_delete(ctx->td, &f->e.key, ctx->ops, ctx->max_ops);
+	if (n > 0)
+		apply_ops(ctx, (unsigned)n, true);
+	f->ddr = false;
+	ctx->nflows_ddr--;
+	f->tier_since = now;
+	f->act_hist = 0;
+	f->seen_sweep = false;
+	f->idle_pending = false;
+	ctx->promotions++;
+	return 0;
+}
+
+static int demote_locked(struct natgw_flow_ctx *ctx, struct rte_flow *f, uint32_t now)
+{
+	struct natgw_ddr_status st;
+	struct natgw_state s;
+	uint32_t idx;
+	int n;
+
+	if (natgw_table_find(ctx->t, &f->e.key, &idx) != 0)
+		return -ENOENT;
+	natgw_dev_read_state(&ctx->dev, idx, &s);
+	n = natgw_table_insert(ctx->td, &f->e, ctx->ops, ctx->max_ops, &idx);
+	if (n < 0)
+		return n;
+	apply_ops(ctx, (unsigned)n, true);
+	/* both copies exist and the on-chip one still wins; clear it only while
+	 * the DDR tier is still looked up, or the flow would miss */
+	natgw_dev_ddr_status(&ctx->dev, &st);
+	if (!st.active) {
+		n = natgw_table_delete(ctx->td, &f->e.key, ctx->ops, ctx->max_ops);
+		if (n > 0)
+			apply_ops(ctx, (unsigned)n, true);
+		return -EIO;
+	}
+	n = natgw_table_delete(ctx->t, &f->e.key, ctx->ops, ctx->max_ops);
+	if (n > 0)
+		apply_ops(ctx, (unsigned)n, false);
+	/* carry the on-chip counts; aging continues from its last on-chip hit */
+	f->acc_pkts += s.pkts;
+	f->acc_bytes += s.bytes;
+	f->ddr = true;
+	ctx->nflows_ddr++;
+	f->ddr_seen = s.ts;
+	f->tier_since = now;
+	f->act_hist = 0;
+	f->seen_sweep = false;
+	f->idle_pending = false;
+	ctx->demotions++;
+	return 0;
+}
+
+/* a demotion candidate still worth moving: on chip, settled, still idle */
+static bool demote_ok(struct natgw_flow_ctx *ctx, struct rte_flow *f, uint32_t now)
+{
+	struct natgw_state s;
+
+	if (f->ddr || (uint32_t)(now - f->tier_since) < ctx->resid_ticks || read_flow_state(ctx, f, &s) != 0)
+		return false;
+	return (uint32_t)(now - s.ts) >= ctx->demote_ticks;
+}
+
+/*
+ * Up to MOVE_BATCH moves under the lock: demote idle flows while the chip is
+ * above its low-water mark, then promote active DDR flows (into free room
+ * below the high-water mark, or in place of an idle flow). Returns the number
+ * of candidates handled (0: nothing left to do).
+ */
+static unsigned moves_locked(struct natgw_flow_ctx *ctx, unsigned *budget)
+{
+	uint32_t now = natgw_dev_tick(&ctx->dev);
+	unsigned handled = 0;
+	struct rte_flow *f;
+
+	while (*budget && handled < MOVE_BATCH && onchip_count(ctx) > ctx->lo_cnt &&
+	       (f = TAILQ_FIRST(&ctx->demote_q)) != NULL) {
+		handled++;
+		cand_clear(ctx, f);
+		if (!demote_ok(ctx, f, now))
+			continue;
+		(*budget)--;
+		if (demote_locked(ctx, f, now) != 0)
+			ctx->migrate_fail++;
+	}
+	while (*budget && handled < MOVE_BATCH && (f = TAILQ_FIRST(&ctx->promote_q)) != NULL) {
+		handled++;
+		cand_clear(ctx, f);
+		if (!f->ddr || f->bulk || (uint32_t)(now - f->tier_since) < ctx->resid_ticks)
+			continue;
+		if (onchip_count(ctx) >= ctx->hi_cnt) {
+			/* full: swap with an idle on-chip flow, if there is one */
+			struct rte_flow *v = NULL;
+			while ((v = TAILQ_FIRST(&ctx->demote_q)) != NULL) {
+				cand_clear(ctx, v);
+				if (demote_ok(ctx, v, now))
+					break;
+			}
+			if (!v)
+				break;
+			(*budget)--;
+			if (demote_locked(ctx, v, now) != 0) {
+				ctx->migrate_fail++;
+				continue;
+			}
+		}
+		if (!*budget)
+			break;
+		(*budget)--;
+		if (promote_locked(ctx, f, now) != 0)
+			ctx->migrate_fail++;
+	}
+	return handled;
 }
 
 void natgw_flow_poll(struct natgw_flow_ctx *ctx)
@@ -955,7 +1243,9 @@ void natgw_flow_poll(struct natgw_flow_ctx *ctx)
 	while (natgw_dev_pop_event(&ctx->dev, &ev)) {
 		switch (ev.type) {
 		case NATGW_EVT_IDLE:
-			if (ev.idx < natgw_table_size(ctx->t) && (f = ctx->by_idx[ev.idx]) != NULL && f->has_age) {
+			if (ev.idx >= natgw_table_size(ctx->t) || (f = ctx->by_idx[ev.idx]) == NULL)
+				break;
+			if (f->has_age) {
 				struct natgw_state s;
 				if (check_age_locked(ctx, f, now)) {
 					notify[f->e.key.lane] = true;
@@ -964,6 +1254,9 @@ void natgw_flow_poll(struct natgw_flow_ctx *ctx)
 					f->pending_ts = s.ts;
 				}
 			}
+			/* idle on chip: a demotion candidate (checked again before it moves) */
+			if (ctx->balanced && !f->aged)
+				cand_set(ctx, f, CAND_DEMOTE);
 			break;
 		case NATGW_EVT_FIN:
 			ctx->ev_fin++;
@@ -987,6 +1280,17 @@ void natgw_flow_poll(struct natgw_flow_ctx *ctx)
 	ddr_sweep_locked(ctx, now, notify);
 	rte_spinlock_unlock(&ctx->lock);
 
+	/* tier moves, a few at a time so flow creates are not held up */
+	if (ctx->balanced) {
+		unsigned budget = ctx->budget;
+		unsigned handled;
+		do {
+			rte_spinlock_lock(&ctx->lock);
+			handled = moves_locked(ctx, &budget);
+			rte_spinlock_unlock(&ctx->lock);
+		} while (handled && budget);
+	}
+
 	for (unsigned l = 0; l < ctx->cfg.lanes; l++) {
 		if (notify[l] && ctx->lane_bound[l])
 			rte_eth_dev_callback_process(&rte_eth_devices[ctx->lane_port[l]], RTE_ETH_EVENT_FLOW_AGED, NULL);
@@ -1004,7 +1308,7 @@ static const char *const reason_names[NATGW_STAT_COUNT] = {
 
 unsigned natgw_flow_xstats_count(void)
 {
-	return NATGW_STAT_COUNT + 8;
+	return NATGW_STAT_COUNT + 13;
 }
 
 int natgw_flow_xstats_get_names(struct natgw_flow_ctx *ctx, struct rte_eth_xstat_name *names, unsigned size)
@@ -1025,6 +1329,11 @@ int natgw_flow_xstats_get_names(struct natgw_flow_ctx *ctx, struct rte_eth_xstat
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_lookups");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_hits");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_skips");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_promotions");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_demotions");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_migrate_failures");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_onchip_load_pct");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_skips_last_sweep");
 	return (int)n;
 }
 
@@ -1053,6 +1362,11 @@ int natgw_flow_xstats_get(struct natgw_flow_ctx *ctx, unsigned lane, struct rte_
 		xstats[i].id = i; xstats[i++].value = ht;
 		xstats[i].id = i; xstats[i++].value = sk;
 	}
+	xstats[i].id = i; xstats[i++].value = ctx->promotions;
+	xstats[i].id = i; xstats[i++].value = ctx->demotions;
+	xstats[i].id = i; xstats[i++].value = ctx->migrate_fail;
+	xstats[i].id = i; xstats[i++].value = (uint64_t)onchip_count(ctx) * 100 / natgw_table_size(ctx->t);
+	xstats[i].id = i; xstats[i++].value = ctx->last_skip_delta;
 	rte_spinlock_unlock(&ctx->lock);
 	return (int)n;
 }

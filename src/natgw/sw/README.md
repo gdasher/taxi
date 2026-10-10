@@ -53,7 +53,7 @@ The second option matters for shared builds. A shared DPDK autoloads every mempo
 | Suite | Command | Covers |
 | --- | --- | --- |
 | libnatgw and C model | `make test` (`tests/test_{layout,table,model,dev,ddr}.py`) | <ul><li>Layouts and hashes are bit-exact with the Python model.</li><li>Cuckoo placement matches the Python model write for write, and stays relocation-safe after every write, for both the on-chip and the DDR table geometry.</li><li>The C model matches the Python ShimModel byte for byte, also with flows split between the two tiers.</li><li>Registers, events, aging and overflow; DDR status when absent, present without a DIMM and working; DDR entry access, clear and the activity bitmap.</li></ul> |
-| DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li><li>DDR tier: spill to DDR once on-chip is full, DDR punts carry the DDR index flag, no counters for DDR flows, DDR aging from the activity bitmap; with no DIMM or `no_ddr=1`, ENOSPC at on-chip capacity and no DDR lookups.</li></ul> |
+| DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li><li>DDR tier: spill to DDR once on-chip is full, DDR punts carry the DDR index flag, no counters for DDR flows, DDR aging from the activity bitmap; with no DIMM or `no_ddr=1`, ENOSPC at on-chip capacity and no DDR lookups.</li><li>Tier policy: admission at the high-water mark and bulk flows to DDR; idle flows demoted and busy DDR flows promoted, with a probe frame run through the model after every single table command forwarding unchanged throughout; no ping-pong once settled; counters monotonic across demote and promote; `fill` ignores the watermark.</li></ul> |
 | VPP integration | `pytest vpp/tests` (VPP and passwordless sudo; skipped otherwise) | Kernel TCP/UDP from namespaces on the model's TAP lanes, through VPP and the model. See below. |
 | WAN manager | `pytest wanmgr/tests` | <ul><li>Unit tests against a fake VPP that models routing and NAT for probes: thresholds, flapping, target fallback, steering, flushing, lease changes, restarts, alert rate limiting and SMTP.</li><li>Integration tests with real VPP, the offload plugin, dnsmasq "modems" and an SMTP sink: startup, an ISP outage, all WANs down, and a VPP restart.</li></ul> |
 
@@ -67,13 +67,13 @@ The tests cover:
 - **Next hops:** a next-hop MAC change reinstalls the flows.
 - **ECMP:** across two WANs the hardware picks the same WAN as VPP, which the replies prove.
 - **Table full:** sessions that don't fit stay in software and keep working.
-- **DDR tier** (`test_offload_ddr.py`): with a working DDR tier every session is offloaded beyond the on-chip capacity; hardware-only traffic on DDR flows (which have no counters) keeps their sessions alive, and idle ones expire; with the tier present but no DIMM, extra sessions stay in software.
+- **DDR tier** (`test_offload_ddr.py`): with a working DDR tier every session is offloaded beyond the on-chip capacity; hardware-only traffic on DDR flows (which have no counters) keeps their sessions alive, and idle ones expire; with the tier present but no DIMM, extra sessions stay in software; `bulk-udp-port` sessions go to DDR; a busy session arriving while the chip is full of idle ones is promoted without losing a packet.
 - **Observability:** the CLI and the stats segment gauge.
 
 Fault-injection checks confirm the suites detect real bugs:
 
 - libnatgw: mutations of the table code.
-- DPDK: TTL decrement ignored, per-flow age ignored, MACs swapped.
+- DPDK: TTL decrement ignored, per-flow age ignored, MACs swapped, a promotion that clears the DDR copy before writing the on-chip one.
 - VPP plugin: ECMP hash ignored, counter refresh skipped, CLOSING ignored, revalidation skipped, DDR activity refresh skipped.
 - WAN manager: probes not pinned, no flush, steering before a verdict, DOWN after one bad round, and removing a down WAN's pool address.
 
@@ -107,10 +107,32 @@ Fault-injection checks confirm the suites detect real bugs:
 On bitstreams with the DDR tier (`DDR_STATUS` present) the rte_flow backend
 uses it automatically when the memory calibrated:
 
-- **Placement.** Flows go on chip first; when the on-chip table refuses one,
-  it goes to the DDR table. Without a usable tier (not built in, no DIMM,
-  failed clear, or disabled), a full on-chip table gives ENOSPC as before and
-  VPP keeps the session in software.
+- **Placement (tier policy).** With `tier_policy=balanced`, the default when
+  a DDR tier is in use:
+  - **Admission.** New flows go on chip while it is below `onchip_high`
+    (85%) full, else to DDR.
+  - **Demotion.** Idle on-chip flows (no hit for `demote_idle`, 10 s) move
+    to DDR while the chip is above `onchip_low` (70%). The hardware idle
+    scanner finds them, so the host never scans on-chip state.
+  - **Promotion.** DDR flows seen active in `promote_k` of the last
+    `promote_n` bitmap sweeps (6 of 8; 4 of 8 while DDR skips are rising) move
+    on chip, into free room or in place of an idle flow.
+  - **Limits.** At most `migrate_budget` (64) moves per poll, in batches of 8
+    so flow creates aren't held up; a flow stays `min_residency` (30 s) in a
+    tier before moving again.
+  - **Hitless moves.** The new copy is written before the old one is
+    cleared; on-chip lookups win, so the flow hits throughout. A demotion is
+    abandoned if the DDR tier stops being looked up.
+  - **Counters.** On-chip counts are carried across a stay in DDR, so COUNT
+    totals never go backwards.
+  - **Bulk hint.** rte_flow priority 1 places a flow in DDR and never
+    promotes it. The VPP plugin sets it for UDP to the server ports listed
+    with `bulk-udp-port <port>` (repeatable; none by default).
+
+  `tier_policy=fill` keeps first-come placement: on chip until the table
+  refuses a flow, then DDR, with no moves. Without a usable tier (not built
+  in, no DIMM, failed clear, or disabled), a full on-chip table gives ENOSPC
+  as before and VPP keeps the session in software.
 - **Start-up.** The context clears the DDR table and bitmap and then enables
   DDR lookups; a tier that is present but not calibrated is left disabled
   and logged.
@@ -121,9 +143,14 @@ uses it automatically when the memory calibrated:
   one sweep. The VPP plugin refreshes a session's last-heard time from AGE
   for flows without counters.
 - **Controls.** cndm PMD devarg `natgw_ddr=0` disables the tier; the model
-  PMD takes `ddr_bucket_w=<5-20>`, `ddr_calib=0|1` and `no_ddr=0|1`.
+  PMD takes `ddr_bucket_w=<5-20>`, `ddr_calib=0|1` and `no_ddr=0|1`. Both
+  take the policy options `tier_policy`, `onchip_high`, `onchip_low`,
+  `demote_idle`, `promote_k`, `promote_n`, `migrate_budget` and
+  `min_residency`.
 - **xstats.** `natgw_ddr_flows`, `natgw_ddr_lookups`, `natgw_ddr_hits`,
-  `natgw_ddr_skips` (the last three device-wide, wrapping at 32 bits).
+  `natgw_ddr_skips` (these three device-wide, wrapping at 32 bits),
+  `natgw_promotions`, `natgw_demotions`, `natgw_migrate_failures`,
+  `natgw_onchip_load_pct`, `natgw_ddr_skips_last_sweep`.
 
 ### VPP NAT configuration for multiple WANs
 
