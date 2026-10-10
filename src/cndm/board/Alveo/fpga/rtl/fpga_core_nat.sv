@@ -64,7 +64,12 @@ module fpga_core_nat #
     // NAT shim configuration
     parameter NAT_BUCKET_W = 16,
     parameter NAT_RAM_PIPE = 3,
-    parameter NAT_TICK_DIV = 250000
+    parameter NAT_TICK_DIV = 250000,
+    // DDR tier (0: none; the DDR ports are then unused)
+    parameter NAT_DDR = 0,
+    parameter NAT_DDR_BUCKET_W = 20,
+    parameter NAT_DDR_AXI_ADDR_W = 34,
+    parameter NAT_DDR_AXI_ID_W = 4
 )
 (
     /*
@@ -181,7 +186,42 @@ module fpga_core_nat #
     input  wire logic [3:0]               qspi_dq_i,
     output wire logic [3:0]               qspi_dq_o,
     output wire logic [3:0]               qspi_dq_oe,
-    output wire logic                     qspi_cs
+    output wire logic                     qspi_cs,
+
+    /*
+     * NAT DDR tier: AXI4 master in the pcie_clk domain, and the memory
+     * controller's calibration status (synchronised to pcie_clk)
+     */
+    output wire logic [NAT_DDR_AXI_ID_W-1:0]   m_axi_ddr_awid,
+    output wire logic [NAT_DDR_AXI_ADDR_W-1:0] m_axi_ddr_awaddr,
+    output wire logic [7:0]                    m_axi_ddr_awlen,
+    output wire logic [2:0]                    m_axi_ddr_awsize,
+    output wire logic [1:0]                    m_axi_ddr_awburst,
+    output wire logic                          m_axi_ddr_awvalid,
+    input  wire logic                          m_axi_ddr_awready,
+    output wire logic [511:0]                  m_axi_ddr_wdata,
+    output wire logic [63:0]                   m_axi_ddr_wstrb,
+    output wire logic                          m_axi_ddr_wlast,
+    output wire logic                          m_axi_ddr_wvalid,
+    input  wire logic                          m_axi_ddr_wready,
+    input  wire logic [NAT_DDR_AXI_ID_W-1:0]   m_axi_ddr_bid,
+    input  wire logic [1:0]                    m_axi_ddr_bresp,
+    input  wire logic                          m_axi_ddr_bvalid,
+    output wire logic                          m_axi_ddr_bready,
+    output wire logic [NAT_DDR_AXI_ID_W-1:0]   m_axi_ddr_arid,
+    output wire logic [NAT_DDR_AXI_ADDR_W-1:0] m_axi_ddr_araddr,
+    output wire logic [7:0]                    m_axi_ddr_arlen,
+    output wire logic [2:0]                    m_axi_ddr_arsize,
+    output wire logic [1:0]                    m_axi_ddr_arburst,
+    output wire logic                          m_axi_ddr_arvalid,
+    input  wire logic                          m_axi_ddr_arready,
+    input  wire logic [NAT_DDR_AXI_ID_W-1:0]   m_axi_ddr_rid,
+    input  wire logic [511:0]                  m_axi_ddr_rdata,
+    input  wire logic [1:0]                    m_axi_ddr_rresp,
+    input  wire logic                          m_axi_ddr_rlast,
+    input  wire logic                          m_axi_ddr_rvalid,
+    output wire logic                          m_axi_ddr_rready,
+    input  wire logic                          ddr_calib
 );
 
 localparam logic PTP_TS_FMT_TOD = 1'b0;
@@ -1024,7 +1064,11 @@ end
 natgw_shim #(
     .BUCKET_W(NAT_BUCKET_W),
     .RAM_PIPE(NAT_RAM_PIPE),
-    .TICK_DIV_RST(NAT_TICK_DIV)
+    .TICK_DIV_RST(NAT_TICK_DIV),
+    .DDR_ENABLE(NAT_DDR),
+    .DDR_BUCKET_W(NAT_DDR_BUCKET_W),
+    .DDR_AXI_ADDR_W(NAT_DDR_AXI_ADDR_W),
+    .DDR_AXI_ID_W(NAT_DDR_AXI_ID_W)
 )
 natgw_inst (
     .clk(pcie_clk),
@@ -1054,6 +1098,40 @@ natgw_inst (
     .s_axis_core_tx(core_axis_tx),
     .m_axis_core_tx_cpl(core_axis_tx_cpl),
     .m_axis_core_rx(core_axis_rx),
+
+    /*
+     * DDR tier
+     */
+    .m_axi_ddr_awid(m_axi_ddr_awid),
+    .m_axi_ddr_awaddr(m_axi_ddr_awaddr),
+    .m_axi_ddr_awlen(m_axi_ddr_awlen),
+    .m_axi_ddr_awsize(m_axi_ddr_awsize),
+    .m_axi_ddr_awburst(m_axi_ddr_awburst),
+    .m_axi_ddr_awvalid(m_axi_ddr_awvalid),
+    .m_axi_ddr_awready(m_axi_ddr_awready),
+    .m_axi_ddr_wdata(m_axi_ddr_wdata),
+    .m_axi_ddr_wstrb(m_axi_ddr_wstrb),
+    .m_axi_ddr_wlast(m_axi_ddr_wlast),
+    .m_axi_ddr_wvalid(m_axi_ddr_wvalid),
+    .m_axi_ddr_wready(m_axi_ddr_wready),
+    .m_axi_ddr_bid(m_axi_ddr_bid),
+    .m_axi_ddr_bresp(m_axi_ddr_bresp),
+    .m_axi_ddr_bvalid(m_axi_ddr_bvalid),
+    .m_axi_ddr_bready(m_axi_ddr_bready),
+    .m_axi_ddr_arid(m_axi_ddr_arid),
+    .m_axi_ddr_araddr(m_axi_ddr_araddr),
+    .m_axi_ddr_arlen(m_axi_ddr_arlen),
+    .m_axi_ddr_arsize(m_axi_ddr_arsize),
+    .m_axi_ddr_arburst(m_axi_ddr_arburst),
+    .m_axi_ddr_arvalid(m_axi_ddr_arvalid),
+    .m_axi_ddr_arready(m_axi_ddr_arready),
+    .m_axi_ddr_rid(m_axi_ddr_rid),
+    .m_axi_ddr_rdata(m_axi_ddr_rdata),
+    .m_axi_ddr_rresp(m_axi_ddr_rresp),
+    .m_axi_ddr_rlast(m_axi_ddr_rlast),
+    .m_axi_ddr_rvalid(m_axi_ddr_rvalid),
+    .m_axi_ddr_rready(m_axi_ddr_rready),
+    .ddr_calib(ddr_calib),
 
     /*
      * Status

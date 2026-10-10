@@ -343,4 +343,5 @@ static struct rte_pci_driver rte_cndm_pmd = {
 RTE_PMD_REGISTER_PCI(net_cndm, rte_cndm_pmd);
 RTE_PMD_REGISTER_PCI_TABLE(net_cndm, pci_id_cndm_map);
 RTE_PMD_REGISTER_KMOD_DEP(net_cndm, "* vfio-pci");
+RTE_PMD_REGISTER_PARAM_STRING(net_cndm, "natgw_ddr=0|1");
 RTE_LOG_REGISTER_DEFAULT(cndm_logtype_driver, NOTICE);

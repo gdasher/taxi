@@ -357,7 +357,39 @@ uut (
     .qspi_dq_i(qspi_dq_i),
     .qspi_dq_o(qspi_dq_o),
     .qspi_dq_oe(qspi_dq_oe),
-    .qspi_cs(qspi_cs)
+    .qspi_cs(qspi_cs),
+
+    // no DDR tier in this testbench
+    .m_axi_ddr_awid(),
+    .m_axi_ddr_awaddr(),
+    .m_axi_ddr_awlen(),
+    .m_axi_ddr_awsize(),
+    .m_axi_ddr_awburst(),
+    .m_axi_ddr_awvalid(),
+    .m_axi_ddr_awready('0),
+    .m_axi_ddr_wdata(),
+    .m_axi_ddr_wstrb(),
+    .m_axi_ddr_wlast(),
+    .m_axi_ddr_wvalid(),
+    .m_axi_ddr_wready('0),
+    .m_axi_ddr_bid('0),
+    .m_axi_ddr_bresp('0),
+    .m_axi_ddr_bvalid('0),
+    .m_axi_ddr_bready(),
+    .m_axi_ddr_arid(),
+    .m_axi_ddr_araddr(),
+    .m_axi_ddr_arlen(),
+    .m_axi_ddr_arsize(),
+    .m_axi_ddr_arburst(),
+    .m_axi_ddr_arvalid(),
+    .m_axi_ddr_arready('0),
+    .m_axi_ddr_rid('0),
+    .m_axi_ddr_rdata('0),
+    .m_axi_ddr_rresp('0),
+    .m_axi_ddr_rlast('0),
+    .m_axi_ddr_rvalid('0),
+    .m_axi_ddr_rready(),
+    .ddr_calib(1'b0)
 );
 
 endmodule

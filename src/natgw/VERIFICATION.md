@@ -70,6 +70,8 @@ the property's main check can first fire, from the matching cover trace).
 | `ram` | 1 bank, PIPE 2 | P9.1–P9.2 | Bounded pass | 13 | – | repeated write/read sequences (a read of a written address completes from cycle 1 + 1 + PIPE) |
 | `ram` | 8 banks, PIPE 3/4/5 | P9.1–P9.2 | Bounded pass | 12 / 13 / 14 | – | across one mux level, with and without bank and output registers |
 | `ram` | 32 banks, PIPE 4/5/6 | P9.1–P9.2 | Bounded pass | 11 / 12 / 13 | – | across two mux levels |
+| `actmap` | `p2_bmc`, `p3_bmc` (RAM_PIPE 2, 3) | P10.1–P10.3 | Bounded pass | 21 | read-back of a word with bits 0 and 63 set by hits | hits on every cycle the producer may send, host read-and-clear and bulk clear interleaved, both ends of the forwarding window (DDR branch) |
+| `ddr` | `bmc` | P11.1–P11.5 | Bounded pass | 15 | a request-cap skip at 5; a DDR hit at 9 | two lanes of lookups against a free AXI memory (arbitrary stalls and data, in order per ID), calibration and enable toggling; covers several complete lookups per lane, the cap and a DDR hit (DDR branch) |
 | all | `cover` | – | Pass | – | – | every harness reaches its checked scenarios |
 
 Note on the rewrite: the forwarded-frame properties (P3.3–P3.5: unchanged
@@ -170,6 +172,31 @@ bank output register and with an extra output stage:
 - P9.1 every port-A read of a written address returns the reference value after PIPE cycles;
 - P9.2 the same for port-B reads, with port B also taking the writes.
 
+**P10 Activity bitmap** (`formal/actmap`, DDR branch). Hits (set requests)
+arrive whenever the producer's almost-full input allows, the host reads and
+clears arbitrary words one at a time, and bulk clears start at any time; one
+word W is tracked against a shadow:
+
+- P10.1 a host read of W returns exactly the bits set in W since the last read or clear of W (read-modify-write forwarding exact for back-to-back updates of one word);
+- P10.2 host reads return in order, RAM_PIPE+1 cycles after issue;
+- P10.3 the set FIFO never overflows, so no hit is lost while the producer honours almost-full.
+
+**P11 DDR lookup** (`formal/ddr`, DDR branch, `MAX_OUT` 2, `QUEUE_DEPTH` 4).
+On-chip results arrive on two lanes, each a DDR candidate or not; the AXI
+memory answers only outstanding reads, in order per ID, with arbitrary data
+and stalls; calibration and the enable toggle freely. Lane T's results are
+tracked through a shadow queue:
+
+- P11.1 results leave in order per lane;
+- P11.2 a result that was not a DDR candidate (not looked up, or an on-chip hit) leaves unchanged; a candidate leaves unchanged (a miss) or as a hit carrying the DDR index flag, with its hash unchanged;
+- P11.3 never more than 2 x MAX_OUT reads outstanding per lane;
+- P11.4 no DDR lookup is issued while the tier is inactive, and every lane read belongs to an issued lookup (two reads each);
+- P11.5 the per-lane queues never overflow.
+
+Both harnesses were checked against mutants: removing the bitmap's
+forwarding from the most recent write fails P10.1 at once, and ignoring the
+request cap fails P11.3 within three cycles.
+
 ### Defects found by formal verification
 
 | Block | Defect | Fix |
@@ -227,6 +254,32 @@ reference model unless stated otherwise.
 | `run_test_bad_frames` | Bad-FCS frames dropped at ingress and counted |
 | `run_test_events` | FIN/RST events on hits; idle events from the scanner with one live flow kept active |
 
+### DDR tier tests (DDR branch)
+
+Block test `natgw_ddr` (DDR_BUCKET_W 6, MAX_OUT 4, activity-bitmap pipeline 2 and 3), against cocotbext-axi's `AxiRam` with random stalls on every channel:
+
+| Test | What it covers |
+| --- | --- |
+| `run_test_host_access` | DDR entry write, clear and read through the host port; clearing one slot (a half-line write) leaves the other slot of its line intact; the bulk clear zeroes the whole table |
+| `run_test_lookup_exact` | Low-rate lookups (no skips allowed): every DDR candidate hits or misses exactly as the Python `DdrTable` says, with the DDR index flag and next hop |
+| `run_test_lookup`, `run_test_lookup_stalls` | All lanes at full rate with memory stalls: results in order per lane, every result either exact or a counted skip |
+| `run_test_request_cap` | Slow memory: the per-lane cap holds and misses beyond it are skipped and counted |
+| `run_test_activity` | After 1500 lookups at full rate, the bitmap holds exactly the DDR entries that hit; a read clears its word |
+| `run_test_inactive` | Not calibrated, or disabled: no lane reads reach the memory |
+
+Fault injection caught by these tests: wrong table-1 index, request cap
+ignored, no bitmap forwarding.
+
+Shim test `natgw_shim` with `DDR_ENABLE=1` (in addition to all tests above):
+`run_test_ddr_random` (sessions split between the tiers, mixed traffic, activity
+bitmap checked against the model), `run_test_ddr_fin_and_entries` (FIN on DDR
+flows, entry read-back, statistics), `run_test_ddr_no_dimm` (calibration low:
+DDR entries never hit, no memory traffic).
+
+Host side: see `sw/README.md` (libnatgw and C model against the Python model
+with both tiers, the DPDK rte_flow tiering tests, and VPP integration with and
+without a DIMM).
+
 ### System test (V3): `fpga_core_nat`, PCIe, cndm driver and BASE-R SerDes models
 
 | Test | What it covers |
@@ -238,6 +291,11 @@ reference model unless stated otherwise.
 ## Not covered
 
 - Hardware: link bring-up, PCIe enumeration on a real host, real line rate.
+- DDR tier on hardware: memory calibration with the real RDIMM, DDR latency
+  and the resulting lookup rate (the simulations use a behavioural memory),
+  and timing closure of the `fpga_AU200_nat_ddr` build. The DDR top level is
+  checked by Vivado RTL elaboration of both variants; the system testbench
+  runs without the tier.
 - Timing closure of the 512k-entry build. Build results:
   - 128k entries (`NAT_BUCKET_W=14`, commit `1933cd5`): meets timing on
     every clock (WNS +0.015 ns, WHS +0.010 ns).

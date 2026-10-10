@@ -6,8 +6,8 @@ p2_cover
 [options]
 p2_bmc: mode bmc
 p3_bmc: mode bmc
-p2_bmc: depth 24
-p3_bmc: depth 24
+p2_bmc: depth 22
+p3_bmc: depth 22
 p2_cover: mode cover
 p2_cover: depth 30
 

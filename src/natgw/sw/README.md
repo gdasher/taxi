@@ -52,8 +52,8 @@ The second option matters for shared builds. A shared DPDK autoloads every mempo
 
 | Suite | Command | Covers |
 | --- | --- | --- |
-| libnatgw and C model | `make test` (`tests/test_{layout,table,model,dev}.py`) | <ul><li>Layouts and hashes are bit-exact with the Python model.</li><li>Cuckoo placement matches the Python model write for write, and stays relocation-safe after every write.</li><li>The C model matches the Python ShimModel byte for byte.</li><li>Registers, events, aging and overflow.</li></ul> |
-| DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li></ul> |
+| libnatgw and C model | `make test` (`tests/test_{layout,table,model,dev,ddr}.py`) | <ul><li>Layouts and hashes are bit-exact with the Python model.</li><li>Cuckoo placement matches the Python model write for write, and stays relocation-safe after every write, for both the on-chip and the DDR table geometry.</li><li>The C model matches the Python ShimModel byte for byte, also with flows split between the two tiers.</li><li>Registers, events, aging and overflow; DDR status when absent, present without a DIMM and working; DDR entry access, clear and the activity bitmap.</li></ul> |
+| DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li><li>DDR tier: spill to DDR once on-chip is full, DDR punts carry the DDR index flag, no counters for DDR flows, DDR aging from the activity bitmap; with no DIMM or `no_ddr=1`, ENOSPC at on-chip capacity and no DDR lookups.</li></ul> |
 | VPP integration | `pytest vpp/tests` (VPP and passwordless sudo; skipped otherwise) | Kernel TCP/UDP from namespaces on the model's TAP lanes, through VPP and the model. See below. |
 | WAN manager | `pytest wanmgr/tests` | <ul><li>Unit tests against a fake VPP that models routing and NAT for probes: thresholds, flapping, target fallback, steering, flushing, lease changes, restarts, alert rate limiting and SMTP.</li><li>Integration tests with real VPP, the offload plugin, dnsmasq "modems" and an SMTP sink: startup, an ISP outage, all WANs down, and a VPP restart.</li></ul> |
 
@@ -67,13 +67,14 @@ The tests cover:
 - **Next hops:** a next-hop MAC change reinstalls the flows.
 - **ECMP:** across two WANs the hardware picks the same WAN as VPP, which the replies prove.
 - **Table full:** sessions that don't fit stay in software and keep working.
+- **DDR tier** (`test_offload_ddr.py`): with a working DDR tier every session is offloaded beyond the on-chip capacity; hardware-only traffic on DDR flows (which have no counters) keeps their sessions alive, and idle ones expire; with the tier present but no DIMM, extra sessions stay in software.
 - **Observability:** the CLI and the stats segment gauge.
 
 Fault-injection checks confirm the suites detect real bugs:
 
 - libnatgw: mutations of the table code.
 - DPDK: TTL decrement ignored, per-flow age ignored, MACs swapped.
-- VPP plugin: ECMP hash ignored, counter refresh skipped, CLOSING ignored, revalidation skipped.
+- VPP plugin: ECMP hash ignored, counter refresh skipped, CLOSING ignored, revalidation skipped, DDR activity refresh skipped.
 - WAN manager: probes not pinned, no flush, steering before a verdict, DOWN after one bad round, and removing a down WAN's pool address.
 
 ## natgw_offload in brief
@@ -100,6 +101,29 @@ Fault-injection checks confirm the suites detect real bugs:
   - In `startup.conf`: `natgw-offload { enable active-packets 4 sync-interval 1 }`.
   - CLI: `natgw offload [enable|disable] ...`, `show natgw offload [sessions]`, `natgw offload sync`, `clear natgw offload counters`.
   - Stats segment: `/natgw/offloaded`.
+
+### DDR tier
+
+On bitstreams with the DDR tier (`DDR_STATUS` present) the rte_flow backend
+uses it automatically when the memory calibrated:
+
+- **Placement.** Flows go on chip first; when the on-chip table refuses one,
+  it goes to the DDR table. Without a usable tier (not built in, no DIMM,
+  failed clear, or disabled), a full on-chip table gives ENOSPC as before and
+  VPP keeps the session in software.
+- **Start-up.** The context clears the DDR table and bitmap and then enables
+  DDR lookups; a tier that is present but not calibrated is left disabled
+  and logged.
+- **Counters and aging.** DDR flows have no hardware counters: a COUNT query
+  succeeds with `hits_set = bytes_set = 0`. AGE uses the activity bitmap:
+  each poll reads up to 4096 occupied words, a set bit marks its flow seen,
+  and flows are aged when a sweep completes, so idle times are accurate to
+  one sweep. The VPP plugin refreshes a session's last-heard time from AGE
+  for flows without counters.
+- **Controls.** cndm PMD devarg `natgw_ddr=0` disables the tier; the model
+  PMD takes `ddr_bucket_w=<5-20>`, `ddr_calib=0|1` and `no_ddr=0|1`.
+- **xstats.** `natgw_ddr_flows`, `natgw_ddr_lookups`, `natgw_ddr_hits`,
+  `natgw_ddr_skips` (the last three device-wide, wrapping at 32 bits).
 
 ### VPP NAT configuration for multiple WANs
 

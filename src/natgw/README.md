@@ -134,3 +134,40 @@ the reason is not BYPASS). The header beat carries the frame's first-beat tuser.
   and counts them (statistic 16); bad-FCS frames are counted as statistic 17.
 - Forwarded frames to one egress lane wait behind each other in the lane
   switch; a congested egress lane back-pressures the ingress lanes feeding it.
+
+## DDR tier (optional, branch `natgw-ddr4`)
+
+A second, larger flow table in DDR4, looked up only after an on-chip miss.
+It is built in with `natgw_shim #(.DDR_ENABLE(1))` and an AXI4 master to a
+memory controller; without it (`DDR_ENABLE=0`, the default) the shim is
+unchanged and every DDR register reads zero.
+
+- **Layout.** Two tables of 2^`DDR_BUCKET_W` 64-byte lines, two 32-byte
+  entries per line. Buckets come from the *top* `DDR_BUCKET_W` bits of the
+  same two hashes (the on-chip tier uses the low bits). Index =
+  {table, bucket, slot}; line address = `DDR_BASE` + 64 x {table, bucket}.
+- **Lookup** (`natgw_ddr`). A miss that was looked up issues one 64-byte read
+  per table (ARID = lane, so results stay in order per lane) and the two
+  slots of each line are compared. A hit is reported with index
+  `0x80000000 | ddr_idx` (punt header and statistics) and uses the same
+  next-hop table. At most `DDR_MAX_OUT` lookups per lane are in flight; a
+  miss beyond that is punted unlooked-up and counted as a skip.
+- **No per-entry state.** DDR hits do not update packet/byte counters or
+  timestamps and raise no events: the packet path never writes DDR. Instead
+  each hit sets a bit in an on-chip **activity bitmap** (`natgw_actmap`, one
+  bit per DDR entry, URAM), which the host reads and clears 64 bits at a time.
+- **Host access.** Entry write/clear/read through the existing ENT_DATA and
+  INDEX registers with commands 6/7/8; activity words with command 9
+  (ACT_LO/HI). A hardware bulk clear (`DDR_CTRL` bit 1) zeroes the table and
+  the bitmap; DDR contents are random after power-up, so the host clears
+  before enabling.
+- **Optional at run time.** `DDR_STATUS` reports *present* (the build has the
+  tier), *calibrated* (the memory controller calibrated: a DIMM is fitted and
+  working), *enabled*, *clearing* and *active*. Lookups happen only while
+  calibrated, enabled and not clearing. The host places flows in DDR only
+  when the tier is present and calibrated, after a clear; with no DIMM it
+  behaves exactly as without the tier.
+- **Board.** `fpga_AU200_nat_ddr` builds the AU200 NAT design with the
+  tier on DDR4 channel C2 (one RDIMM; `ddr4_0` controller, 512-bit AXI at
+  300 MHz, Xilinx AXI clock converter to the 250 MHz shim clock).
+  `NAT_DDR_BUCKET_W` (default 20: 4M entries, 256 MB) sets the size.

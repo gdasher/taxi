@@ -9,12 +9,41 @@
 #include <ethdev_driver.h>
 #include <rte_alarm.h>
 #include <rte_io.h>
+#include <rte_kvargs.h>
+#include <string.h>
 
 #include "cndm.h"
 
 #define NATGW_POLL_US     100000
 #define NATGW_TICK_HZ     1000
 #define NATGW_TICK_DIV    250000     /* 250 MHz core clock / 1000 */
+
+/* devarg natgw_ddr=0: never place flows in the DDR tier (default: use it
+ * when the bitstream has one and its memory calibrated) */
+static int natgw_arg_bool(const char *key __rte_unused, const char *val, void *out)
+{
+	*(bool *)out = !strcmp(val, "1") || !strcmp(val, "true");
+	return 0;
+}
+
+static bool natgw_ddr_allowed(struct cndm_dev *cdev)
+{
+	static const char *const keys[] = {"natgw_ddr", NULL};
+	struct rte_devargs *da = cdev->pdev->device.devargs;
+	struct rte_kvargs *kv;
+	bool allowed = true;
+
+	if (!da || !da->args || !*da->args)
+		return true;
+	kv = rte_kvargs_parse(da->args, keys);
+	if (!kv) {
+		DRV_LOG(ERR, "invalid devargs '%s' (known: natgw_ddr=0|1)", da->args);
+		return true;
+	}
+	rte_kvargs_process(kv, "natgw_ddr", natgw_arg_bool, &allowed);
+	rte_kvargs_free(kv);
+	return allowed;
+}
 
 static uint32_t natgw_io_rd(void *ctx, uint32_t off)
 {
@@ -65,6 +94,7 @@ int cndm_natgw_init(struct cndm_dev *cdev)
 	cfg.seed1 = 0xffffffff;
 	cfg.max_depth = 6;
 	cfg.punt_hdr = cdev->natgw_punt_hdr;
+	cfg.no_ddr = !natgw_ddr_allowed(cdev);
 	cdev->natgw = natgw_flow_ctx_create(&io, &cfg, cdev->pdev->device.numa_node);
 	if (!cdev->natgw) {
 		DRV_LOG(ERR, "NAT block present but could not be initialised");

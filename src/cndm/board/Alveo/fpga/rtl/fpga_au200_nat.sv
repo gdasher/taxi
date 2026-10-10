@@ -48,7 +48,10 @@ module fpga #
 
     // NAT shim configuration
     parameter NAT_BUCKET_W = 16,
-    parameter NAT_RAM_PIPE = 3
+    parameter NAT_RAM_PIPE = 3,
+    // DDR tier (builds with `define NAT_DDR): 2 x 2^NAT_DDR_BUCKET_W
+    // 64-byte lines of two entries in DDR4 channel C2
+    parameter NAT_DDR_BUCKET_W = 20
 )
 (
     /*
@@ -119,6 +122,28 @@ module fpga #
     input  wire logic         pcie_refclk_p,
     input  wire logic         pcie_refclk_n,
     input  wire logic         pcie_reset_n
+`ifdef NAT_DDR
+    ,
+    /*
+     * DDR4 channel C2 (one RDIMM): the NAT DDR tier
+     */
+    input  wire logic         clk_ddr4_c2_p,
+    input  wire logic         clk_ddr4_c2_n,
+    output wire logic         ddr4_c2_act_n,
+    output wire logic [16:0]  ddr4_c2_adr,
+    output wire logic [1:0]   ddr4_c2_ba,
+    output wire logic [1:0]   ddr4_c2_bg,
+    output wire logic [0:0]   ddr4_c2_ck_t,
+    output wire logic [0:0]   ddr4_c2_ck_c,
+    output wire logic [0:0]   ddr4_c2_cke,
+    output wire logic [0:0]   ddr4_c2_cs_n,
+    output wire logic [0:0]   ddr4_c2_odt,
+    output wire logic         ddr4_c2_par,
+    output wire logic         ddr4_c2_reset_n,
+    inout  wire logic [71:0]  ddr4_c2_dq,
+    inout  wire logic [17:0]  ddr4_c2_dqs_t,
+    inout  wire logic [17:0]  ddr4_c2_dqs_c
+`endif
 );
 
 // Clock and reset
@@ -783,6 +808,286 @@ wire uart_txd_int[1];
 assign uart_txd = uart_txd_int[0];
 assign uart_rxd_int[0] = uart_rxd;
 
+/*
+ * NAT DDR tier: DDR4 channel C2 through an AXI clock converter
+ */
+wire [3:0]    nat_ddr_awid;
+wire [33:0]   nat_ddr_awaddr;
+wire [7:0]    nat_ddr_awlen;
+wire [2:0]    nat_ddr_awsize;
+wire [1:0]    nat_ddr_awburst;
+wire          nat_ddr_awvalid;
+wire          nat_ddr_awready;
+wire [511:0]  nat_ddr_wdata;
+wire [63:0]   nat_ddr_wstrb;
+wire          nat_ddr_wlast;
+wire          nat_ddr_wvalid;
+wire          nat_ddr_wready;
+wire [3:0]    nat_ddr_bid;
+wire [1:0]    nat_ddr_bresp;
+wire          nat_ddr_bvalid;
+wire          nat_ddr_bready;
+wire [3:0]    nat_ddr_arid;
+wire [33:0]   nat_ddr_araddr;
+wire [7:0]    nat_ddr_arlen;
+wire [2:0]    nat_ddr_arsize;
+wire [1:0]    nat_ddr_arburst;
+wire          nat_ddr_arvalid;
+wire          nat_ddr_arready;
+wire [3:0]    nat_ddr_rid;
+wire [511:0]  nat_ddr_rdata;
+wire [1:0]    nat_ddr_rresp;
+wire          nat_ddr_rlast;
+wire          nat_ddr_rvalid;
+wire          nat_ddr_rready;
+wire        nat_ddr_calib;
+
+`ifdef NAT_DDR
+
+wire clk_ddr4_c2_ibuf;
+
+IBUFDS
+clk_ddr4_c2_ibufds_inst (
+    .I(clk_ddr4_c2_p),
+    .IB(clk_ddr4_c2_n),
+    .O(clk_ddr4_c2_ibuf)
+);
+
+wire ddr4_c2_ui_clk;
+wire ddr4_c2_ui_rst;
+wire ddr4_c2_calib_complete;
+logic ddr4_c2_aresetn_reg = 1'b0;
+
+always_ff @(posedge ddr4_c2_ui_clk) begin
+    ddr4_c2_aresetn_reg <= !ddr4_c2_ui_rst;
+end
+
+logic pcie_aresetn_reg = 1'b0;
+
+always_ff @(posedge pcie_user_clk) begin
+    pcie_aresetn_reg <= !pcie_user_rst;
+end
+
+// controller side of the clock converter (ui_clk domain)
+wire [3:0]   ddr_awid, ddr_arid, ddr_bid, ddr_rid;
+wire [33:0]  ddr_awaddr, ddr_araddr;
+wire [7:0]   ddr_awlen, ddr_arlen;
+wire [2:0]   ddr_awsize, ddr_arsize;
+wire [1:0]   ddr_awburst, ddr_arburst, ddr_bresp, ddr_rresp;
+wire [0:0]   ddr_awlock, ddr_arlock;
+wire [3:0]   ddr_awcache, ddr_arcache, ddr_awqos, ddr_arqos;
+wire [2:0]   ddr_awprot, ddr_arprot;
+wire         ddr_awvalid, ddr_awready, ddr_wvalid, ddr_wready, ddr_wlast;
+wire         ddr_bvalid, ddr_bready, ddr_arvalid, ddr_arready;
+wire         ddr_rvalid, ddr_rready, ddr_rlast;
+wire [511:0] ddr_wdata, ddr_rdata;
+wire [63:0]  ddr_wstrb;
+wire [7:0]   ddr_bid_full, ddr_rid_full;
+
+assign ddr_bid = ddr_bid_full[3:0];
+assign ddr_rid = ddr_rid_full[3:0];
+
+axi_cc_natgw_ddr
+ddr_cc_inst (
+    .s_axi_aclk(pcie_user_clk),
+    .s_axi_aresetn(pcie_aresetn_reg),
+    .s_axi_awid(nat_ddr_awid),
+    .s_axi_awaddr(nat_ddr_awaddr),
+    .s_axi_awlen(nat_ddr_awlen),
+    .s_axi_awsize(nat_ddr_awsize),
+    .s_axi_awburst(nat_ddr_awburst),
+    .s_axi_awlock(1'b0),
+    .s_axi_awcache(4'b0011),
+    .s_axi_awprot(3'b010),
+    .s_axi_awregion(4'd0),
+    .s_axi_awqos(4'd0),
+    .s_axi_awvalid(nat_ddr_awvalid),
+    .s_axi_awready(nat_ddr_awready),
+    .s_axi_wdata(nat_ddr_wdata),
+    .s_axi_wstrb(nat_ddr_wstrb),
+    .s_axi_wlast(nat_ddr_wlast),
+    .s_axi_wvalid(nat_ddr_wvalid),
+    .s_axi_wready(nat_ddr_wready),
+    .s_axi_bid(nat_ddr_bid),
+    .s_axi_bresp(nat_ddr_bresp),
+    .s_axi_bvalid(nat_ddr_bvalid),
+    .s_axi_bready(nat_ddr_bready),
+    .s_axi_arid(nat_ddr_arid),
+    .s_axi_araddr(nat_ddr_araddr),
+    .s_axi_arlen(nat_ddr_arlen),
+    .s_axi_arsize(nat_ddr_arsize),
+    .s_axi_arburst(nat_ddr_arburst),
+    .s_axi_arlock(1'b0),
+    .s_axi_arcache(4'b0011),
+    .s_axi_arprot(3'b010),
+    .s_axi_arregion(4'd0),
+    .s_axi_arqos(4'd0),
+    .s_axi_arvalid(nat_ddr_arvalid),
+    .s_axi_arready(nat_ddr_arready),
+    .s_axi_rid(nat_ddr_rid),
+    .s_axi_rdata(nat_ddr_rdata),
+    .s_axi_rresp(nat_ddr_rresp),
+    .s_axi_rlast(nat_ddr_rlast),
+    .s_axi_rvalid(nat_ddr_rvalid),
+    .s_axi_rready(nat_ddr_rready),
+
+    .m_axi_aclk(ddr4_c2_ui_clk),
+    .m_axi_aresetn(ddr4_c2_aresetn_reg),
+    .m_axi_awid(ddr_awid),
+    .m_axi_awaddr(ddr_awaddr),
+    .m_axi_awlen(ddr_awlen),
+    .m_axi_awsize(ddr_awsize),
+    .m_axi_awburst(ddr_awburst),
+    .m_axi_awlock(ddr_awlock),
+    .m_axi_awcache(ddr_awcache),
+    .m_axi_awprot(ddr_awprot),
+    .m_axi_awregion(),
+    .m_axi_awqos(ddr_awqos),
+    .m_axi_awvalid(ddr_awvalid),
+    .m_axi_awready(ddr_awready),
+    .m_axi_wdata(ddr_wdata),
+    .m_axi_wstrb(ddr_wstrb),
+    .m_axi_wlast(ddr_wlast),
+    .m_axi_wvalid(ddr_wvalid),
+    .m_axi_wready(ddr_wready),
+    .m_axi_bid(ddr_bid),
+    .m_axi_bresp(ddr_bresp),
+    .m_axi_bvalid(ddr_bvalid),
+    .m_axi_bready(ddr_bready),
+    .m_axi_arid(ddr_arid),
+    .m_axi_araddr(ddr_araddr),
+    .m_axi_arlen(ddr_arlen),
+    .m_axi_arsize(ddr_arsize),
+    .m_axi_arburst(ddr_arburst),
+    .m_axi_arlock(ddr_arlock),
+    .m_axi_arcache(ddr_arcache),
+    .m_axi_arprot(ddr_arprot),
+    .m_axi_arregion(),
+    .m_axi_arqos(ddr_arqos),
+    .m_axi_arvalid(ddr_arvalid),
+    .m_axi_arready(ddr_arready),
+    .m_axi_rid(ddr_rid),
+    .m_axi_rdata(ddr_rdata),
+    .m_axi_rresp(ddr_rresp),
+    .m_axi_rlast(ddr_rlast),
+    .m_axi_rvalid(ddr_rvalid),
+    .m_axi_rready(ddr_rready)
+);
+
+ddr4_0
+ddr4_c2_inst (
+    .sys_rst(rst_125mhz_int),
+    .c0_sys_clk_i(clk_ddr4_c2_ibuf),
+    .c0_init_calib_complete(ddr4_c2_calib_complete),
+    .dbg_clk(),
+    .dbg_bus(),
+
+    .c0_ddr4_adr(ddr4_c2_adr),
+    .c0_ddr4_ba(ddr4_c2_ba),
+    .c0_ddr4_cke(ddr4_c2_cke),
+    .c0_ddr4_cs_n(ddr4_c2_cs_n),
+    .c0_ddr4_dq(ddr4_c2_dq),
+    .c0_ddr4_dqs_c(ddr4_c2_dqs_c),
+    .c0_ddr4_dqs_t(ddr4_c2_dqs_t),
+    .c0_ddr4_odt(ddr4_c2_odt),
+    .c0_ddr4_parity(ddr4_c2_par),
+    .c0_ddr4_bg(ddr4_c2_bg),
+    .c0_ddr4_reset_n(ddr4_c2_reset_n),
+    .c0_ddr4_act_n(ddr4_c2_act_n),
+    .c0_ddr4_ck_c(ddr4_c2_ck_c),
+    .c0_ddr4_ck_t(ddr4_c2_ck_t),
+
+    .c0_ddr4_ui_clk(ddr4_c2_ui_clk),
+    .c0_ddr4_ui_clk_sync_rst(ddr4_c2_ui_rst),
+    .c0_ddr4_aresetn(ddr4_c2_aresetn_reg),
+
+    // ECC control interface: unused (ECC on, defaults)
+    .c0_ddr4_s_axi_ctrl_awvalid(1'b0),
+    .c0_ddr4_s_axi_ctrl_awready(),
+    .c0_ddr4_s_axi_ctrl_awaddr(32'd0),
+    .c0_ddr4_s_axi_ctrl_wvalid(1'b0),
+    .c0_ddr4_s_axi_ctrl_wready(),
+    .c0_ddr4_s_axi_ctrl_wdata(32'd0),
+    .c0_ddr4_s_axi_ctrl_bvalid(),
+    .c0_ddr4_s_axi_ctrl_bready(1'b1),
+    .c0_ddr4_s_axi_ctrl_bresp(),
+    .c0_ddr4_s_axi_ctrl_arvalid(1'b0),
+    .c0_ddr4_s_axi_ctrl_arready(),
+    .c0_ddr4_s_axi_ctrl_araddr(32'd0),
+    .c0_ddr4_s_axi_ctrl_rvalid(),
+    .c0_ddr4_s_axi_ctrl_rready(1'b1),
+    .c0_ddr4_s_axi_ctrl_rdata(),
+    .c0_ddr4_s_axi_ctrl_rresp(),
+    .c0_ddr4_interrupt(),
+
+    .c0_ddr4_s_axi_awid({4'd0, ddr_awid}),
+    .c0_ddr4_s_axi_awaddr(ddr_awaddr),
+    .c0_ddr4_s_axi_awlen(ddr_awlen),
+    .c0_ddr4_s_axi_awsize(ddr_awsize),
+    .c0_ddr4_s_axi_awburst(ddr_awburst),
+    .c0_ddr4_s_axi_awlock(ddr_awlock),
+    .c0_ddr4_s_axi_awcache(ddr_awcache),
+    .c0_ddr4_s_axi_awprot(ddr_awprot),
+    .c0_ddr4_s_axi_awqos(ddr_awqos),
+    .c0_ddr4_s_axi_awvalid(ddr_awvalid),
+    .c0_ddr4_s_axi_awready(ddr_awready),
+    .c0_ddr4_s_axi_wdata(ddr_wdata),
+    .c0_ddr4_s_axi_wstrb(ddr_wstrb),
+    .c0_ddr4_s_axi_wlast(ddr_wlast),
+    .c0_ddr4_s_axi_wvalid(ddr_wvalid),
+    .c0_ddr4_s_axi_wready(ddr_wready),
+    .c0_ddr4_s_axi_bready(ddr_bready),
+    .c0_ddr4_s_axi_bid(ddr_bid_full),
+    .c0_ddr4_s_axi_bresp(ddr_bresp),
+    .c0_ddr4_s_axi_bvalid(ddr_bvalid),
+    .c0_ddr4_s_axi_arid({4'd0, ddr_arid}),
+    .c0_ddr4_s_axi_araddr(ddr_araddr),
+    .c0_ddr4_s_axi_arlen(ddr_arlen),
+    .c0_ddr4_s_axi_arsize(ddr_arsize),
+    .c0_ddr4_s_axi_arburst(ddr_arburst),
+    .c0_ddr4_s_axi_arlock(ddr_arlock),
+    .c0_ddr4_s_axi_arcache(ddr_arcache),
+    .c0_ddr4_s_axi_arprot(ddr_arprot),
+    .c0_ddr4_s_axi_arqos(ddr_arqos),
+    .c0_ddr4_s_axi_arvalid(ddr_arvalid),
+    .c0_ddr4_s_axi_arready(ddr_arready),
+    .c0_ddr4_s_axi_rready(ddr_rready),
+    .c0_ddr4_s_axi_rlast(ddr_rlast),
+    .c0_ddr4_s_axi_rvalid(ddr_rvalid),
+    .c0_ddr4_s_axi_rresp(ddr_rresp),
+    .c0_ddr4_s_axi_rid(ddr_rid_full),
+    .c0_ddr4_s_axi_rdata(ddr_rdata)
+);
+
+// calibration status: no DIMM (or a failed one) leaves it low, and the
+// host then never places flows in DDR
+taxi_sync_signal #(
+    .WIDTH(1),
+    .N(3)
+)
+ddr4_c2_calib_sync_inst (
+    .clk(pcie_user_clk),
+    .in(ddr4_c2_calib_complete),
+    .out(nat_ddr_calib)
+);
+
+`else
+
+assign nat_ddr_awready = '0;
+assign nat_ddr_wready = '0;
+assign nat_ddr_bid = '0;
+assign nat_ddr_bresp = '0;
+assign nat_ddr_bvalid = '0;
+assign nat_ddr_arready = '0;
+assign nat_ddr_rid = '0;
+assign nat_ddr_rdata = '0;
+assign nat_ddr_rresp = '0;
+assign nat_ddr_rlast = '0;
+assign nat_ddr_rvalid = '0;
+assign nat_ddr_calib = 1'b0;
+
+`endif
+
 fpga_core_nat #(
     .SIM(SIM),
     .VENDOR(VENDOR),
@@ -827,7 +1132,15 @@ fpga_core_nat #(
     // NAT shim
     .NAT_BUCKET_W(NAT_BUCKET_W),
     .NAT_RAM_PIPE(NAT_RAM_PIPE),
-    .NAT_TICK_DIV(250000)
+    .NAT_TICK_DIV(250000),
+`ifdef NAT_DDR
+    .NAT_DDR(1),
+`else
+    .NAT_DDR(0),
+`endif
+    .NAT_DDR_BUCKET_W(NAT_DDR_BUCKET_W),
+    .NAT_DDR_AXI_ADDR_W(34),
+    .NAT_DDR_AXI_ID_W(4)
 )
 core_inst (
     /*
@@ -957,7 +1270,41 @@ core_inst (
     .qspi_dq_i(qspi_dq_i_int),
     .qspi_dq_o(qspi_dq_o_int),
     .qspi_dq_oe(qspi_dq_oe_int),
-    .qspi_cs(qspi_cs_int)
+    .qspi_cs(qspi_cs_int),
+
+    /*
+     * NAT DDR tier
+     */
+    .m_axi_ddr_awid(nat_ddr_awid),
+    .m_axi_ddr_awaddr(nat_ddr_awaddr),
+    .m_axi_ddr_awlen(nat_ddr_awlen),
+    .m_axi_ddr_awsize(nat_ddr_awsize),
+    .m_axi_ddr_awburst(nat_ddr_awburst),
+    .m_axi_ddr_awvalid(nat_ddr_awvalid),
+    .m_axi_ddr_awready(nat_ddr_awready),
+    .m_axi_ddr_wdata(nat_ddr_wdata),
+    .m_axi_ddr_wstrb(nat_ddr_wstrb),
+    .m_axi_ddr_wlast(nat_ddr_wlast),
+    .m_axi_ddr_wvalid(nat_ddr_wvalid),
+    .m_axi_ddr_wready(nat_ddr_wready),
+    .m_axi_ddr_bid(nat_ddr_bid),
+    .m_axi_ddr_bresp(nat_ddr_bresp),
+    .m_axi_ddr_bvalid(nat_ddr_bvalid),
+    .m_axi_ddr_bready(nat_ddr_bready),
+    .m_axi_ddr_arid(nat_ddr_arid),
+    .m_axi_ddr_araddr(nat_ddr_araddr),
+    .m_axi_ddr_arlen(nat_ddr_arlen),
+    .m_axi_ddr_arsize(nat_ddr_arsize),
+    .m_axi_ddr_arburst(nat_ddr_arburst),
+    .m_axi_ddr_arvalid(nat_ddr_arvalid),
+    .m_axi_ddr_arready(nat_ddr_arready),
+    .m_axi_ddr_rid(nat_ddr_rid),
+    .m_axi_ddr_rdata(nat_ddr_rdata),
+    .m_axi_ddr_rresp(nat_ddr_rresp),
+    .m_axi_ddr_rlast(nat_ddr_rlast),
+    .m_axi_ddr_rvalid(nat_ddr_rvalid),
+    .m_axi_ddr_rready(nat_ddr_rready),
+    .ddr_calib(nat_ddr_calib)
 );
 
 endmodule
