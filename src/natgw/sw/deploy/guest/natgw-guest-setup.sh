@@ -108,9 +108,10 @@ build_dpdk() {
 	[ -e "$d/drivers/common/natgw/meson.build" ] || "$NATGW_SRC/taxi/src/natgw/sw/dpdk/setup_dpdk.sh" "$d"
 	# platform=generic: never -march=native (the build host's CPU may not be
 	# the server's). Only the drivers the gateway uses: fewer mempool drivers
-	# also keeps the mempool ops table from overflowing under VPP.
+	# also keeps the mempool ops table from overflowing under VPP. VPP's dpdk
+	# plugin includes the PCI, vdev and VMBus bus headers.
 	local opts=(-Dplatform=generic -Denable_driver_sdk=true -Dtests=false -Denable_apps=test-pmd
-		"-Denable_drivers=bus/pci,bus/vdev,mempool/ring,mempool/stack,common/natgw,net/cndm,net/natgw_model"
+		"-Denable_drivers=bus/pci,bus/vdev,bus/vmbus,mempool/ring,mempool/stack,common/natgw,net/cndm,net/natgw_model"
 		-Dprefix=/usr/local -Dbuildtype=release)
 	if [ -d "$d/build" ]; then
 		meson configure "$d/build" "${opts[@]}" >/dev/null

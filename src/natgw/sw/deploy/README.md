@@ -13,6 +13,7 @@ For the cabling, VLANs and every address, see the [wiring diagram and configurat
 | `host/natgw-fpga-update` | Stages a bitstream and restarts the VM through Proxmox |
 | `guest/natgw-guest-setup.sh` | Builds and installs DPDK, VPP and the WAN manager in the VM, and writes their configuration and services |
 | `guest/natgw-fpga` | Stages a bitstream on the host and applies it, from inside the VM |
+| `switch/nexus-93108tc-fx.conf` | Site switch configuration (Cisco Nexus 93108TC-FX) |
 | `tests/` | Tests of the host scripts against a fake host (`pytest tests`) |
 
 ## What you need
@@ -20,7 +21,7 @@ For the cabling, VLANs and every address, see the [wiring diagram and configurat
 - **Server:** the Proxmox VE node that will hold the U200, running Proxmox VE 8. The recommended VM uses a virtual IOMMU (the `viommu` machine option of current 8.x releases). Without it, see step 5.
 - **The card:** an Alveo U200, with the natgw bitstream (`fpga_AU200_nat`) built from the `natgw` branch.
 - **For the first flash:** a machine with Vivado or Vivado Lab Edition and a micro-USB cable to the U200's maintenance port.
-- **The switch:** both QSFP28 cages split 4×25G. See the wiring page.
+- **The switch:** a Cisco Nexus 93108TC-FX (step 3). Also one short QSFP28 passive DAC per used U200 cage.
 - **The ISO:** Ubuntu Server 24.04 LTS, uploaded to the node's ISO storage.
 
 ## 1. Server hardware and BIOS (Dell R7515)
@@ -59,20 +60,32 @@ Keep a copy of this bitstream as your known-good (golden) image. Power-cycle the
 lspci -nn -d 1234:c001
 ```
 
-## 3. Switch
+## 3. Switch (Cisco Nexus 93108TC-FX)
 
-Configure the switch as in the wiring page's *Switch ports* table:
+`switch/nexus-93108tc-fx.conf` is a complete NX-OS configuration for the site switch: VLANs, the U200 breakout ports, Proxmox, LAN and WAN ports, and management. Review the hostname, NTP servers and mgmt0 address, add your users and AAA, then paste it into the switch's configuration.
 
-| Port | VLAN |
-| --- | --- |
-| Lane 0 (LAN) | access VLAN 10 |
-| Lane 1 (WAN1) | access VLAN 101 |
-| Lane 2 (WAN2) | access VLAN 102 |
-| Lanes 3–7 | shut down |
-| ISP modems | access ports in VLANs 101 and 102 |
-| The server's LAN NIC and LAN clients | access VLAN 10 |
+| Port | Connects to | VLAN | Notes |
+| --- | --- | --- | --- |
+| Eth1/49/1 | U200 QSFP0 lane 0 (VPP `CndmEthernet0`) | 10 LAN | 25G, no auto-negotiation, FEC off |
+| Eth1/49/2 | U200 QSFP0 lane 1 (`CndmEthernet1`) | 101 WAN1 | 25G, no auto-negotiation, FEC off |
+| Eth1/49/3 | U200 QSFP0 lane 2 (`CndmEthernet2`) | 102 WAN2 | 25G, no auto-negotiation, FEC off |
+| Eth1/49/4, Eth1/50/1–4 | U200 lanes 3–7 | – | shut down |
+| Eth1/1 | pve1 (R7515) LAN NIC, bridge `vmbr1` | 10 | |
+| Eth1/2 | pve1 cluster NIC (corosync) | 20 PVE-CLUSTER | 10.20.0.0/24, no gateway |
+| Eth1/3 | pve1 iDRAC | 10 | |
+| Eth1/4–7 | further Proxmox nodes (LAN, cluster) | 10 / 20 | shut until used |
+| Eth1/9–39 | LAN clients, access points | 10 | storm control |
+| Eth1/40 | the switch's own mgmt0 (192.168.1.4) | 10 | |
+| Eth1/45 | ISP 1 modem | 101 | no LLDP or CDP, BPDUs filtered |
+| Eth1/46 | ISP 2 modem | 102 | no LLDP or CDP, BPDUs filtered |
+| others | spare | – | shut down |
 
-Keep VLANs 101 and 102 off every port that faces the server's NICs: the host must never sit on a WAN segment.
+Things to check:
+- **Cabling the card.** Each U200 cage connects to a switch QSFP28 port with one straight QSFP28 passive DAC. Both ends run as 4×25G: `interface breakout module 1 port 49-50 map 25g-4x`.
+- **Cable rating.** Taxi's 25G PHY does no auto-negotiation and no FEC, so use a short cable (1–2 m) rated for 25G without FEC (CA-N). Nexus switches may refuse cables not coded for Cisco.
+- **Lane order.** At bring-up, check it once: with only Eth1/49/2 enabled, `vppctl show interface` should show link on `CndmEthernet1`.
+- **Modem link speed.** The 93108TC-FX's copper ports run at 100M, 1G or 10G. A modem whose fastest port is 2.5G or 5G links at 1G, so for service above 1 Gb/s use a modem port that does 10G.
+- **The switch stays off the WAN.** It has no address in any data VLAN and is managed only through mgmt0, which is cabled to a LAN port. WAN VLANs 101 and 102 each contain exactly two ports: the modem and the U200 lane.
 
 ## 4. Prepare the Proxmox host
 
@@ -179,7 +192,7 @@ What the script does:
 1. **Packages:** installs build tools.
 2. **Sources:** clones `taxi`, `dpdk` and `vpp` (branch `natgw`) into `/opt/natgw/src`.
 3. **DPDK:** builds and installs it to `/usr/local`.
-   - Only the drivers the gateway uses are included: PCI and vdev buses, ring and stack mempools, `common_natgw`, `net_cndm` and `net_natgw_model`.
+   - Only the drivers the gateway uses are included: the PCI, vdev and VMBus buses (VPP needs all three), ring and stack mempools, `common_natgw`, `net_cndm` and `net_natgw_model`.
    - It's built for generic x86-64 (`platform=generic`), never for the build machine's CPU, so the same build runs on any server.
 4. **VPP:** builds it with the nat44-ed hooks and the `natgw_offload` plugin into `/opt/natgw/vpp`.
 5. **WAN manager:** installs it into `/opt/natgw/wanmgr`, with a virtualenv holding `vpp_papi`.
