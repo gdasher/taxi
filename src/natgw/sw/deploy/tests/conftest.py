@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: BSD-3-Clause
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

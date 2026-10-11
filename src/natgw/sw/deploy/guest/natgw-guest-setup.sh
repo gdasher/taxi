@@ -67,6 +67,7 @@ fi
 # per-WAN settings: defaults for a deploy.env written before them
 : "${NATGW_WAN1_NAME:=wan1}" "${NATGW_WAN1_MAC:=}" "${NATGW_WAN1_ADDRESS:=}" "${NATGW_WAN1_ROUTES:=}"
 : "${NATGW_WAN2_NAME:=wan2}" "${NATGW_WAN2_MAC:=}" "${NATGW_WAN2_ADDRESS:=}" "${NATGW_WAN2_ROUTES:=}"
+: "${NATGW_WAN1_WEIGHT:=1}" "${NATGW_WAN2_WEIGHT:=1}"
 : "${NATGW_MONITOR_BIND:=$NATGW_MGMT_IF}" "${NATGW_MONITOR_PORT:=8443}" "${NATGW_MONITOR_TLS:=yes}"
 : "${NATGW_MONITOR_CERT:=}" "${NATGW_MONITOR_KEY:=}"
 
@@ -235,6 +236,9 @@ render() { # template -> stdout
 		-e "s|@NATGW_WAN2_NAME@|${WAN2_NAME_SED:-}|g" \
 		-e "s|@NATGW_WAN1_CLI@|${WAN1_CLI:-}|g" \
 		-e "s|@NATGW_WAN2_CLI@|${WAN2_CLI:-}|g" \
+		-e "s|@NATGW_WAN_ACL@|${WAN_ACL:-}|g" \
+		-e "s|@NATGW_WAN1_WEIGHT@|$NATGW_WAN1_WEIGHT|g" \
+		-e "s|@NATGW_WAN2_WEIGHT@|$NATGW_WAN2_WEIGHT|g" \
 		-e "s|@NATGW_LAN_CIDR@|$NATGW_LAN_CIDR|g" \
 		-e "s|@NATGW_LAN_NET@|$NATGW_LAN_NET|g" \
 		-e "s|@NATGW_LAN_GW@|$NATGW_LAN_GW|g" \
@@ -255,6 +259,21 @@ render() { # template -> stdout
 		"$HERE/templates/$1"
 }
 
+# prefix -> its network ("192.168.11.2/24" -> "192.168.11.0/24"); refuses
+# anything that is not an IPv4 prefix (named by $2 in the error)
+net_of() { # prefix setting
+	local a b c d len n m
+	[[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] \
+		|| die "$2: '$1' is not an address/prefix"
+	a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]} c=${BASH_REMATCH[3]} d=${BASH_REMATCH[4]} len=${BASH_REMATCH[5]}
+	[ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ] && [ "$len" -le 32 ] \
+		|| die "$2: '$1' is not an address/prefix"
+	n=$(((a << 24) | (b << 16) | (c << 8) | d))
+	m=$(((0xffffffff << (32 - len)) & 0xffffffff))
+	n=$((n & m))
+	echo "$((n >> 24 & 255)).$((n >> 16 & 255)).$((n >> 8 & 255)).$((n & 255))/$len"
+}
+
 # a WAN's own VPP commands: its MAC (a cloned one, for an ISP whose DHCP
 # lease follows the old router's MAC), an extra address on its segment (to
 # reach a device's management there, such as the WAS-110's LCT, whose
@@ -262,24 +281,48 @@ render() { # template -> stdout
 # (a cable modem's status page). Echoes the lines, "\n"-separated for render.
 wan_cli() { # n
 	local ifv="NATGW_WAN$1_IF" namev="NATGW_WAN$1_NAME" macv="NATGW_WAN$1_MAC"
-	local addrv="NATGW_WAN$1_ADDRESS" routesv="NATGW_WAN$1_ROUTES"
+	local addrv="NATGW_WAN$1_ADDRESS" routesv="NATGW_WAN$1_ROUTES" weightv="NATGW_WAN$1_WEIGHT"
 	local ifn=${!ifv} out="" r
 	case "${!namev}" in
 	""|*[\"\\]*|*[![:print:]]*) die "$namev: give a name without quotes or backslashes" ;;
 	esac
+	[[ "${!weightv}" =~ ^[0-9]{1,3}$ ]] && [ "${!weightv}" -ge 1 ] && [ "${!weightv}" -le 255 ] \
+		|| die "$weightv: '${!weightv}' is not a whole number from 1 to 255"
 	if [ -n "${!macv}" ]; then
 		[[ "${!macv}" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || die "$macv: '${!macv}' is not a MAC address"
 		out="${out}\\nset interface mac address $ifn ${!macv}"
 	fi
 	if [ -n "${!addrv}" ]; then
-		[[ "${!addrv}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "$addrv: '${!addrv}' is not an address/prefix"
+		net_of "${!addrv}" "$addrv" >/dev/null
 		out="${out}\\nset interface ip address $ifn ${!addrv}"
 	fi
 	for r in ${!routesv}; do
-		[[ "$r" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "$routesv: '$r' is not a prefix"
+		net_of "$r" "$routesv" >/dev/null
 		out="${out}\\nip route add $r via $ifn"
 	done
 	echo "$out"
+}
+
+# the WAN ingress ACL's rules for the management addresses: nothing from the
+# internet may reach the devices behind NATGW_WAN<n>_ADDRESS (its subnet,
+# except VPP's own address, which the WAS-110 pings) or NATGW_WAN<n>_ROUTES.
+# NAT drops such packets already (no session, NAT forwarding off); the ACL
+# keeps them out even if "nat44 forwarding enable" is ever set. Replies to
+# the LAN's sessions are addressed to the leases, so they pass. Echoes
+# "rule, rule, " for the front of the ACL.
+wan_acl() {
+	local permits="" denies="" n addrv routesv r
+	for n in 1 2; do
+		addrv="NATGW_WAN${n}_ADDRESS" routesv="NATGW_WAN${n}_ROUTES"
+		if [ -n "${!addrv}" ]; then
+			permits="${permits}permit src 0.0.0.0/0 dst ${!addrv%/*}/32, "
+			denies="${denies}deny src 0.0.0.0/0 dst $(net_of "${!addrv}" "$addrv"), "
+		fi
+		for r in ${!routesv}; do
+			denies="${denies}deny src 0.0.0.0/0 dst $(net_of "$r" "$routesv"), "
+		done
+	done
+	echo "$permits$denies"
 }
 
 configure() {
@@ -312,6 +355,7 @@ configure() {
 	done
 	WAN1_CLI=$(wan_cli 1)
 	WAN2_CLI=$(wan_cli 2)
+	WAN_ACL=$(wan_acl)
 	# names such as "AT&T": & and | are special in render's sed
 	WAN1_NAME_SED=$(printf '%s' "$NATGW_WAN1_NAME" | sed 's/[&|]/\\&/g')
 	WAN2_NAME_SED=$(printf '%s' "$NATGW_WAN2_NAME" | sed 's/[&|]/\\&/g')

@@ -13,15 +13,18 @@ down_rounds = 3
 [nat]
 vrf_id = 0
 
-# probe targets: reachable from the internet, each owned by one WAN
+# probe targets: reachable from the internet, each owned by one WAN.
+# weight: the WAN's share of new sessions (ECMP), relative to the others
 [[wan]]
 name = "@NATGW_WAN1_NAME@"
 interface = "@NATGW_WAN1_IF@"
+weight = @NATGW_WAN1_WEIGHT@
 probe_targets = ["1.1.1.1", "9.9.9.9"]
 
 [[wan]]
 name = "@NATGW_WAN2_NAME@"
 interface = "@NATGW_WAN2_IF@"
+weight = @NATGW_WAN2_WEIGHT@
 probe_targets = ["1.0.0.1", "149.112.112.112"]
 
 [alerts]

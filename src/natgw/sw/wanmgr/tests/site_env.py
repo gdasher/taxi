@@ -34,14 +34,14 @@ INTERVAL = 1.0
 
 
 class Site:
-    def __init__(self, name="wmgr", dpdk_extra="", wan_cli=()):
+    def __init__(self, name="wmgr", dpdk_extra="", wan_cli=(), extra_plugins=()):
         """wan_cli: VPP commands run before the WANs come up, as the
         deployment's natgw.cli does (a cloned MAC, extra addresses, routes)"""
         self.wan_cli = list(wan_cli)
         self.tmp = tempfile.mkdtemp(prefix="wanmgr-")
         os.chmod(self.tmp, 0o777)
         self.smtp = SmtpSink()
-        self.vpp = Vpp(name=name, extra_plugins=["dhcp_plugin.so"],
+        self.vpp = Vpp(name=name, extra_plugins=["dhcp_plugin.so", *extra_plugins],
                        offload_conf="enable active-packets 4 sync-interval 0.25", dpdk_extra=dpdk_extra)
         self.ns = {}
         self.procs = []

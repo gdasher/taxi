@@ -243,7 +243,12 @@ The first run writes `/etc/natgw/deploy.env` and stops. Edit it:
 - DNS upstreams;
 - the CPU VPP polls on (a vCPU other than 0);
 - the NAT session limit, 1M by default (see *Flow tables and the DDR tier* in step 10);
-- the WANs: names (`att` and `xfinity`, used in alerts and on the monitor page), the BGW320's MAC for AT&T (`NATGW_WAN1_MAC`, step 3), VPP's address next to the WAS-110 (`NATGW_WAN1_ADDRESS`, 192.168.11.2/24), and the route to the cable modem's page (`NATGW_WAN2_ROUTES`);
+- the WANs:
+  - names (`att` and `xfinity`, used in alerts and on the monitor page);
+  - weights, each WAN's share of new sessions (5 and 2, for AT&T's 5 Gb/s against Xfinity's 2 Gb/s);
+  - the BGW320's MAC for AT&T (`NATGW_WAN1_MAC`, step 3);
+  - VPP's address next to the WAS-110 (`NATGW_WAN1_ADDRESS`, 192.168.11.2/24);
+  - the route to the cable modem's page (`NATGW_WAN2_ROUTES`);
 - where the monitor's page is served (`NATGW_MONITOR_BIND`, `NATGW_MONITOR_PORT`; see step 11);
 - the Proxmox host's address and this VM's ID, used for FPGA updates.
 
@@ -266,8 +271,8 @@ What the script does:
    - `/etc/vpp/startup.conf`, with the card's PCI address detected and any `NATGW_CARD_DEVARGS`. The device's counters reach the stats segment every second.
      - VPP's main heap is 2 GB (`NATGW_VPP_HEAP`). nat44-ed preallocates its sessions there: 430 MB for 1M.
      - The offload plugin's sync budget follows the session limit (limit ÷ 64, at least 4096), so each session is synced at least every 64 s.
-   - `/etc/vpp/natgw.cli`, including each WAN's cloned MAC, extra address and routes.
-   - `/etc/natgw/wanmgr.toml`, only if missing, with the WANs' names. To rename a WAN later, edit `name` there and restart `natgw-wanmgr`.
+   - `/etc/vpp/natgw.cli`, including each WAN's cloned MAC, extra address and routes. Its WAN ingress ACL drops traffic from the internet to the LAN and to the ISP devices' management addresses (see *ISP equipment* in step 10).
+   - `/etc/natgw/wanmgr.toml`, only if missing, with the WANs' names and weights. To change them later, edit `name` or `weight` there and restart `natgw-wanmgr`.
    - `/etc/natgw/monitor.toml`, regenerated from `deploy.env` on every run.
    - The monitor's HTTPS certificate: yours, or a self-signed one created once in `/etc/natgw/tls`.
    - `/etc/dnsmasq.d/natgw-lan.conf` and `/etc/natgw/60-natgw-mgmt.yaml`.
@@ -375,7 +380,11 @@ Expect about a minute of gateway outage per update. If a new image doesn't enume
 - **Updating the stick.** Follow the 8311 project's release notes. Write down the masquerade values first.
 - **The cable modem's page** is `http://192.168.100.1/` from any LAN client. Its Ethernet Port Aggregation page shows the bond's state. A factory reset turns aggregation off, which takes Xfinity down until it's turned on again (step 3, from a laptop on LAN 1).
 - **Xfinity's link.** If one of the two cables fails, the port-channel carries on at 1 Gb/s. `show port-channel summary` shows it.
-- **Sharing traffic between the ISPs.** New sessions are spread across the healthy WANs by ECMP, equally by default. To match the plans' speeds, set `weight` in each `[[wan]]` block of `/etc/natgw/wanmgr.toml`, for example 5 for a 5 Gb/s AT&T plan against 2 for Xfinity's 2 Gb/s, then restart `natgw-wanmgr`.
+- **Sharing traffic between the ISPs.** New sessions are spread across the healthy WANs by ECMP, in proportion to their weights: 5 for AT&T and 2 for Xfinity by default, matching 5 Gb/s against 2 Gb/s. Weights are whole numbers from 1 to 255, so a ratio of 2.5 to 1 is 5 to 2. They come from `NATGW_WAN1_WEIGHT` and `NATGW_WAN2_WEIGHT` when the script creates `/etc/natgw/wanmgr.toml`. After that, edit `weight` in each `[[wan]]` block there and restart `natgw-wanmgr`. When one ISP is down, the other takes every new session, whatever the weights.
+- **The devices' pages are for the LAN only.** Requests from the LAN leave through the WAN's NAT, so the stick and the modem see them coming from the lease address. From the internet side, nothing reaches them through VPP:
+  - VPP's NAT drops packets that match no session.
+  - The WAN ingress ACL also drops traffic addressed to `NATGW_WANn_ADDRESS`'s subnet (except VPP's own address, which the stick pings) and to `NATGW_WANn_ROUTES`. That holds even if `nat44 forwarding enable` is ever set, which would otherwise route such packets through.
+  - The ISPs still manage their own devices: AT&T can configure the stick, and turn its page off, over the fiber, and Xfinity manages the modem over the cable.
 
 ### Flow tables and the DDR tier
 
@@ -468,5 +477,6 @@ The monitor serves a page with the gateway's statistics and the ISPs' state at `
     - LAN clients reach a stand-in for the stick's page (192.168.11.1, management gateway 192.168.11.2) and for the modem's page (192.168.100.1).
     - Internet traffic still uses only the leases, and is offloaded.
     - The stick's page stays reachable while its WAN is down, and failover and recovery are unchanged.
+    - From either ISP's side, datagrams addressed to the stick or the modem, routed to VPP's lease, never arrive. That also holds with `nat44 forwarding enable` set. As a control, with forwarding on and the ACL removed, they do arrive.
 - **DDR defaults:** `startup.conf` rendered with and without devargs and bulk ports. VPP started with the 2 GB heap, the derived sync budget and bulk ports, and the 1M-session NAT limit (432 MB used of the heap). The DDR tier itself is tested on the C model and the RTL (`sw/README.md`).
 - **Not tested (no hardware or Proxmox here):** the hardware steps (vfio, hugepages, kernel command line), `natgw-host-setup.sh` on a real Proxmox host, Pyrite flashing of a U200, the VM settings, DDR calibration on a real card, the sync budget's main-thread cost on the card, the WAS-110 and the QSA in the Nexus, AT&T's acceptance of the masquerade, and the CM2500 and its LACP bond with the Nexus.
