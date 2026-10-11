@@ -34,7 +34,10 @@ INTERVAL = 1.0
 
 
 class Site:
-    def __init__(self, name="wmgr", dpdk_extra=""):
+    def __init__(self, name="wmgr", dpdk_extra="", wan_cli=()):
+        """wan_cli: VPP commands run before the WANs come up, as the
+        deployment's natgw.cli does (a cloned MAC, extra addresses, routes)"""
+        self.wan_cli = list(wan_cli)
         self.tmp = tempfile.mkdtemp(prefix="wanmgr-")
         os.chmod(self.tmp, 0o777)
         self.smtp = SmtpSink()
@@ -88,6 +91,8 @@ class Site:
 
     def configure_vpp(self):
         v = self.vpp
+        for c in self.wan_cli:
+            v.cli(c)
         for c in ["set interface state NatgwModel0 up",
                   "set interface ip address NatgwModel0 192.168.1.1/24",
                   "nat44 plugin enable sessions 4096"]:

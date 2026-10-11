@@ -4,8 +4,12 @@ comment { LAN }
 set interface state @NATGW_LAN_IF@ up
 set interface ip address @NATGW_LAN_IF@ @NATGW_LAN_CIDR@
 
-comment { WANs: addresses, DHCP clients and NAT pool entries come from natgw-wanmgr }
+comment { WANs: addresses, DHCP clients and NAT pool entries come from natgw-wanmgr. }
+comment { Below each: its cloned MAC, an address to reach a device's management on its }
+comment { segment, and routes straight out of it, when deploy.env sets them. }
+comment { WAN1 }@NATGW_WAN1_CLI@
 set interface state @NATGW_WAN1_IF@ up
+comment { WAN2 }@NATGW_WAN2_CLI@
 set interface state @NATGW_WAN2_IF@ up
 
 comment { NAT only as an output feature on the WANs, with no inside interface }

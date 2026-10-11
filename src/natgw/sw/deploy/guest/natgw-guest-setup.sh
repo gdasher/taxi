@@ -64,6 +64,9 @@ fi
 # added with the DDR tier: defaults for a deploy.env written before it
 : "${NATGW_DPDK_BRANCH:=natgw}" "${NATGW_VPP_BRANCH:=natgw}" "${NATGW_VPP_HEAP:=2G}"
 : "${NATGW_CARD_DEVARGS:=}" "${NATGW_BULK_UDP_PORTS:=}"
+# per-WAN settings: defaults for a deploy.env written before them
+: "${NATGW_WAN1_NAME:=wan1}" "${NATGW_WAN1_MAC:=}" "${NATGW_WAN1_ADDRESS:=}" "${NATGW_WAN1_ROUTES:=}"
+: "${NATGW_WAN2_NAME:=wan2}" "${NATGW_WAN2_MAC:=}" "${NATGW_WAN2_ADDRESS:=}" "${NATGW_WAN2_ROUTES:=}"
 : "${NATGW_MONITOR_BIND:=$NATGW_MGMT_IF}" "${NATGW_MONITOR_PORT:=8443}" "${NATGW_MONITOR_TLS:=yes}"
 : "${NATGW_MONITOR_CERT:=}" "${NATGW_MONITOR_KEY:=}"
 
@@ -228,6 +231,10 @@ render() { # template -> stdout
 		-e "s|@NATGW_LAN_IF@|$NATGW_LAN_IF|g" \
 		-e "s|@NATGW_WAN1_IF@|$NATGW_WAN1_IF|g" \
 		-e "s|@NATGW_WAN2_IF@|$NATGW_WAN2_IF|g" \
+		-e "s|@NATGW_WAN1_NAME@|${WAN1_NAME_SED:-}|g" \
+		-e "s|@NATGW_WAN2_NAME@|${WAN2_NAME_SED:-}|g" \
+		-e "s|@NATGW_WAN1_CLI@|${WAN1_CLI:-}|g" \
+		-e "s|@NATGW_WAN2_CLI@|${WAN2_CLI:-}|g" \
 		-e "s|@NATGW_LAN_CIDR@|$NATGW_LAN_CIDR|g" \
 		-e "s|@NATGW_LAN_NET@|$NATGW_LAN_NET|g" \
 		-e "s|@NATGW_LAN_GW@|$NATGW_LAN_GW|g" \
@@ -246,6 +253,33 @@ render() { # template -> stdout
 		-e "s|@NATGW_MONITOR_CERT@|${MON_CERT:-}|g" \
 		-e "s|@NATGW_MONITOR_KEY@|${MON_KEY:-}|g" \
 		"$HERE/templates/$1"
+}
+
+# a WAN's own VPP commands: its MAC (a cloned one, for an ISP whose DHCP
+# lease follows the old router's MAC), an extra address on its segment (to
+# reach a device's management there, such as the WAS-110's LCT, whose
+# management gateway is set to this address) and routes straight out of it
+# (a cable modem's status page). Echoes the lines, "\n"-separated for render.
+wan_cli() { # n
+	local ifv="NATGW_WAN$1_IF" namev="NATGW_WAN$1_NAME" macv="NATGW_WAN$1_MAC"
+	local addrv="NATGW_WAN$1_ADDRESS" routesv="NATGW_WAN$1_ROUTES"
+	local ifn=${!ifv} out="" r
+	case "${!namev}" in
+	""|*[\"\\]*|*[![:print:]]*) die "$namev: give a name without quotes or backslashes" ;;
+	esac
+	if [ -n "${!macv}" ]; then
+		[[ "${!macv}" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || die "$macv: '${!macv}' is not a MAC address"
+		out="${out}\\nset interface mac address $ifn ${!macv}"
+	fi
+	if [ -n "${!addrv}" ]; then
+		[[ "${!addrv}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "$addrv: '${!addrv}' is not an address/prefix"
+		out="${out}\\nset interface ip address $ifn ${!addrv}"
+	fi
+	for r in ${!routesv}; do
+		[[ "$r" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]] || die "$routesv: '$r' is not a prefix"
+		out="${out}\\nip route add $r via $ifn"
+	done
+	echo "$out"
 }
 
 configure() {
@@ -276,6 +310,11 @@ configure() {
 		[ "$p" -ge 1 ] && [ "$p" -le 65535 ] || die "NATGW_BULK_UDP_PORTS: $p is out of range"
 		OFFLOAD_CONF="${OFFLOAD_CONF}\\n  bulk-udp-port $p"
 	done
+	WAN1_CLI=$(wan_cli 1)
+	WAN2_CLI=$(wan_cli 2)
+	# names such as "AT&T": & and | are special in render's sed
+	WAN1_NAME_SED=$(printf '%s' "$NATGW_WAN1_NAME" | sed 's/[&|]/\\&/g')
+	WAN2_NAME_SED=$(printf '%s' "$NATGW_WAN2_NAME" | sed 's/[&|]/\\&/g')
 	DNS_SERVERS=""
 	for s in $NATGW_DNS_UPSTREAM; do
 		DNS_SERVERS="${DNS_SERVERS}server=$s\\n"
