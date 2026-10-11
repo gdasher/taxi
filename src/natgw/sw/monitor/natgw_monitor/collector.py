@@ -10,19 +10,24 @@ interval, except the device's 32-bit DDR counters, which wrap.
 ISP outages: when a WAN is DOWN the collector opens an outage record with a
 snapshot of the evidence (reason, lease, link, probe results, the other WANs,
 the route, the WAN's traffic just before), and closes it when the WAN is UP
-again. Records go to <state_dir>/events.jsonl with the WAN manager's state
-and lease events and alert changes, so the history survives restarts of the
-monitor; the WAN manager's own event log (its last 200 events) fills in what
-happened while the monitor was not running."""
+again. Outages, the WAN manager's state and lease events and alert changes go
+to the database (store.py) with the statistics, so the history survives
+restarts of the monitor; the WAN manager's own event log (its last 200
+events) fills in what happened while the monitor was not running.
+
+History: the last hour is kept in memory as well (exact, and for outage
+snapshots); longer windows, or windows from before a restart, come from the
+database: 1 s samples for a day, minute min/avg/max beyond."""
 
 import collections
-import json
 import logging
+import math
 import os
 import threading
 import time
 
 from .sources import SourceDown
+from .store import Store
 
 log = logging.getLogger("natgw-monitor")
 
@@ -76,50 +81,75 @@ class Rates:
 
 
 class EventLog:
-    """append-only JSON lines, most recent kept in memory"""
+    """the event log, in the database"""
 
-    MAX_BYTES = 8 << 20
-    KEEP_LINES = 20000
-
-    def __init__(self, state_dir, keep=1000):
-        self.path = os.path.join(state_dir, "events.jsonl") if state_dir else None
-        self.recent = collections.deque(maxlen=keep)
-        self.lock = threading.Lock()
-        self.loaded = []
-        if self.path:
-            os.makedirs(state_dir, exist_ok=True)
-            self._load()
-
-    def _load(self):
-        try:
-            with open(self.path) as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            return
-        if sum(len(x) for x in lines) > self.MAX_BYTES:
-            lines = lines[-self.KEEP_LINES:]
-            tmp = self.path + ".tmp"
-            with open(tmp, "w") as f:
-                f.writelines(lines)
-            os.replace(tmp, self.path)
-        for ln in lines:
-            try:
-                r = json.loads(ln)
-            except ValueError:
-                continue    # a torn last line after a crash
-            self.loaded.append(r)
-            self.recent.append(r)
+    def __init__(self, store):
+        self.store = store
 
     def add(self, rec):
-        with self.lock:
-            self.recent.append(rec)
-            if self.path:
-                with open(self.path, "a") as f:
-                    f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        self.store.add_event(rec)
 
     def tail(self, n):
-        with self.lock:
-            return list(self.recent)[-n:]
+        return self.store.events(limit=n)
+
+
+SCALARS = ["hw", "punt", "drop", "ratio", "onchip", "ddr", "onchip_flows", "ddr_flows", "prom", "dem", "hit", "vr"]
+
+
+def flatten(h):
+    """a compact sample -> {series: number}, the database's columns"""
+    f = {k: h.get(k) for k in SCALARS}
+    f["vpp"] = 1 if h.get("vpp") else 0
+    for k, v in (h.get("reasons") or {}).items():
+        f[f"r.{k}"] = v
+    for k in PUNT_REASONS:
+        f.setdefault(f"r.{k}", 0.0 if h.get("punt") is not None else None)
+    for name, w in (h.get("wans") or {}).items():
+        f[f"w.{name}.up"] = w.get("up")
+        f[f"w.{name}.rx"] = w.get("rx")
+    return f
+
+
+def unflatten(t, avg, mx, bucket):
+    """database bucket -> the compact sample shape, with peaks under "max";
+    vpp and each WAN's "up" become the fraction of the bucket they were up"""
+    h = {"t": t, "bucket": bucket, "vpp": avg.get("vpp"), "reasons": {}, "wans": {},
+         "max": {"hw": mx.get("hw"), "punt": mx.get("punt"), "drop": mx.get("drop"), "wans": {}}}
+    for k in SCALARS:
+        h[k] = avg.get(k)
+    for k, v in avg.items():
+        if k.startswith("r.") and v:
+            h["reasons"][k[2:]] = v
+        elif k.startswith("w."):
+            name, f = k[2:].rsplit(".", 1)
+            h["wans"].setdefault(name, {})[f] = v
+            if f == "rx":
+                h["max"]["wans"][name] = mx.get(k)
+    return h
+
+
+def counter_snapshot(cur):
+    """every counter of a sample, flat: port.<if>.<xstat>, if.<if>.<counter>,
+    offload.<counter>, nat.<counter>, vpp.<gauge>"""
+    out = {}
+    for p in cur.get("ports", []):
+        for k, v in p["natgw"].items():
+            out[f"port.{p['name']}.{k}"] = v
+        for k, v in (p.get("vpp") or {}).items():
+            out[f"if.{p['name']}.{k}"] = v
+    off = cur.get("offload") or {}
+    for k, v in (off.get("counters") or {}).items():
+        out[f"offload.{k}"] = v
+    for k in ("offloaded", "pending"):
+        if off.get(k) is not None:
+            out[f"offload.{k}"] = off[k]
+    for k in ("sessions", "max_sessions"):
+        if (cur.get("nat") or {}).get(k) is not None:
+            out[f"nat.{k}"] = cur["nat"][k]
+    for k in ("vector_rate", "input_rate"):
+        if (cur.get("vpp") or {}).get(k) is not None:
+            out[f"vpp.{k}"] = cur["vpp"][k]
+    return {k: v for k, v in out.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
 
 class Alerts:
@@ -162,7 +192,11 @@ class Collector:
         self.wans = wans
         self.clock = clock
         self.rates = Rates()
-        self.events = EventLog(cfg.store.state_dir)
+        st = cfg.store
+        self.store = Store(st.state_dir, raw_hours=st.raw_hours, retention_days=st.retention_days,
+                           flush_seconds=st.flush_seconds, clock=clock)
+        self.store.import_jsonl(os.path.join(st.state_dir, "events.jsonl"))
+        self.events = EventLog(self.store)
         self.alerts = Alerts(self.events, clock)
         n = int(cfg.store.history_seconds / cfg.alerts.sample_interval) + 1
         self.history = collections.deque(maxlen=n)
@@ -175,33 +209,23 @@ class Collector:
         self.fill_since = None
         self.seen_wan_events = set()
         self.outages = {}           # wan -> open outage record
-        self.closed = collections.deque(maxlen=200)
         self._restore()
         self.events.add({"type": "monitor", "ts": clock(), "detail": "started"})
 
     # ------------------------------------------------------------ persistence
 
     def _restore(self):
-        for r in self.events.loaded:
-            t = r.get("type")
-            if t == "wan":
+        for r in self.store.events(since=self.clock() - self.store.retention):
+            if r.get("type") == "wan":
                 self.seen_wan_events.add(self._wan_event_key(r))
-            elif t == "outage_start":
-                self.outages[r["wan"]] = r
-            elif t == "outage_end":
-                o = self.outages.pop(r["wan"], None)
-                self.closed.append(self._closed(o, r) if o else r)
-        self.events.loaded = []
+        for o in self.store.outages(limit=1000, open_only=True):
+            self.outages[o["wan"]] = {"type": "outage_start", "ts": o["start"], "wan": o["wan"],
+                                      "reason": o["reason"], "snapshot": o["snapshot"]}
 
     @staticmethod
     def _wan_event_key(e):
         return (e.get("ts"), e.get("wan"), e.get("kind"), e.get("to"))
 
-    @staticmethod
-    def _closed(start, end):
-        return {"wan": start["wan"], "start": start["ts"], "end": end["ts"],
-                "duration": end["ts"] - start["ts"], "reason": start.get("reason"),
-                "snapshot": start.get("snapshot")}
 
     # ------------------------------------------------------------ sampling
 
@@ -239,9 +263,11 @@ class Collector:
         self.alerts.update(self._find_alerts(cur, now))
         cur["alerts"] = self.alerts.list()
         cur["outages"] = self.outage_list()
+        compact = self._compact(cur)
         with self.lock:
             self.current = cur
-            self.history.append(self._compact(cur))
+            self.history.append(compact)
+        self.store.add(now, flatten(compact), counter_snapshot(cur) if cur["vpp"]["up"] else None)
         return cur
 
     # ------------------------------------------------------------ VPP side
@@ -411,9 +437,10 @@ class Collector:
     def _wan_events(self, ws):
         if ws is None:
             return
+        old = self.clock() - self.store.retention
         for e in ws.get("events", []):
-            if e.get("kind") not in ("state", "lease"):
-                continue
+            if e.get("kind") not in ("state", "lease") or (e.get("ts") or 0) < old:
+                continue    # (older than the retention: pruned, not to be logged again)
             k = self._wan_event_key(e)
             if k in self.seen_wan_events:
                 continue
@@ -432,6 +459,7 @@ class Collector:
                        "snapshot": self._snapshot(cur, w, start)}
                 self.outages[name] = rec
                 self.events.add(rec)
+                self.store.outage_open(name, start, rec["reason"], rec["snapshot"])
             elif state == "up" and o is not None:
                 end = w.get("since") or now
                 if end < o["ts"]:
@@ -439,7 +467,7 @@ class Collector:
                 rec = {"type": "outage_end", "ts": end, "wan": name, "start": o["ts"],
                        "duration": end - o["ts"], "reason": o.get("reason")}
                 self.events.add(rec)
-                self.closed.append(self._closed(o, rec))
+                self.store.outage_close(name, o["ts"], end)
                 del self.outages[name]
         for w in cur["wans"]:
             o = self.outages.get(w["name"])
@@ -468,11 +496,12 @@ class Collector:
             "nat_sessions": cur.get("nat", {}).get("sessions"),
         }
 
-    def outage_list(self):
+    def outage_list(self, limit=50):
         now = self.clock()
         cur = [{"wan": o["wan"], "start": o["ts"], "end": None, "duration": now - o["ts"],
                 "reason": o.get("reason"), "snapshot": o.get("snapshot")} for o in self.outages.values()]
-        return sorted(cur, key=lambda o: -o["start"]) + list(reversed(self.closed))[:50]
+        closed = [o for o in self.store.outages(limit=limit + len(cur)) if o["end"] is not None]
+        return sorted(cur, key=lambda o: -o["start"]) + closed[:limit]
 
     # ------------------------------------------------------------ alerts
 
@@ -572,16 +601,51 @@ class Collector:
         }
 
     def history_since(self, seconds, max_points=600):
+        """samples for the graphs over the last `seconds`, at most about
+        max_points: averages per bucket, peaks under "max" """
         with self.lock:
             h = list(self.history)
-        if not h:
-            return []
-        t0 = h[-1]["t"] - seconds
-        h = [x for x in h if x["t"] >= t0]
-        if len(h) <= max_points:
-            return h
-        step = len(h) / max_points
-        return [h[int(i * step)] for i in range(max_points)] + [h[-1]]
+        now = h[-1]["t"] if h else self.clock()
+        since = now - seconds
+        if h:
+            covered = h[0]["t"] <= since + 2 * self.cfg.alerts.sample_interval
+            older = self.store.oldest()
+            if covered or older is None or older >= h[0]["t"] - 1:
+                # memory holds all there is (also just after a fresh start)
+                return self._bucketize([x for x in h if x["t"] >= since], seconds, max_points)
+        rows, b = self.store.history(since, now, max_points)
+        return [unflatten(t, a, m, b) for t, a, m in rows]
+
+    @staticmethod
+    def _bucketize(h, seconds, max_points):
+        b = max(1, math.ceil(seconds / max_points))
+        if b == 1:
+            return [dict(x, bucket=1, max={"hw": x["hw"], "punt": x["punt"], "drop": x["drop"],
+                                           "wans": {n: w.get("rx") for n, w in x["wans"].items()}}) for x in h]
+        groups = collections.OrderedDict()
+        for x in h:
+            groups.setdefault(int(x["t"] // b) * b, []).append(flatten(x))
+        out = []
+        for t, fs in groups.items():
+            keys = {k for f in fs for k in f}
+            avg, mx = {}, {}
+            for k in keys:
+                vs = [f[k] for f in fs if f.get(k) is not None]
+                avg[k] = sum(vs) / len(vs) if vs else None
+                mx[k] = max(vs) if vs else None
+            out.append(unflatten(t, avg, mx, b))
+        return out
+
+    def counter_history(self, name, seconds):
+        now = self.clock()
+        return self.store.counter_history(name, now - seconds, now)
+
+    def outages_between(self, seconds):
+        now = self.clock()
+        return self.store.outages_between(now - seconds, now)
+
+    def close(self):
+        self.store.close()
 
     def snapshot(self):
         with self.lock:

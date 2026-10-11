@@ -291,7 +291,7 @@ Expect about a minute of gateway outage per update. If a new image doesn't enume
 The monitor serves a page with the gateway's statistics and the ISPs' state at `https://<NATGW_MONITOR_BIND>:<NATGW_MONITOR_PORT>/`, by default `https://192.168.1.2:8443/`. It only reads VPP's statistics and the WAN manager's status, so it can't affect forwarding.
 
 **What it shows:**
-- **ISPs.** Each WAN's state, for how long, and why. The reason is one of: no reply from its probe targets, link down, administratively down, no DHCP lease, or interface missing. The page also shows the lease, link, whether it's in the default route, inbound and outbound traffic, the last 60 probe rounds and each target's last reply. A banner appears while an ISP is down.
+- **ISPs.** Each WAN's state, for how long, and why. The reason is one of: no reply from its probe targets, link down, administratively down, no DHCP lease, or interface missing. The page also shows the lease, link, whether it's in the default route, inbound and outbound traffic, the last 60 probe rounds and each target's last reply. The headline says when an ISP is down, and the signal path at the top draws its link cut where the fault is.
 - **Outage history.** Start, end, duration, reason, and the evidence when it started: probe results, lease, link, the other ISPs, and the traffic just before.
 - **Alerts:**
   - an ISP down, critical when no ISP is working;
@@ -303,16 +303,17 @@ The monitor serves a page with the gateway's statistics and the ISPs' state at `
   - the on-chip table above 85% for a minute;
   - NAT sessions near the maximum;
   - any rise in: frames with bad FCS, DDR read errors, lost device events, failed tier moves, table-full installs, install queue overflow, given-up installs, rte_flow errors.
-- **Now** tiles:
-  - offload ratio;
-  - packets forwarded by the FPGA and sent to VPP;
+- **Right now** figures:
+  - packets forwarded by the FPGA, sent to VPP, and dropped;
   - on-chip and DDR table fill;
   - offloaded and NAT sessions;
   - VPP.
-- **Graphs** over 1 minute, 10 minutes or an hour, the ports, every raw counter, and the event log.
+- **Graphs** over 10 minutes, an hour, a day or a week. Each has a table view.
+- **The ports, the event log, and every counter.** Any counter can be graphed over the week.
 - **The same data as JSON:**
   - `/api/stats`;
-  - `/api/history?seconds=600`;
+  - `/api/history?seconds=600` (up to a week);
+  - `/api/counter?name=...`;
   - `/api/events?limit=200`;
   - `/healthz`, for an external check.
 
@@ -333,7 +334,7 @@ The monitor serves a page with the gateway's statistics and the ISPs' state at `
 **Troubleshooting:**
 - `journalctl -u natgw-monitor` shows the monitor's log.
 - `kill -USR1 $(systemctl show -p MainPID --value natgw-monitor)` writes every thread's stack to the journal.
-- The event log is `/var/lib/natgw-monitor/events.jsonl`. It's trimmed at 8 MB to the last 20,000 events.
+- History, events and outages are in `/var/lib/natgw-monitor/monitor.db`, an SQLite file of about 40 MB. It holds one-second samples for a day, and minute summaries, counter snapshots and events for a week. Read it with `sqlite3`, for example `SELECT datetime(start, 'unixepoch'), wan, end - start, reason FROM outages`. Retention is set in `[store]` of `monitor.toml`.
 
 ## What has been tested
 

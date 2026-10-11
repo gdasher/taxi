@@ -3,6 +3,7 @@
 outages and their persistence."""
 
 import json
+import sqlite3
 import time
 
 import pytest
@@ -45,8 +46,8 @@ def alert_ids(cur):
 
 
 def events(tmp_path):
-    with open(tmp_path / "events.jsonl") as f:
-        return [json.loads(x) for x in f]
+    db = sqlite3.connect(tmp_path / "monitor.db")
+    return [json.loads(r[0]) for r in db.execute("SELECT data FROM events ORDER BY id")]
 
 
 # ---------------------------------------------------------------- rates

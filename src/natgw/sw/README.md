@@ -59,7 +59,7 @@ The second option matters for shared builds. A shared DPDK autoloads every mempo
 | DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li><li>DDR tier: spill to DDR once on-chip is full, DDR punts carry the DDR index flag, no counters for DDR flows, DDR aging from the activity bitmap; with no DIMM or `no_ddr=1`, ENOSPC at on-chip capacity and no DDR lookups.</li><li>Tier policy: admission at the high-water mark and bulk flows to DDR; idle flows demoted and busy DDR flows promoted, with a probe frame run through the model after every single table command forwarding unchanged throughout; no ping-pong once settled; counters monotonic across demote and promote; `fill` ignores the watermark.</li><li>The flow context lock under load (`lock_stress`, three threads for 3 s): the main thread creates, destroys and queries flows (about 370k each of creates and destroys) while a poll thread runs the policy (over 1,000 promotions and demotions) and a traffic thread checks that every frame of a rotating set of busy flows is forwarded with its exact rewrite (about 2.7M frames). Then flow accounting, no migration failures, every flow forwarding, and a create never waiting more than 20 ms (about 0.2–0.3 ms seen). Moving without the lock crashes it; leaving destroyed flows on the candidate queues hangs it.</li></ul> |
 | VPP integration | `pytest vpp/tests` (VPP and passwordless sudo; skipped otherwise) | Kernel TCP/UDP from namespaces on the model's TAP lanes, through VPP and the model. See below. |
 | WAN manager | `pytest wanmgr/tests` | <ul><li>Unit tests against a fake VPP that models routing and NAT for probes: thresholds, flapping, target fallback, steering, flushing, lease changes, restarts, alert rate limiting and SMTP; the status file's per-WAN detail (why and since when a WAN is down: probe failure, link down, admin down, no lease; probe history and per-target results; event log; written on VPP loss).</li><li>Integration tests with real VPP, the offload plugin, dnsmasq "modems" and an SMTP sink (`tests/site_env.py`, shared with the monitor's tests): startup, an ISP outage, all WANs down, and a VPP restart.</li></ul> |
-| Monitor | `pytest monitor/tests` | <ul><li>Collector against fake sources: rates (32-bit wrap, counter resets), offload ratio and punt reasons, table fill and DDR state, every alert (raise, hold, clear), ISP outages with their evidence snapshot, the event log and outage history across monitor restarts, a stale or missing WAN manager; the stats reader (interface names with slashes, a hung VPP, a restarted VPP whose socket reuses the inode, a segment stuck mid-update).</li><li>The HTTPS server: TLS 1.2 minimum, plain HTTP refused, certificate reload, security headers, read-only methods, binding to an address only, to an interface name, waiting for an interface's address, a stalled client not blocking others, `--check`.</li><li>Integration with real VPP, the WAN manager and two ISPs: counters equal VPP's own (`show natgw offload`, xstats), per-ISP traffic, an ISP outage captured with its reason and evidence and kept across a monitor restart, all ISPs down, a VPP restart, and the page rendered in headless Chromium (light and dark, desktop and phone width: no script errors, no horizontal scrolling) when Playwright is installed.</li></ul> |
+| Monitor | `pytest monitor/tests` | <ul><li>Collector against fake sources: rates (32-bit wrap, counter resets), offload ratio and punt reasons, table fill and DDR state, every alert (raise, hold, clear), ISP outages with their evidence snapshot, the event log and outage history across monitor restarts, a stale or missing WAN manager; the store (tiers and rollup values, minute counter snapshots, batching, retention that keeps open outages, a crash between flushes, readers during writes, importing the old log, a day's size) and graphs from the database after a restart; the stats reader (interface names with slashes, a hung VPP, a restarted VPP whose socket reuses the inode, a segment stuck mid-update).</li><li>The HTTPS server: TLS 1.2 minimum, plain HTTP refused, certificate reload, security headers, read-only methods, binding to an address only, to an interface name, waiting for an interface's address, a stalled client not blocking others, `--check`.</li><li>Integration with real VPP, the WAN manager and two ISPs: counters equal VPP's own (`show natgw offload`, xstats), per-ISP traffic, an ISP outage captured with its reason and evidence and kept across a monitor restart, all ISPs down, a VPP restart, graphs and counter history surviving a monitor restart, and the page in headless Chromium when Playwright is installed (light and dark, desktop and phone width: no script errors, no horizontal scrolling, the bundled typeface loaded, every window, a table view, the keyboard crosshair, a counter graph).</li></ul> |
 
 The VPP integration tests run VPP with `net_natgw_model,wire=tap`. Each lane's TAP is moved into a namespace: one LAN and two WANs, each WAN with a server behind it. A test decides whether traffic was offloaded from what it can observe. Once a flow is offloaded, VPP's interface counters stop growing while its session counters keep growing, because they are synced back from the hardware.
 
@@ -206,15 +206,43 @@ The WAN manager adds the pool addresses: it keeps each WAN's current lease in th
   - VPP's interface, NAT and vector-rate counters.
 - **The WAN manager's status file** (`/run/natgw-wanmgr.json`): each ISP's state, why and since when, lease, link, probe history and per-target results, whether it is in the default route, and recent events.
 
-Every second it computes rates, keeps an hour of history for the graphs, and evaluates alerts. When an ISP goes down it records an outage with the evidence at that moment, and closes it when the ISP is back. Outages, state changes and alerts go to `/var/lib/natgw-monitor/events.jsonl`, so the history survives restarts.
+Every second it computes rates and evaluates alerts. When an ISP goes down it records an outage with the evidence at that moment, and closes it when the ISP is back.
+
+History is stored locally in SQLite (`/var/lib/natgw-monitor/monitor.db`, `natgw_monitor/store.py`), so it survives restarts:
+
+| Tier | Resolution | Kept for | Size |
+|---|---|---|---|
+| Graph series (traffic, punt reasons, tables, tier moves, per-ISP inbound) | every 1 s sample | 24 h | ~17 MB |
+| The same series as min/avg/max | 1 minute | 7 days | ~6 MB |
+| A snapshot of every counter (device xstats, VPP interfaces, offload, NAT) | 1 minute | 7 days | ~13 MB |
+| Events and outages | each one | 7 days (open outages always) | under 1 MB |
+
+How it's stored:
+- **Write pattern.** Samples are written in batches every 10 s, with WAL journaling: a crash loses at most the last batch and never corrupts the file.
+- **Pruning.** Data past its retention is deleted hourly. SQLite reuses the freed pages, so the file stays at about 40 MB.
+- **Graphs.** Graphs choose the tier by window: 1 s data up to a day, minute summaries beyond. Each point is a bucket average, with the bucket's peak drawn as a thin line.
+- **Counters.** Any counter can be graphed over the week from its minute snapshots. A rate between two snapshots is exact; only peaks within a minute are lost.
+
+Evaluated alternatives:
+- **TinyFlux** needed 3.8 GB of memory and 9 s to open a week of 1 s data.
+- **SQLite with a row per value**, or with JSON documents, was 3 to 3.3 times larger.
+
+An `events.jsonl` from earlier versions is imported once and renamed `events.jsonl.imported`.
 
 The page shows:
-- the ISPs, with a banner while one is down;
-- alerts and status tiles;
-- graphs: forwarded vs sent to VPP, offload ratio, punt reasons, per-ISP inbound traffic with outages shaded, table fill, tier moves and DDR hit rate;
-- the outage history, the ports, every raw counter, and the event log.
+- a one-sentence verdict, and the signal path from the LAN through the gateway to each ISP. A down ISP is drawn cut: on its own link when the link or lease is lost, beyond the ISP when its probes go unanswered.
+- alerts, each ISP's evidence (lease, link, route, probe rounds and targets), and current figures;
+- graphs over 10 minutes, an hour, a day or a week. They show forwarded vs sent to VPP, offload share, punt reasons, per-ISP inbound with outages shaded, table fill, tier moves and DDR hit rate. Each graph has a crosshair (also by keyboard) and a table view.
+- the outage history, the ports, the event log, and every counter, each of which can be graphed.
 
-The JSON API (`/api/stats`, `/api/history`, `/api/events`, `/healthz`) serves the same data.
+The page uses one bundled typeface, Atkinson Hyperlegible Next (SIL OFL, `static/fonts`), and nothing from outside: it works with every ISP down. `tests/preview.py` serves it on a synthetic week for work on the page.
+
+The JSON API serves the same data:
+- `/api/stats`;
+- `/api/history?seconds=` (up to 7 days);
+- `/api/events`;
+- `/api/counters` and `/api/counter?name=&seconds=`;
+- `/healthz`.
 
 What it can't see: frames the FPGA forwards are counted per ingress lane, so an ISP's inbound traffic includes the hardware path but its outbound traffic is VPP's only.
 

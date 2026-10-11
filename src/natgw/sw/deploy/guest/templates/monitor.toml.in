@@ -17,7 +17,12 @@ stats_socket = "/run/vpp/stats.sock"
 wanmgr_status = "/run/natgw-wanmgr.json"
 
 [store]
+# monitor.db there: 1 s samples for raw_hours, minute summaries, counter
+# snapshots and events for retention_days (about 40 MB in all)
 state_dir = "/var/lib/natgw-monitor"
+raw_hours = 24
+retention_days = 7
+flush_seconds = 10
 history_seconds = 3600
 
 [alerts]

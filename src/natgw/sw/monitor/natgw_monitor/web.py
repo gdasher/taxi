@@ -3,8 +3,12 @@
 
     GET /                  the page (static/index.html, app.js, style.css)
     GET /api/stats         the current sample: traffic, tables, NAT, VPP, ISPs, alerts, outages
-    GET /api/history?seconds=600   samples for the graphs (at most ~600 points)
+    GET /api/history?seconds=600   samples for the graphs (at most ~600 points; up
+                                   to the retention, 7 days), and the outages in the window
     GET /api/events?limit=200      the event log (WAN, outage, alert, VPP events)
+    GET /api/counters              the names of every stored counter
+    GET /api/counter?name=port.NatgwModel0.rx_forwarded&seconds=86400
+                                   one counter's minute snapshots, and its rate
     GET /healthz           {"ok": true} while the collector is sampling
 
 One listening socket per bound address. [http] bind takes addresses and
@@ -34,7 +38,11 @@ STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 FILES = {"/": ("index.html", "text/html; charset=utf-8"),
          "/index.html": ("index.html", "text/html; charset=utf-8"),
          "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-         "/style.css": ("style.css", "text/css; charset=utf-8")}
+         "/charts.js": ("charts.js", "text/javascript; charset=utf-8"),
+         "/style.css": ("style.css", "text/css; charset=utf-8"),
+         "/fonts/atkinson-hyperlegible-next.woff2": ("fonts/atkinson-hyperlegible-next.woff2", "font/woff2"),
+         "/fonts/OFL-AtkinsonHyperlegibleNext.txt": ("fonts/OFL-AtkinsonHyperlegibleNext.txt",
+                                                     "text/plain; charset=utf-8")}
 CONN_TIMEOUT = 30
 
 
@@ -107,12 +115,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "max-age=86400" if ctype == "font/woff2" else "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Security-Policy",
-                         "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
+                         "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; font-src 'self'; "
                          "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
         if self.server.tls:
             self.send_header("Strict-Transport-Security", "max-age=31536000")
@@ -130,6 +138,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
+        try:
+            self._get()
+        except (ConnectionError, ssl.SSLError, TimeoutError):
+            raise
+        except Exception:
+            log.exception("GET %s", self.path)
+            self._json({"error": "internal error"}, 500)
+
+    def _get(self):
         u = urllib.parse.urlsplit(self.path)
         q = urllib.parse.parse_qs(u.query)
         col = self.server.collector
@@ -141,13 +158,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cur = col.snapshot()
             if cur is None:
                 return self._json({"error": "starting"}, 503)
-            return self._json(dict(cur, hostname=self.server.hostname))
-        if u.path == "/api/history":
+            return self._json(dict(cur, hostname=self.server.hostname, storage=col.store.info()))
+        if u.path in ("/api/history", "/api/counter"):
             try:
-                seconds = min(max(float(q.get("seconds", ["600"])[0]), 10), 86400)
+                seconds = min(max(float(q.get("seconds", ["600"])[0]), 10), col.store.retention)
             except ValueError:
                 return self._json({"error": "seconds: a number"}, 400)
-            return self._json({"samples": col.history_since(seconds)})
+            if u.path == "/api/history":
+                return self._json({"seconds": seconds, "samples": col.history_since(seconds),
+                                   "outages": col.outages_between(seconds)})
+            name = q.get("name", [""])[0]
+            pts = col.counter_history(name, seconds)
+            if pts is None:
+                return self._json({"error": f"no counter {name!r}"}, 404)
+            rates = [[t1, (v1 - v0) / (t1 - t0) if v1 >= v0 and t1 > t0 else None]
+                     for (t0, v0), (t1, v1) in zip(pts, pts[1:])]
+            return self._json({"name": name, "points": pts, "rates": rates})
+        if u.path == "/api/counters":
+            return self._json({"names": col.store.counter_names()})
         if u.path == "/api/events":
             try:
                 limit = min(max(int(q.get("limit", ["200"])[0]), 1), 1000)

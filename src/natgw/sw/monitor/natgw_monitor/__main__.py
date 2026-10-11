@@ -53,6 +53,7 @@ def main(argv=None):
         stop.wait()
         web.stop()
     sampler.join(timeout=5)
+    col.close()     # the last batch of samples
     return 0
 
 

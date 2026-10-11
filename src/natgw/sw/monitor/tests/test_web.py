@@ -84,9 +84,15 @@ def srv(tmp_path):
 
 def test_https_page_and_api(srv):
     r, body = srv.get("/")
-    assert r.status == 200 and b"natgw monitor" in body and r.getheader("Content-Type").startswith("text/html")
-    for f in ("/app.js", "/style.css"):
+    assert r.status == 200 and b'id="path"' in body and r.getheader("Content-Type").startswith("text/html")
+    for f in ("/app.js", "/charts.js", "/style.css", "/fonts/OFL-AtkinsonHyperlegibleNext.txt"):
         assert srv.get(f)[0].status == 200
+    r, body = srv.get("/fonts/atkinson-hyperlegible-next.woff2")
+    assert r.status == 200 and r.getheader("Content-Type") == "font/woff2" and body[:4] == b"wOF2"
+    r, body = srv.get("/api/counters")
+    assert r.status == 200 and "names" in json.loads(body)
+    assert srv.get("/api/counter?name=nope")[0].status == 404
+    assert "storage" in json.loads(srv.get("/api/stats")[1])
     r, body = srv.get("/api/stats")
     st = json.loads(body)
     assert r.status == 200 and st["hostname"] == "natgw-test" and {w["name"] for w in st["wans"]} == {"wan1", "wan2"}

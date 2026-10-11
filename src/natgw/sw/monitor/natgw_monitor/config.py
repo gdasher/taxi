@@ -16,8 +16,11 @@
     wanmgr_status = "/run/natgw-wanmgr.json"
 
     [store]
-    state_dir = "/var/lib/natgw-monitor"   # the event and outage log
-    history_seconds = 3600                 # graphs, kept in memory
+    state_dir = "/var/lib/natgw-monitor"   # monitor.db: statistics, events, outages
+    raw_hours = 24                         # every 1 s sample kept this long
+    retention_days = 7                     # minute rollups, counters and events
+    flush_seconds = 10                     # samples written in batches this often
+    history_seconds = 3600                 # also kept in memory (exact, newest)
 
     [alerts]
     sample_interval = 1.0
@@ -58,6 +61,9 @@ class SourcesConfig:
 @dataclasses.dataclass
 class StoreConfig:
     state_dir: str = "/var/lib/natgw-monitor"
+    raw_hours: float = 24.0
+    retention_days: float = 7.0
+    flush_seconds: float = 10.0
     history_seconds: int = 3600
 
 
@@ -127,8 +133,13 @@ def parse(text):
         raise ConfigError("[alerts]: intervals must be positive")
     if not 0 < a.onchip_fill_pct <= 100:
         raise ConfigError("[alerts] onchip_fill_pct must be 1..100")
-    if cfg.store.history_seconds < 60:
+    st = cfg.store
+    if st.history_seconds < 60:
         raise ConfigError("[store] history_seconds must be at least 60")
+    if not 0 < st.raw_hours <= 24 * st.retention_days:
+        raise ConfigError("[store] raw_hours must be positive and within retention_days")
+    if not 0 < st.retention_days <= 366 or not 0 < st.flush_seconds <= 300:
+        raise ConfigError("[store] retention_days must be 1..366 days, flush_seconds 1..300")
     return cfg
 
 

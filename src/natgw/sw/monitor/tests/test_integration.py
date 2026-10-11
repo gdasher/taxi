@@ -10,6 +10,7 @@ import http.client
 import json
 import os
 import signal
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -202,15 +203,25 @@ def test_isp_outage_is_captured(env):
     assert o["end"] == w["since"] and abs(o["duration"] - (w["since"] - down_at)) < 0.01
     assert 5 <= o["duration"] <= 30
     assert "wan_down:wan1" not in mon.alerts()
-    with open(os.path.join(state, "events.jsonl")) as f:
-        ev = [json.loads(x) for x in f]
+    db = sqlite3.connect(os.path.join(state, "monitor.db"))
+    ev = [json.loads(r[0]) for r in db.execute("SELECT data FROM events ORDER BY id")]
+    db.close()
     assert [e["type"] for e in ev if e["type"].startswith("outage")][-2:] == ["outage_start", "outage_end"]
     assert any(e["type"] == "alert" and e["id"] == "wan_down:wan1" and e["state"] == "cleared" for e in ev)
-    # the history survives a monitor restart
+    # the history survives a monitor restart: outages, graphs, counters
+    before = json.loads(mon.get("/api/history?seconds=120")[1])
     mon.stop()
     mon.start()
     o2 = [x for x in mon.stats()["outages"] if x["wan"] == "wan1"][0]
     assert o2["start"] == o["start"] and o2["end"] == o["end"]
+    after = json.loads(mon.get("/api/history?seconds=120")[1])
+    old = {int(h["t"]) for h in before["samples"]} & {int(h["t"]) for h in after["samples"]}
+    assert len(before["samples"]) > 5 and len(old) >= len(before["samples"]) - 2, \
+        "the graphs keep every sample from before the restart (written on shutdown)"
+    assert any(x["wan"] == "wan1" and x["end"] for x in after["outages"]), "outage marked on the graphs"
+    names = json.loads(mon.get("/api/counters")[1])["names"]
+    assert "port.NatgwModel1.rx_forwarded" in names
+    assert mon.stats()["storage"]["bytes"] > 0
 
 
 def test_all_isps_down_is_critical(env):
@@ -244,15 +255,30 @@ def test_page_renders(env, tmp_path):
                 page.on("pageerror", lambda e: errors.append(str(e)))
                 page.on("console", lambda m: m.type == "error" and errors.append(m.text))
                 page.goto(f"https://127.0.0.1:{mon.port}/")
-                page.wait_for_selector("article.wan.down[data-wan=wan2]", timeout=10000)
-                page.wait_for_function("document.querySelectorAll('#events tbody tr').length > 1", timeout=15000)
-                card = page.inner_text("article.wan.down[data-wan=wan2]")
-                assert "Down for" in card and "no reply from probe targets" in card
-                assert "wan2 DOWN" in page.inner_text("#banner")
+                page.wait_for_selector(".isp[data-wan=wan2][data-state=down]", timeout=10000)
+                page.locator("#events tbody tr").nth(1).wait_for(timeout=15000)
+                card = page.inner_text(".isp[data-wan=wan2]")
+                assert "Down" in card and "no reply from probe targets" in card
+                assert "wan2 down for" in page.inner_text("#status")
+                assert page.get_attribute(".branch[data-wan=wan2] .tail", "class").startswith("break"), \
+                    "the cut is drawn beyond the provider when its probes fail"
                 assert "wan2" in page.inner_text("#alerts")
-                assert "ongoing" in page.inner_text("#outages")
-                assert page.inner_text("#overall") != "all good"
-                # no horizontal scrolling of the page itself
+                assert "Ongoing" in page.inner_text("#outages")
+                assert page.evaluate("document.fonts.check('16px \"Atkinson Hyperlegible Next\"')")
+                # every window loads, and the chart's table view shows the data
+                for w in ("600", "86400", "604800", "3600"):
+                    page.click(f"#window button[data-s='{w}']")
+                    page.wait_for_timeout(400)
+                page.click("#charts .chart >> nth=0 >> text=Show as table")
+                page.locator("#charts .chart-table tbody tr").nth(2).wait_for(timeout=15000)
+                # crosshair by keyboard
+                page.focus("#charts canvas >> nth=0")
+                page.keyboard.press("ArrowLeft")
+                assert page.locator("#charts .tip >> nth=0").is_visible()
+                # a counter's history
+                page.click("text=Device counters on NatgwModel1")
+                page.click("details.counters:has(summary:text('NatgwModel1')) button:text-is('rx_forwarded')")
+                page.wait_for_selector("#counter-chart h3")
                 assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth + 1")
                 page.screenshot(path=str(tmp_path / f"page-{width}-{scheme}.png"), full_page=True)
                 page.close()
