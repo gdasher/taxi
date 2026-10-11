@@ -1,30 +1,44 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""Local time-series and event storage (SQLite, <state_dir>/monitor.db).
+"""Local storage: statistics in DuckDB (<state_dir>/stats.duckdb), events and
+outages in SQLite (<state_dir>/monitor.db).
 
-Three tiers of statistics, and the event log:
+Statistics, three tiers:
 
-  samples    every sample (1 s) of the graph series, for `raw_hours` (24 h)
-  rollup     per minute, min/avg/max of each graph series, for `retention_days`
-  counters   per minute, a snapshot of every counter, for `retention_days`.
-             Rates over any window follow exactly from two snapshots; only
-             peaks inside a minute are lost, and the rollup's max keeps those
-             for the graphed series
+  samples    every sample (1 s) of the graph series, for `raw_days` (30)
+  rollup     per minute, min/avg/max of each graph series, for `retention_days` (365)
+  counters   every `counter_minutes` (1), a snapshot of every counter, for
+             `retention_days`. Rates over any window follow exactly from two
+             snapshots; only peaks between snapshots are lost, and the
+             rollup's max keeps those for the graphed series
+
+DuckDB stores each column compressed and scans only the columns a query
+needs, so long windows of 1 s data stay fast (a month's graph in tens of
+milliseconds) and small. Values are stored as integers at a fixed scale per
+series (rates in whole units; percentages, small rates and up/down
+fractions in hundredths): whole numbers compress several times better than
+full-precision floats. Tables are wide, a column per series, added when a
+series first appears (a new WAN, a new port).
+
+Events and outages stay in SQLite: they are small, written one at a time,
+and an operator can read them with `sqlite3` while the monitor runs (DuckDB
+locks its file to the monitor's process).
+
   events     WAN, outage, alert, VPP and monitor events, for `retention_days`
   outages    one row per ISP outage (end NULL while ongoing); open outages are
              never pruned
 
-The tables are wide (a column per series, added when a series first
-appears: a new WAN, a new port) because that is several times smaller than a
-row per value or a JSON document per sample. Samples are written in batches
-every `flush_seconds`; events at once. WAL journaling: a crash or power loss
-loses at most the last batch and never corrupts the file; the web server's
-threads read through their own connections while the sampler writes. Pruning
-runs hourly; SQLite reuses the freed pages, so the file stops growing after
-the first `retention_days`.
+Samples are written in batches every `flush_seconds`, events at once. Both
+databases journal: a crash loses at most the last batch and corrupts nothing.
+The web server's threads read through their own connections (DuckDB
+cursors, SQLite connections) while the sampler writes. Pruning runs hourly;
+both reuse the freed space, so the files stop growing after the retention.
+DuckDB's memory is capped at `memory_mb` (256): appends pin an uncompressed
+block per column until a checkpoint, about 80 MB for these tables, so much
+less than that fails writes. A fatal DuckDB error (which invalidates the
+connection) reopens the database; at most the batch in flight is lost.
 
-Sizes (graph series ~29 values, ~190 counters; measured with random data,
-real data with many zeros is smaller): samples ~17 MB, rollup ~6 MB,
-counters ~13 MB, events well under 1 MB a week."""
+Sizes at the default retention, measured with realistic data: samples ~80 MB,
+rollup ~64 MB, counters ~270 MB, events a few MB: about 410 MB in all."""
 
 import json
 import logging
@@ -34,10 +48,25 @@ import sqlite3
 import threading
 import time
 
+import duckdb
+
 log = logging.getLogger("natgw-monitor")
 
-DB_NAME = "monitor.db"
+EVENTS_DB = "monitor.db"
+STATS_DB = "stats.duckdb"
 PRUNE_EVERY = 3600.0
+TABLES = ("samples", "rollup", "counters")
+
+# graph series kept in hundredths; everything else in whole units
+HUNDREDTHS = {"ratio", "onchip", "ddr", "hit", "vr", "prom", "dem", "vpp"}
+
+
+def scale_of(name):
+    """the integer scale a graph series or counter is stored at"""
+    base = name.rsplit("|", 1)[0]
+    if base in HUNDREDTHS or base.endswith(".up") or base.startswith("vpp."):
+        return 100
+    return 1
 
 
 def q(name):
@@ -45,37 +74,94 @@ def q(name):
     return '"' + name.replace('"', '""') + '"'
 
 
+def _num(v):
+    return v is not None and not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+
+
 class Store:
-    def __init__(self, state_dir, raw_hours=24.0, retention_days=7.0, flush_seconds=10.0, clock=time.time):
+    def __init__(self, state_dir, raw_days=30.0, retention_days=365.0, counter_minutes=1, flush_seconds=10.0,
+                 memory_mb=256, clock=time.time):
         os.makedirs(state_dir, exist_ok=True)
-        self.path = os.path.join(state_dir, DB_NAME)
-        self.raw_seconds = raw_hours * 3600
+        self.path = os.path.join(state_dir, EVENTS_DB)
+        self.stats_path = os.path.join(state_dir, STATS_DB)
+        self.raw_seconds = raw_days * 86400
         self.retention = retention_days * 86400
+        self.counter_seconds = int(counter_minutes) * 60
         self.flush_seconds = flush_seconds
         self.clock = clock
-        self.lock = threading.Lock()          # the writer connection and the buffers
+        self.lock = threading.Lock()          # the writer connections and the buffers
         self.local = threading.local()
-        self.w = self._connect()
-        self._schema()
-        self.cols = {t: self._columns(t) for t in ("samples", "rollup", "counters")}
+        self.w = self._sqlite()
+        self._events_schema()
+        self.memory_mb = int(memory_mb)
+        self.gen = 0                          # +1 when the DuckDB connection is reopened
+        self._open_stats()
         self.buf = []                         # [(t, {series: value})] not yet written
         self.roll_rows = []                   # finished minutes not yet written
         self.acc_minute = None                # minute being accumulated
         self.acc = {}                         # series -> [min, max, sum, n]
+        self.minute_counters = None
         self.last_flush = clock()
         self.last_prune = 0.0
-        self.minute_counters = None
 
     # ------------------------------------------------------------ setup
 
-    def _connect(self):
+    def _sqlite(self):
         c = sqlite3.connect(self.path, timeout=10, check_same_thread=False, isolation_level=None)
         c.execute("PRAGMA journal_mode=WAL")
         c.execute("PRAGMA synchronous=NORMAL")
         c.execute("PRAGMA busy_timeout=10000")
         return c
 
+    def _events_schema(self):
+        w = self.w
+        w.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
+                  "type TEXT NOT NULL, data TEXT NOT NULL)")
+        w.execute("CREATE INDEX IF NOT EXISTS events_ts ON events (ts)")
+        w.execute("CREATE TABLE IF NOT EXISTS outages (wan TEXT NOT NULL, start REAL NOT NULL, end REAL, "
+                  "reason TEXT, snapshot TEXT, PRIMARY KEY (wan, start))")
+        # statistics of earlier versions (SQLite) are left behind, not migrated
+        old = [r[0] for r in w.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN "
+                                       "('samples', 'rollup', 'counters')")]
+        if old:
+            for t in old:
+                w.execute(f"DROP TABLE {t}")
+            w.execute("VACUUM")
+            log.info("dropped the statistics of an earlier version from %s (now in %s)", self.path, STATS_DB)
+
+    def _open_stats(self):
+        # appending pins an uncompressed 256 KB block per column of each
+        # table's open row group (~300 columns: ~80 MB) until a checkpoint
+        # compresses it: the limit must leave room for that
+        self.d = duckdb.connect(self.stats_path)
+        self.d.execute(f"SET memory_limit = '{self.memory_mb}MB'")
+        self.d.execute("SET threads = 2")
+        for t in TABLES:
+            # no primary key: DuckDB would keep an index of every row in memory
+            self.d.execute(f"CREATE TABLE IF NOT EXISTS {t} (t BIGINT NOT NULL)")
+        self.cols = {t: self._columns(self.d, t) for t in TABLES}
+
+    def _reopen_stats(self, e):
+        """a fatal DuckDB error invalidates the connection until it is
+        reopened; what was not committed is lost"""
+        log.error("statistics database failed (%s); reopening it", e)
+        try:
+            self.d.close()
+        except duckdb.Error:
+            pass
+        self.gen += 1
+        try:
+            self._open_stats()
+        except duckdb.Error:
+            log.exception("reopening %s", self.stats_path)
+
+    @staticmethod
+    def _columns(c, table):
+        return {r[0] for r in c.execute(f"SELECT column_name FROM duckdb_columns() WHERE table_name = '{table}'"
+                                        ).fetchall()} - {"t"}
+
     def _reader(self):
+        """this thread's SQLite connection"""
         c = getattr(self.local, "c", None)
         if c is None:
             c = sqlite3.connect(self.path, timeout=10, isolation_level=None)
@@ -83,25 +169,20 @@ class Store:
             self.local.c = c
         return c
 
-    def _schema(self):
-        w = self.w
-        w.execute("CREATE TABLE IF NOT EXISTS samples (t INTEGER PRIMARY KEY)")
-        w.execute("CREATE TABLE IF NOT EXISTS rollup (t INTEGER PRIMARY KEY)")
-        w.execute("CREATE TABLE IF NOT EXISTS counters (t INTEGER PRIMARY KEY)")
-        w.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
-                  "type TEXT NOT NULL, data TEXT NOT NULL)")
-        w.execute("CREATE INDEX IF NOT EXISTS events_ts ON events (ts)")
-        w.execute("CREATE TABLE IF NOT EXISTS outages (wan TEXT NOT NULL, start REAL NOT NULL, end REAL, "
-                  "reason TEXT, snapshot TEXT, PRIMARY KEY (wan, start))")
-
-    def _columns(self, table):
-        return {r[1] for r in self.w.execute(f"PRAGMA table_info({table})")} - {"t"}
+    def _dreader(self):
+        """this thread's DuckDB cursor"""
+        c = getattr(self.local, "d", None)
+        if c is None or getattr(self.local, "gen", None) != self.gen:
+            c = self.d.cursor()
+            self.local.d = c
+            self.local.gen = self.gen
+        return c
 
     def _ensure(self, table, names):
-        new = [n for n in names if n not in self.cols[table]]
-        for n in new:
-            self.w.execute(f"ALTER TABLE {table} ADD COLUMN {q(n)} REAL")
-            self.cols[table].add(n)
+        for n in names:
+            if n not in self.cols[table]:
+                self.d.execute(f"ALTER TABLE {table} ADD COLUMN {q(n)} BIGINT")
+                self.cols[table].add(n)
 
     def close(self):
         """write everything, including the minute in progress (a restart
@@ -111,6 +192,8 @@ class Store:
                 self._close_minute()
                 self.acc_minute = None
             self._flush_locked()
+            self.d.execute("CHECKPOINT")
+            self.d.close()
             self.w.close()
 
     # ------------------------------------------------------------ statistics
@@ -125,7 +208,7 @@ class Store:
                 self._close_minute()
             self.acc_minute = minute
             for k, v in series.items():
-                if v is None or (isinstance(v, float) and not math.isfinite(v)):
+                if not _num(v):
                     continue
                 a = self.acc.get(k)
                 if a is None:
@@ -146,7 +229,8 @@ class Store:
         row = {}
         for k, (lo, hi, s, n) in self.acc.items():
             row[f"{k}|min"], row[f"{k}|avg"], row[f"{k}|max"] = lo, s / n, hi
-        self.roll_rows.append((self.acc_minute, row, self.minute_counters))
+        snap = self.minute_counters if self.acc_minute % self.counter_seconds == 0 else None
+        self.roll_rows.append((self.acc_minute, row, snap))
         self.acc = {}
         self.minute_counters = None
 
@@ -154,31 +238,50 @@ class Store:
         with self.lock:
             self._flush_locked()
 
-    def _insert(self, table, rows):
-        """rows: [(t, {column: value})], one transaction"""
+    def _insert(self, table, rows, replace=False):
+        """rows: [(t, {column: value})], values scaled to integers; replace:
+        rows already stored for those times go (a minute written at shutdown
+        and again after a restart)"""
         if not rows:
             return
         names = sorted({k for _, r in rows for k in r})
-        self._ensure(table, names)
-        sql = (f"INSERT OR REPLACE INTO {table} (t{''.join(', ' + q(n) for n in names)}) "
-               f"VALUES (?{', ?' * len(names)})")
-        self.w.executemany(sql, [[int(t)] + [r.get(n) for n in names] for t, r in rows])
+        scales = [scale_of(n) for n in names]
+        if replace:
+            self.d.execute(f"DELETE FROM {table} WHERE t IN ({', '.join(str(int(t)) for t, _ in rows)})")
+        # literal values, not bound parameters: every value is an integer or
+        # NULL, and DuckDB's Python binding probes for optional modules
+        # (NumPy, pandas) on every bound parameter, which costs ~20 ms a batch
+        values = []
+        for t, r in rows:
+            vals = [str(int(t))]
+            for n, sc in zip(names, scales):
+                v = r.get(n)
+                vals.append(str(round(v * sc)) if _num(v) else "NULL")
+            values.append(f"({', '.join(vals)})")
+        self.d.execute(f"INSERT INTO {table} (t{''.join(', ' + q(n) for n in names)}) VALUES {', '.join(values)}")
 
     def _flush_locked(self):
         self.last_flush = self.clock()
         if not self.buf and not self.roll_rows:
             return
+        roll = [(m, r) for m, r, _ in self.roll_rows]
+        cnt = [(m, c) for m, _, c in self.roll_rows if c]
         try:
-            self.w.execute("BEGIN")
+            # new columns first: DDL outside the data transaction
+            for table, rows in (("samples", self.buf), ("rollup", roll), ("counters", cnt)):
+                self._ensure(table, sorted({k for _, r in rows for k in r}))
+            self.d.execute("BEGIN")
             self._insert("samples", self.buf)
-            self._insert("rollup", [(m, r) for m, r, _ in self.roll_rows])
-            self._insert("counters", [(m, c) for m, _, c in self.roll_rows if c])
-            self.w.execute("COMMIT")
-        except sqlite3.Error:
+            self._insert("rollup", roll, replace=True)
+            self._insert("counters", cnt, replace=True)
+            self.d.execute("COMMIT")
+        except duckdb.FatalException as e:
+            self._reopen_stats(e)
+        except duckdb.Error:
             log.exception("writing statistics")
             try:
-                self.w.execute("ROLLBACK")
-            except sqlite3.Error:
+                self.d.execute("ROLLBACK")
+            except duckdb.Error:
                 pass
         self.buf = []
         self.roll_rows = []
@@ -191,16 +294,28 @@ class Store:
         self.last_prune = now
         old = now - self.retention
         try:
+            self.d.execute("BEGIN")
+            self.d.execute("DELETE FROM samples WHERE t < ?", [int(now - self.raw_seconds)])
+            self.d.execute("DELETE FROM rollup WHERE t < ?", [int(old)])
+            self.d.execute("DELETE FROM counters WHERE t < ?", [int(old)])
+            self.d.execute("COMMIT")
+            self.d.execute("CHECKPOINT")      # frees the deleted blocks for reuse
+        except duckdb.FatalException as e:
+            self._reopen_stats(e)
+        except duckdb.Error:
+            log.exception("pruning statistics")
+            try:
+                self.d.execute("ROLLBACK")
+            except duckdb.Error:
+                pass
+        try:
             self.w.execute("BEGIN")
-            self.w.execute("DELETE FROM samples WHERE t < ?", (int(now - self.raw_seconds),))
-            self.w.execute("DELETE FROM rollup WHERE t < ?", (int(old),))
-            self.w.execute("DELETE FROM counters WHERE t < ?", (int(old),))
             self.w.execute("DELETE FROM events WHERE ts < ?", (old,))
             self.w.execute("DELETE FROM outages WHERE end IS NOT NULL AND end < ?", (old,))
             self.w.execute("COMMIT")
             self.w.execute("PRAGMA wal_checkpoint(PASSIVE)")
         except sqlite3.Error:
-            log.exception("pruning")
+            log.exception("pruning events")
             try:
                 self.w.execute("ROLLBACK")
             except sqlite3.Error:
@@ -213,64 +328,72 @@ class Store:
 
     # ------------------------------------------------------------ queries
 
+    def _read_columns(self, table):
+        return sorted(self._columns(self._dreader(), table))
+
     def history(self, since, until, max_points=600):
-        """[(t, {series: avg}, {series: max})] for [since, until], at most
-        about max_points buckets: from the 1 s samples while they cover the
-        window, else from the minute rollups"""
-        c = self._reader()
+        """[(t, {series: avg}, {series: max})] for [since, until] in at most
+        about max_points buckets, and the bucket length: from the 1 s samples
+        for windows up to `raw_days`, else from the minute rollups"""
+        c = self._dreader()
         span = max(until - since, 1)
-        if span <= self.raw_seconds:
-            cols = [n for n in self._read_columns(c, "samples")]
+        raw_from, roll_from = c.execute("SELECT (SELECT min(t) FROM samples), (SELECT min(t) FROM rollup)").fetchone()
+        # the 1 s samples, unless they start later than the window and the
+        # rollups go back further (raw_days shortened, or a fresh tier)
+        # (a rollup's minute starts up to 59 s before the first sample in it)
+        covered = raw_from is None or raw_from <= since + 60 or roll_from is None or roll_from >= raw_from - 60
+        if span <= self.raw_seconds and covered:
+            cols = self._read_columns("samples")
             b = max(1, math.ceil(span / max_points))
-            sel = "".join(f", avg({q(n)}), max({q(n)})" for n in cols)
-            rows = c.execute(f"SELECT (t / {b}) * {b} AS bt{sel} FROM samples WHERE t >= ? AND t <= ? "
-                             f"GROUP BY bt ORDER BY bt", (int(since), int(until))).fetchall()
-            out = []
-            for r in rows:
-                avg = {n: r[1 + 2 * i] for i, n in enumerate(cols)}
-                mx = {n: r[2 + 2 * i] for i, n in enumerate(cols)}
-                out.append((r[0], avg, mx))
+            sel = "".join(f", avg({q(n)}) / {scale_of(n)}, max({q(n)}) / {scale_of(n)}" for n in cols)
+            rows = c.execute(f"SELECT (t // {b}) * {b} AS bt{sel} FROM samples WHERE t >= ? AND t <= ? "
+                             f"GROUP BY bt ORDER BY bt", [int(since), int(until)]).fetchall()
+            out = [(r[0], {n: r[1 + 2 * i] for i, n in enumerate(cols)},
+                    {n: r[2 + 2 * i] for i, n in enumerate(cols)}) for r in rows]
             if b == 1:
                 last = out[-1][0] if out else since - 1
                 out += [(t, s, s) for t, s in self.pending() if last < t <= until]
             return out, b
-        allc = self._read_columns(c, "rollup")
+        allc = self._read_columns("rollup")
         series = sorted({n.rsplit("|", 1)[0] for n in allc})
         b = max(60, math.ceil(span / max_points / 60) * 60)
-        sel = ", ".join(f"avg({q(n + '|avg')}), max({q(n + '|max')})" for n in series)
-        rows = c.execute(f"SELECT (t / {b}) * {b} AS bt{', ' + sel if sel else ''} FROM rollup "
-                         f"WHERE t >= ? AND t <= ? GROUP BY bt ORDER BY bt", (int(since), int(until))).fetchall()
+        sel = "".join(f", avg({q(n + '|avg')}) / {scale_of(n)}, max({q(n + '|max')}) / {scale_of(n)}" for n in series)
+        rows = c.execute(f"SELECT (t // {b}) * {b} AS bt{sel} FROM rollup WHERE t >= ? AND t <= ? "
+                         f"GROUP BY bt ORDER BY bt", [int(since), int(until)]).fetchall()
         return [(r[0], {n: r[1 + 2 * i] for i, n in enumerate(series)},
                  {n: r[2 + 2 * i] for i, n in enumerate(series)}) for r in rows], b
 
-    @staticmethod
-    def _read_columns(c, table):
-        return [r[1] for r in c.execute(f"PRAGMA table_info({table})") if r[1] != "t"]
-
     def oldest(self):
         """the time of the oldest stored sample (None: nothing stored)"""
-        r = self._reader().execute("SELECT min(x) FROM (SELECT min(t) AS x FROM samples "
-                                   "UNION ALL SELECT min(t) FROM rollup)").fetchone()
+        r = self._dreader().execute("SELECT least((SELECT min(t) FROM samples), (SELECT min(t) FROM rollup))"
+                                    ).fetchone()
         return r[0]
 
     def counter_names(self):
-        return sorted(self._read_columns(self._reader(), "counters"))
+        return self._read_columns("counters")
 
-    def counter_history(self, name, since, until):
-        """[(t, value)] of one counter, a snapshot a minute"""
-        c = self._reader()
-        if name not in self._read_columns(c, "counters"):
+    def counter_history(self, name, since, until, max_points=600):
+        """[(t, value)] of one counter: the last snapshot in each of at most
+        about max_points buckets"""
+        if name not in self._read_columns("counters"):
             return None
-        return c.execute(f"SELECT t, {q(name)} FROM counters WHERE t >= ? AND t <= ? AND {q(name)} IS NOT NULL "
-                         f"ORDER BY t", (int(since), int(until))).fetchall()
+        b = max(self.counter_seconds, math.ceil((until - since) / max_points / 60) * 60)
+        s = scale_of(name)
+        rows = self._dreader().execute(
+            f"SELECT max(t), arg_max({q(name)}, t) / {s} FROM counters WHERE t >= ? AND t <= ? AND {q(name)} IS NOT NULL "
+            f"GROUP BY t // {b} ORDER BY 1", [int(since), int(until)]).fetchall()
+        return [(t, int(v) if s == 1 else v) for t, v in rows]
 
     def info(self):
         c = self._reader()
-        size = sum(os.path.getsize(self.path + s) for s in ("", "-wal") if os.path.exists(self.path + s))
-        r = c.execute("SELECT (SELECT min(t) FROM samples), (SELECT min(t) FROM rollup), "
-                      "(SELECT count(*) FROM events)").fetchone()
-        return {"path": self.path, "bytes": size, "samples_from": r[0], "rollup_from": r[1], "events": r[2],
-                "raw_hours": self.raw_seconds / 3600, "retention_days": self.retention / 86400}
+        size = 0
+        for p in (self.path, self.path + "-wal", self.stats_path, self.stats_path + ".wal"):
+            if os.path.exists(p):
+                size += os.path.getsize(p)
+        r = self._dreader().execute("SELECT (SELECT min(t) FROM samples), (SELECT min(t) FROM rollup)").fetchone()
+        return {"path": self.stats_path, "events_path": self.path, "bytes": size, "samples_from": r[0],
+                "rollup_from": r[1], "events": c.execute("SELECT count(*) FROM events").fetchone()[0],
+                "raw_days": self.raw_seconds / 86400, "retention_days": self.retention / 86400}
 
     # ------------------------------------------------------------ events and outages
 

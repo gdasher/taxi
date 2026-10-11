@@ -59,7 +59,7 @@ The second option matters for shared builds. A shared DPDK autoloads every mempo
 | DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li><li>DDR tier: spill to DDR once on-chip is full, DDR punts carry the DDR index flag, no counters for DDR flows, DDR aging from the activity bitmap; with no DIMM or `no_ddr=1`, ENOSPC at on-chip capacity and no DDR lookups.</li><li>Tier policy: admission at the high-water mark and bulk flows to DDR; idle flows demoted and busy DDR flows promoted, with a probe frame run through the model after every single table command forwarding unchanged throughout; no ping-pong once settled; counters monotonic across demote and promote; `fill` ignores the watermark.</li><li>The flow context lock under load (`lock_stress`, three threads for 3 s): the main thread creates, destroys and queries flows (about 370k each of creates and destroys) while a poll thread runs the policy (over 1,000 promotions and demotions) and a traffic thread checks that every frame of a rotating set of busy flows is forwarded with its exact rewrite (about 2.7M frames). Then flow accounting, no migration failures, every flow forwarding, and a create never waiting more than 20 ms (about 0.2–0.3 ms seen). Moving without the lock crashes it; leaving destroyed flows on the candidate queues hangs it.</li></ul> |
 | VPP integration | `pytest vpp/tests` (VPP and passwordless sudo; skipped otherwise) | Kernel TCP/UDP from namespaces on the model's TAP lanes, through VPP and the model. See below. |
 | WAN manager | `pytest wanmgr/tests` | <ul><li>Unit tests against a fake VPP that models routing and NAT for probes: thresholds, flapping, target fallback, steering, flushing, lease changes, restarts, alert rate limiting and SMTP; the status file's per-WAN detail (why and since when a WAN is down: probe failure, link down, admin down, no lease; probe history and per-target results; event log; written on VPP loss).</li><li>Integration tests with real VPP, the offload plugin, dnsmasq "modems" and an SMTP sink (`tests/site_env.py`, shared with the monitor's tests): startup, an ISP outage, all WANs down, and a VPP restart.</li></ul> |
-| Monitor | `pytest monitor/tests` | <ul><li>Collector against fake sources: rates (32-bit wrap, counter resets), offload ratio and punt reasons, table fill and DDR state, every alert (raise, hold, clear), ISP outages with their evidence snapshot, the event log and outage history across monitor restarts, a stale or missing WAN manager; the store (tiers and rollup values, minute counter snapshots, batching, retention that keeps open outages, a crash between flushes, readers during writes, importing the old log, a day's size) and graphs from the database after a restart; the stats reader (interface names with slashes, a hung VPP, a restarted VPP whose socket reuses the inode, a segment stuck mid-update).</li><li>The HTTPS server: TLS 1.2 minimum, plain HTTP refused, certificate reload, security headers, read-only methods, binding to an address only, to an interface name, waiting for an interface's address, a stalled client not blocking others, `--check`.</li><li>Integration with real VPP, the WAN manager and two ISPs: counters equal VPP's own (`show natgw offload`, xstats), per-ISP traffic, an ISP outage captured with its reason and evidence and kept across a monitor restart, all ISPs down, a VPP restart, graphs and counter history surviving a monitor restart, and the page in headless Chromium when Playwright is installed (light and dark, desktop and phone width: no script errors, no horizontal scrolling, the bundled typeface loaded, every window, a table view, the keyboard crosshair, a counter graph).</li></ul> |
+| Monitor | `pytest monitor/tests` | <ul><li>Collector against fake sources: rates (32-bit wrap, counter resets), offload ratio and punt reasons, table fill and DDR state, every alert (raise, hold, clear), ISP outages with their evidence snapshot, the event log and outage history across monitor restarts, a stale or missing WAN manager; the store (tiers and rollup values at their integer scales, minute counter snapshots, batching, a minute rewritten after a restart, retention that keeps open outages, a crash between flushes, readers during writes, reopening after a fatal DuckDB error, importing the old log, the daily growth) and graphs from the database after a restart; the stats reader (interface names with slashes, a hung VPP, a restarted VPP whose socket reuses the inode, a segment stuck mid-update).</li><li>The HTTPS server: TLS 1.2 minimum, plain HTTP refused, certificate reload, security headers, read-only methods, binding to an address only, to an interface name, waiting for an interface's address, a stalled client not blocking others, `--check`.</li><li>Integration with real VPP, the WAN manager and two ISPs: counters equal VPP's own (`show natgw offload`, xstats), per-ISP traffic, an ISP outage captured with its reason and evidence and kept across a monitor restart, all ISPs down, a VPP restart, graphs and counter history surviving a monitor restart, and the page in headless Chromium when Playwright is installed (light and dark, desktop and phone width: no script errors, no horizontal scrolling, the bundled typeface loaded, every window, a table view, the keyboard crosshair, a counter graph).</li></ul> |
 
 The VPP integration tests run VPP with `net_natgw_model,wire=tap`. Each lane's TAP is moved into a namespace: one LAN and two WANs, each WAN with a server behind it. A test decides whether traffic was offloaded from what it can observe. Once a flow is offloaded, VPP's interface counters stop growing while its session counters keep growing, because they are synced back from the hardware.
 
@@ -208,38 +208,56 @@ The WAN manager adds the pool addresses: it keeps each WAN's current lease in th
 
 Every second it computes rates and evaluates alerts. When an ISP goes down it records an outage with the evidence at that moment, and closes it when the ISP is back.
 
-History is stored locally in SQLite (`/var/lib/natgw-monitor/monitor.db`, `natgw_monitor/store.py`), so it survives restarts:
+History is stored locally (`natgw_monitor/store.py`), so it survives restarts. Statistics are in DuckDB (`/var/lib/natgw-monitor/stats.duckdb`); events and outages are in SQLite (`monitor.db`):
 
-| Tier | Resolution | Kept for | Size |
+| Tier | Resolution | Kept for | Size (measured) |
 |---|---|---|---|
-| Graph series (traffic, punt reasons, tables, tier moves, per-ISP inbound) | every 1 s sample | 24 h | ~17 MB |
-| The same series as min/avg/max | 1 minute | 7 days | ~6 MB |
-| A snapshot of every counter (device xstats, VPP interfaces, offload, NAT) | 1 minute | 7 days | ~13 MB |
-| Events and outages | each one | 7 days (open outages always) | under 1 MB |
+| Graph series (traffic, punt reasons, tables, tier moves, per-ISP inbound) | every 1 s sample | 30 days | ~80 MB |
+| The same series as min/avg/max | 1 minute | 1 year | ~64 MB |
+| A snapshot of every counter (device xstats, VPP interfaces, offload, NAT) | 1 minute (`counter_minutes`) | 1 year | ~270 MB |
+| Events and outages (SQLite) | each one | 1 year (open outages always) | a few MB |
+
+That's about 410 MB of data. DuckDB's file also carries free space that it reuses as old data is pruned, so plan for 1 GB of disk. All retentions are settings (`[store]`).
+
+**Why DuckDB for statistics.** It compresses each column and scans only the columns a graph needs, so long windows of fine data stay small and fast. Measured on monitor-shaped data:
+
+| | SQLite | DuckDB |
+|---|---|---|
+| 30 days of 1 s graph data | 206–484 MB | 80 MB |
+| A month's graph from 1 s data | 2.6–3.3 s | 23–44 ms |
+| Every counter at 1 s for a week | 800 MB | 253 MB |
+
+Values are stored as integers at a fixed scale per series: rates in whole units; percentages, small rates and up/down fractions in hundredths. Whole numbers compress 2–4 times better than full-precision floats. How noisy the real per-second rates are moves the 1 s tier by up to about 3 times.
+
+**Costs of DuckDB:**
+- **The lock.** Its file is locked to the monitor's process, so read statistics through the JSON API. Events and outages stay in SQLite so that `sqlite3` can read them while the monitor runs.
+- **Memory.** Appends hold an uncompressed 256 KB block per column (about 300 columns, ~80 MB) until a checkpoint compresses them. The cache is capped at `memory_mb` (256), and the process peaks near 400 MB; a 64 MB cap made writes fail.
+- **Fatal errors.** A fatal DuckDB error invalidates the connection. The store then reopens it, losing at most the batch being written.
+- **The package.** `duckdb` is pinned (`requirements.txt`, and the setup script). Its Python binding probes for NumPy and pandas on every bound parameter, about 20 ms per write, so rows are written as literal integer values instead.
 
 How it's stored:
-- **Write pattern.** Samples are written in batches every 10 s, with WAL journaling: a crash loses at most the last batch and never corrupts the file.
-- **Pruning.** Data past its retention is deleted hourly. SQLite reuses the freed pages, so the file stays at about 40 MB.
-- **Graphs.** Graphs choose the tier by window: 1 s data up to a day, minute summaries beyond. Each point is a bucket average, with the bucket's peak drawn as a thin line.
-- **Counters.** Any counter can be graphed over the week from its minute snapshots. A rate between two snapshots is exact; only peaks within a minute are lost.
+- **Write pattern.** Samples are written in batches every 10 s, about 7 ms per batch. Both stores journal: a crash loses at most the last batch and corrupts nothing.
+- **Pruning.** Data past its retention is deleted hourly, followed by a DuckDB checkpoint, so freed space is reused. In a three-week rolling test the file stayed flat.
+- **Graphs.** Graphs choose the tier by window: 1 s data up to 30 days (unless the summaries reach further back), minute summaries beyond. Each point is a bucket average, with the bucket's peak drawn as a thin line.
+- **Counters.** Any counter can be graphed over the year, from its snapshots: a rate between two snapshots is exact.
 
-Evaluated alternatives:
+Also evaluated:
 - **TinyFlux** needed 3.8 GB of memory and 9 s to open a week of 1 s data.
 - **SQLite with a row per value**, or with JSON documents, was 3 to 3.3 times larger.
 
-An `events.jsonl` from earlier versions is imported once and renamed `events.jsonl.imported`.
+An `events.jsonl` from the first version is imported once and renamed `events.jsonl.imported`. Statistics from the SQLite-only version are dropped from `monitor.db`, not migrated; it was never deployed.
 
 The page shows:
 - a one-sentence verdict, and the signal path from the LAN through the gateway to each ISP. A down ISP is drawn cut: on its own link when the link or lease is lost, beyond the ISP when its probes go unanswered.
 - alerts, each ISP's evidence (lease, link, route, probe rounds and targets), and current figures;
-- graphs over 10 minutes, an hour, a day or a week. They show forwarded vs sent to VPP, offload share, punt reasons, per-ISP inbound with outages shaded, table fill, tier moves and DDR hit rate. Each graph has a crosshair (also by keyboard) and a table view.
+- graphs over 10 minutes, an hour, a day, a week, 30 days or a year. They show forwarded vs sent to VPP, offload share, punt reasons, per-ISP inbound with outages shaded, table fill, tier moves and DDR hit rate. Each graph has a crosshair (also by keyboard) and a table view.
 - the outage history, the ports, the event log, and every counter, each of which can be graphed.
 
 The page uses one bundled typeface, Atkinson Hyperlegible Next (SIL OFL, `static/fonts`), and nothing from outside: it works with every ISP down. `tests/preview.py` serves it on a synthetic week for work on the page.
 
 The JSON API serves the same data:
 - `/api/stats`;
-- `/api/history?seconds=` (up to 7 days);
+- `/api/history?seconds=` (up to the retention, a year);
 - `/api/events`;
 - `/api/counters` and `/api/counter?name=&seconds=`;
 - `/healthz`.

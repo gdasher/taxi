@@ -1,0 +1,3 @@
+# natgw monitor: Python 3.11+ standard library, plus
+duckdb==1.5.5
+# vpp_papi comes from the VPP tree (src/vpp-api/python), not PyPI

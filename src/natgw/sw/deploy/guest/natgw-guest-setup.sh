@@ -39,6 +39,7 @@ done
 HERE=$(cd "$(dirname "$0")" && pwd)
 ENV=/etc/natgw/deploy.env
 CARD_ID=1234:c001
+MONITOR_DUCKDB=1.5.5     # DuckDB for the monitor's statistics (see sw/monitor)
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf 'natgw-guest-setup: %s\n' "$*" >&2; exit 1; }
@@ -164,7 +165,9 @@ install_monitor() {
 	rm -rf "$NATGW_PREFIX/monitor/natgw_monitor"
 	cp -r "$NATGW_SRC/taxi/src/natgw/sw/monitor/natgw_monitor" "$NATGW_PREFIX/monitor/"
 	find "$NATGW_PREFIX/monitor" -name __pycache__ -prune -exec rm -rf {} +
-	PYTHONPATH="$NATGW_PREFIX/monitor" "$NATGW_PREFIX/venv/bin/python" -c "import natgw_monitor.web, vpp_papi.vpp_stats"
+	# the statistics store (natgw_monitor/store.py); the version is pinned
+	"$NATGW_PREFIX/venv/bin/pip" install -q "duckdb==$MONITOR_DUCKDB"
+	PYTHONPATH="$NATGW_PREFIX/monitor" "$NATGW_PREFIX/venv/bin/python" -c "import natgw_monitor.store, natgw_monitor.web, vpp_papi.vpp_stats"
 }
 
 # the monitor's certificate: the one named in deploy.env, else a self-signed

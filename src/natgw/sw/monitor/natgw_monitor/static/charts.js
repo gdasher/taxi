@@ -38,6 +38,7 @@
 
   function clock(t, span) {
     const d = new Date(t * 1000);
+    if (span > 8 * 86400) return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
     if (span > 2 * 86400) return d.toLocaleDateString(undefined, { weekday: "short" }) + " " +
       d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
     return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: span <= 900 ? "2-digit" : undefined });

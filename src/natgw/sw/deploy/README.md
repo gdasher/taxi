@@ -308,11 +308,11 @@ The monitor serves a page with the gateway's statistics and the ISPs' state at `
   - on-chip and DDR table fill;
   - offloaded and NAT sessions;
   - VPP.
-- **Graphs** over 10 minutes, an hour, a day or a week. Each has a table view.
-- **The ports, the event log, and every counter.** Any counter can be graphed over the week.
+- **Graphs** over 10 minutes, an hour, a day, a week, 30 days or a year. Each has a table view.
+- **The ports, the event log, and every counter.** Any counter can be graphed over the year.
 - **The same data as JSON:**
   - `/api/stats`;
-  - `/api/history?seconds=600` (up to a week);
+  - `/api/history?seconds=600` (up to a year);
   - `/api/counter?name=...`;
   - `/api/events?limit=200`;
   - `/healthz`, for an external check.
@@ -334,7 +334,15 @@ The monitor serves a page with the gateway's statistics and the ISPs' state at `
 **Troubleshooting:**
 - `journalctl -u natgw-monitor` shows the monitor's log.
 - `kill -USR1 $(systemctl show -p MainPID --value natgw-monitor)` writes every thread's stack to the journal.
-- History, events and outages are in `/var/lib/natgw-monitor/monitor.db`, an SQLite file of about 40 MB. It holds one-second samples for a day, and minute summaries, counter snapshots and events for a week. Read it with `sqlite3`, for example `SELECT datetime(start, 'unixepoch'), wan, end - start, reason FROM outages`. Retention is set in `[store]` of `monitor.toml`.
+- **Statistics** are in `/var/lib/natgw-monitor/stats.duckdb` (DuckDB):
+  - one-second samples for 30 days;
+  - minute summaries and a snapshot of every counter each minute, for a year.
+
+  That's about 410 MB once a year has accumulated; plan for 1 GB of disk.
+- **Reading them.** DuckDB locks the file to the monitor while it runs, so read statistics through the API (`/api/history`, `/api/counter`).
+- **Events and outages** are in `monitor.db` (SQLite), kept for a year. You can read them while the monitor runs, for example `sqlite3 /var/lib/natgw-monitor/monitor.db "SELECT datetime(start, 'unixepoch'), wan, end - start, reason FROM outages"`.
+- **Retention** is set in `[store]` of `monitor.toml`.
+- **Memory.** The monitor uses up to about 400 MB, mostly DuckDB's cache (`memory_mb`, 256). The service is limited to 1 GB.
 
 ## What has been tested
 

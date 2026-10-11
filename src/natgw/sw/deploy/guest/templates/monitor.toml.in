@@ -17,11 +17,15 @@ stats_socket = "/run/vpp/stats.sock"
 wanmgr_status = "/run/natgw-wanmgr.json"
 
 [store]
-# monitor.db there: 1 s samples for raw_hours, minute summaries, counter
-# snapshots and events for retention_days (about 40 MB in all)
+# stats.duckdb there: 1 s samples for raw_days, minute summaries and counter
+# snapshots for retention_days; monitor.db: events and outages, as long.
+# About 410 MB of data at these settings (plan 1 GB of disk); the service
+# peaks near 400 MB of memory with memory_mb = 256
 state_dir = "/var/lib/natgw-monitor"
-raw_hours = 24
-retention_days = 7
+raw_days = 30
+retention_days = 365
+counter_minutes = 1
+memory_mb = 256
 flush_seconds = 10
 history_seconds = 3600
 

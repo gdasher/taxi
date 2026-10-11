@@ -17,7 +17,7 @@ events) fills in what happened while the monitor was not running.
 
 History: the last hour is kept in memory as well (exact, and for outage
 snapshots); longer windows, or windows from before a restart, come from the
-database: 1 s samples for a day, minute min/avg/max beyond."""
+database: 1 s samples for 30 days, minute min/avg/max beyond."""
 
 import collections
 import logging
@@ -193,8 +193,9 @@ class Collector:
         self.clock = clock
         self.rates = Rates()
         st = cfg.store
-        self.store = Store(st.state_dir, raw_hours=st.raw_hours, retention_days=st.retention_days,
-                           flush_seconds=st.flush_seconds, clock=clock)
+        self.store = Store(st.state_dir, raw_days=st.raw_days, retention_days=st.retention_days,
+                           counter_minutes=st.counter_minutes, flush_seconds=st.flush_seconds,
+                           memory_mb=st.memory_mb, clock=clock)
         self.store.import_jsonl(os.path.join(st.state_dir, "events.jsonl"))
         self.events = EventLog(self.store)
         self.alerts = Alerts(self.events, clock)

@@ -16,9 +16,11 @@
     wanmgr_status = "/run/natgw-wanmgr.json"
 
     [store]
-    state_dir = "/var/lib/natgw-monitor"   # monitor.db: statistics, events, outages
-    raw_hours = 24                         # every 1 s sample kept this long
-    retention_days = 7                     # minute rollups, counters and events
+    state_dir = "/var/lib/natgw-monitor"   # stats.duckdb (statistics), monitor.db (events, outages)
+    raw_days = 30                          # every 1 s sample kept this long
+    retention_days = 365                   # minute rollups, counter snapshots, events
+    counter_minutes = 1                    # a snapshot of every counter this often
+    memory_mb = 256                        # DuckDB's memory limit (128 at least)
     flush_seconds = 10                     # samples written in batches this often
     history_seconds = 3600                 # also kept in memory (exact, newest)
 
@@ -61,8 +63,10 @@ class SourcesConfig:
 @dataclasses.dataclass
 class StoreConfig:
     state_dir: str = "/var/lib/natgw-monitor"
-    raw_hours: float = 24.0
-    retention_days: float = 7.0
+    raw_days: float = 30.0
+    retention_days: float = 365.0
+    counter_minutes: int = 1
+    memory_mb: int = 256
     flush_seconds: float = 10.0
     history_seconds: int = 3600
 
@@ -136,10 +140,14 @@ def parse(text):
     st = cfg.store
     if st.history_seconds < 60:
         raise ConfigError("[store] history_seconds must be at least 60")
-    if not 0 < st.raw_hours <= 24 * st.retention_days:
-        raise ConfigError("[store] raw_hours must be positive and within retention_days")
-    if not 0 < st.retention_days <= 366 or not 0 < st.flush_seconds <= 300:
-        raise ConfigError("[store] retention_days must be 1..366 days, flush_seconds 1..300")
+    if not 0 < st.raw_days <= st.retention_days:
+        raise ConfigError("[store] raw_days must be positive and no more than retention_days")
+    if not 0 < st.retention_days <= 3660 or not 0 < st.flush_seconds <= 300:
+        raise ConfigError("[store] retention_days must be up to 3660 days, flush_seconds 1..300")
+    if not isinstance(st.counter_minutes, int) or not 1 <= st.counter_minutes <= 60 or 60 % st.counter_minutes:
+        raise ConfigError("[store] counter_minutes must divide an hour (1, 2, 5, 10, 15, 30 or 60)")
+    if not isinstance(st.memory_mb, int) or st.memory_mb < 128:
+        raise ConfigError("[store] memory_mb must be at least 128")
     return cfg
 
 

@@ -30,7 +30,8 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-MemoryMax=512M
+# DuckDB's cache is capped at [store] memory_mb (256 MB); the process peaks near 400 MB
+MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target

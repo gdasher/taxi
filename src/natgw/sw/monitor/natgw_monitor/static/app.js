@@ -6,7 +6,7 @@
 
 const STATS_MS = 2000;
 const EVENTS_MS = 10000;
-const HISTORY_MS = { 600: 2000, 3600: 5000, 86400: 30000, 604800: 60000 };
+const HISTORY_MS = { 600: 2000, 3600: 5000, 86400: 30000, 604800: 60000, 2592000: 300000, 31536000: 600000 };
 let windowSeconds = 3600;
 let last = null;
 let historyTimer = null;
@@ -288,7 +288,7 @@ function renderOutages(cur) {
     h("td", { class: x.end ? "when" : "when bad-text" }, x.end ? when(x.end) : "Ongoing"),
     h("td", { class: "n" }, dur(x.duration)), h("td", null, x.reason || ""),
     h("td", { class: "evidence" }, evidence(x.snapshot))))
-    : h("tr", null, h("td", { class: "empty", colspan: 6 }, "No outages in the last week.")));
+    : h("tr", null, h("td", { class: "empty", colspan: 6 }, "No outages in the last year.")));
 }
 
 function eventText(e) {
@@ -433,9 +433,10 @@ function wanSeries() {
 
 function resolutionNote(samples) {
   const b = samples.length ? samples[samples.length - 1].bucket || 1 : 1;
-  const each = b === 1 ? "Each point is one second." :
-    `Each point averages ${b >= 60 ? `${b / 60} minute${b === 60 ? "" : "s"}` : `${b} seconds`}; the thin lines show the peak.`;
-  return `${each} One-second samples are kept for a day, one-minute summaries for a week.`;
+  const span = b >= 86400 ? `${+(b / 86400).toFixed(1)} days` : b >= 3600 ? `${+(b / 3600).toFixed(1)} hours`
+    : b >= 60 ? `${b / 60} minute${b === 60 ? "" : "s"}` : `${b} seconds`;
+  const each = b === 1 ? "Each point is one second." : `Each point averages ${span}; the thin lines show the peak.`;
+  return `${each} One-second samples are kept for 30 days, one-minute summaries for a year.`;
 }
 
 async function loadHistory() {

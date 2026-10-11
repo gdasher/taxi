@@ -99,11 +99,14 @@ def seed(state_dir, now):
         cnt["port.NatgwModel1.rx_forwarded"] += int((row.get("hw|avg") or 0) * 0.3 * 60)
         counters.append((m, dict(cnt)))
     with st.lock:
-        st.w.execute("BEGIN")
+        for table, rows in (("rollup", roll), ("counters", counters), ("samples", raw)):
+            st._ensure(table, sorted({k for _, r in rows for k in r}))
+        st.d.execute("BEGIN")
+        for i in range(0, len(raw), 5000):      # literal VALUES: keep the statements modest
+            st._insert("samples", raw[i:i + 5000])
         st._insert("rollup", roll)
         st._insert("counters", counters)
-        st._insert("samples", raw)
-        st.w.execute("COMMIT")
+        st.d.execute("COMMIT")
     for ago, length, w, reason in PAST_OUTAGES:
         t0 = now - ago
         st.add_event({"type": "wan", "ts": t0, "wan": w, "kind": "state", "from": "up", "to": "down", "detail": reason})
@@ -184,7 +187,7 @@ def serve(port=0, state_dir=None, stop=None, tls=False, cert=None, key=None):
     """start a preview monitor; returns (web, collector, stop event)"""
     state_dir = state_dir or tempfile.mkdtemp(prefix="natgw-preview-")
     now = time.time()
-    if not os.path.exists(os.path.join(state_dir, "monitor.db")):
+    if not os.path.exists(os.path.join(state_dir, "stats.duckdb")):
         seed(state_dir, now)
     cfg = config.parse(f"""
 [http]

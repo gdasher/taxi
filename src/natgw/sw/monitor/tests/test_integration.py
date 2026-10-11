@@ -266,7 +266,7 @@ def test_page_renders(env, tmp_path):
                 assert "Ongoing" in page.inner_text("#outages")
                 assert page.evaluate("document.fonts.check('16px \"Atkinson Hyperlegible Next\"')")
                 # every window loads, and the chart's table view shows the data
-                for w in ("600", "86400", "604800", "3600"):
+                for w in ("600", "86400", "604800", "2592000", "31536000", "3600"):
                     page.click(f"#window button[data-s='{w}']")
                     page.wait_for_timeout(400)
                 page.click("#charts .chart >> nth=0 >> text=Show as table")
@@ -307,6 +307,10 @@ def test_vpp_restart(env):
         return st and st["vpp"]["up"] and st["vpp"]["boottime"] != boot and st["wanmgr"]["up"] and \
             all(w["state"] == "up" for w in st["wans"]) and len(st["ports"]) == 3 and st
     wait_for(back, timeout=60, interval=0.5, what="monitor sees VPP and both WANs back")
+    # traffic needs more than the monitor's verdict: the WAN manager's
+    # default route back through both modems (as its own restart test waits)
+    wait_for(lambda: site.api_default_paths() == sorted(w["modem"] for w in WANS.values()), timeout=30,
+             what="default route re-applied")
     ev = json.loads(mon.get("/api/events?limit=500")[1])["events"]
     if not any(e["type"] == "vpp" and e["to"] in ("down", "restarted") for e in ev):
         with open(os.path.join(mon.dir, "events.json"), "w") as f:
