@@ -19,7 +19,9 @@ For the cabling, VLANs and every address, see the [wiring diagram and configurat
 ## What you need
 
 - **Server:** the Proxmox VE node that will hold the U200, running Proxmox VE 8. The recommended VM uses a virtual IOMMU (the `viommu` machine option of current 8.x releases). Without it, see step 5.
-- **The card:** an Alveo U200, with the natgw bitstream (`fpga_AU200_nat`) built from the `natgw` branch.
+- **The card:** an Alveo U200, with the natgw DDR bitstream (`fpga_AU200_nat_ddr`) built from the `natgw-ddr4` branch.
+  - The DDR tier uses the DIMM in channel C2. The U200 ships with all four DDR4 DIMMs fitted, so a stock card needs nothing more.
+  - The on-chip-only bitstream (`fpga_AU200_nat`) also runs with this branch's software, with the same configuration. Without the DDR tier, the card offloads about 128k sessions instead of 1M.
 - **For the first flash:** a machine with Vivado or Vivado Lab Edition and a micro-USB cable to the U200's maintenance port.
 - **The switch:** a Cisco Nexus 93108TC-FX (step 3). Also one short QSFP28 passive DAC per used U200 cage.
 - **The ISO:** Ubuntu Server 24.04 LTS, uploaded to the node's ISO storage.
@@ -50,9 +52,11 @@ The card has to boot the natgw design from its own flash to appear on PCIe as `1
 On the build machine, with the U200 installed and powered in the server and its micro-USB port connected:
 
 ```
-cd taxi/src/cndm/board/Alveo/fpga/fpga_AU200_nat
+cd taxi/src/cndm/board/Alveo/fpga/fpga_AU200_nat_ddr
 make flash        # builds fpga.mcs from fpga.bit and programs the configuration flash over JTAG
 ```
+
+The build places 256k flows on chip and 4M in DDR (`NAT_DDR_BUCKET_W=20`, 256 MB of the DIMM). It meets timing with little slack (WNS +0.011 ns). If a build misses timing, `NAT_BUCKET_W=14 make flash` (128k on chip) has more slack.
 
 Keep a copy of this bitstream as your known-good (golden) image. Power-cycle the server (a full power cycle, not a warm reboot). Then check on the host that the card enumerates:
 
@@ -95,7 +99,7 @@ Use a Linux bridge for the LAN (for example `vmbr1` on the NIC cabled to a VLAN 
 
 ```
 apt-get install -y git
-git clone --depth 1 -b natgw https://github.com/gdasher/taxi /root/natgw-taxi
+git clone --depth 1 -b natgw-ddr4 https://github.com/gdasher/taxi /root/natgw-taxi
 cd /root/natgw-taxi/src/natgw/sw/deploy/host
 ```
 
@@ -171,7 +175,7 @@ In the VM, as root:
 
 ```
 apt-get install -y git
-git clone --depth 1 -b natgw https://github.com/gdasher/taxi /opt/natgw/src/taxi
+git clone --depth 1 -b natgw-ddr4 https://github.com/gdasher/taxi /opt/natgw/src/taxi
 /opt/natgw/src/taxi/src/natgw/sw/deploy/guest/natgw-guest-setup.sh
 ```
 
@@ -179,6 +183,7 @@ The first run writes `/etc/natgw/deploy.env` and stops. Edit it:
 - LAN addresses and DHCP range;
 - DNS upstreams;
 - the CPU VPP polls on (a vCPU other than 0);
+- the NAT session limit, 1M by default (see *Flow tables and the DDR tier* in step 10);
 - where the monitor's page is served (`NATGW_MONITOR_BIND`, `NATGW_MONITOR_PORT`; see step 11);
 - the Proxmox host's address and this VM's ID, used for FPGA updates.
 
@@ -191,14 +196,16 @@ reboot
 
 What the script does:
 1. **Packages:** installs build tools.
-2. **Sources:** clones `taxi`, `dpdk` and `vpp` (branch `natgw`) into `/opt/natgw/src`.
+2. **Sources:** clones `taxi` (branch `natgw-ddr4`, `NATGW_BRANCH`), and `dpdk` and `vpp` (branch `natgw`) into `/opt/natgw/src`.
 3. **DPDK:** builds and installs it to `/usr/local`.
    - Only the drivers the gateway uses are included: the PCI, vdev and VMBus buses (VPP needs all three), ring and stack mempools, `common_natgw`, `net_cndm` and `net_natgw_model`.
    - It's built for generic x86-64 (`platform=generic`), never for the build machine's CPU, so the same build runs on any server.
 4. **VPP:** builds it with the nat44-ed hooks and the `natgw_offload` plugin into `/opt/natgw/vpp`.
 5. **WAN manager and monitor:** installs them into `/opt/natgw/wanmgr` and `/opt/natgw/monitor`, with a virtualenv holding `vpp_papi`.
 6. **Configuration:** writes it from templates:
-   - `/etc/vpp/startup.conf`, with the card's PCI address detected. The device's counters reach the stats segment every second.
+   - `/etc/vpp/startup.conf`, with the card's PCI address detected and any `NATGW_CARD_DEVARGS`. The device's counters reach the stats segment every second.
+     - VPP's main heap is 2 GB (`NATGW_VPP_HEAP`). nat44-ed preallocates its sessions there: 430 MB for 1M.
+     - The offload plugin's sync budget follows the session limit (limit ÷ 64, at least 4096), so each session is synced at least every 64 s.
    - `/etc/vpp/natgw.cli`.
    - `/etc/natgw/wanmgr.toml`, only if missing.
    - `/etc/natgw/monitor.toml`, regenerated from `deploy.env` on every run.
@@ -219,6 +226,8 @@ systemctl status vpp natgw-wanmgr
 vppctl show interface                     # CndmEthernet0..7, LAN, WAN1 and WAN2 up
 vppctl show hardware-interfaces CndmEthernet0 detail | grep natgw_   # shim counters
 vppctl show natgw offload
+vppctl show hardware-interfaces CndmEthernet0 detail | grep -E 'natgw_(ddr_status|onchip_capacity|ddr_capacity)'
+                                          # 23 (present, calibrated, enabled, active), 262144, 4194304
 cat /run/natgw-wanmgr.json                # WAN states and leases
 systemctl status natgw-monitor            # then open https://192.168.1.2:8443/ (step 11)
 ```
@@ -275,6 +284,15 @@ If something goes wrong:
 - **Errors** are logged. The VM still starts unless `NATGW_STRICT=yes` is set in `/etc/natgw/fpga.conf`.
 - **Reloading at every start:** set `NATGW_RELOAD_ON_START=yes` to fully reset the card at each start (about 10 s extra).
 
+**Moving a gateway from the `natgw` branch to the DDR tier.** In the VM, switch the taxi checkout first: the setup script from the `natgw` branch would ask for `natgw-ddr4` in the DPDK and VPP repositories too.
+
+```
+git -C /opt/natgw/src/taxi fetch origin +refs/heads/natgw-ddr4:refs/remotes/origin/natgw-ddr4
+git -C /opt/natgw/src/taxi checkout -B natgw-ddr4 origin/natgw-ddr4
+```
+
+In `/etc/natgw/deploy.env`, set `NATGW_BRANCH=natgw-ddr4` and `NATGW_NAT_SESSIONS=1048576`. The other new settings take their defaults when missing. Run `natgw-guest-setup.sh`, then stage the `fpga_AU200_nat_ddr` bitstream and apply it as above. The new software also runs on the old bitstream, so the order doesn't matter.
+
 Expect about a minute of gateway outage per update. If a new image doesn't enumerate at all, write the golden image back over JTAG (step 2).
 
 ## 10. Operating notes
@@ -285,6 +303,17 @@ Expect about a minute of gateway outage per update. If a new image doesn't enume
 - **Proxmox firewall.** If you enable it on the gateway VM's LAN interface, allow the VM to act as a DHCP server. The per-VM DHCP option is aimed at clients, and the IP/MAC filters can block a DHCP server.
 - **CPU load.** VPP polls, so one of the VM's cores shows 100% all the time. That's expected; don't overcommit the pinned cores.
 - **Worker threads.** VPP runs on its main thread only. Worker threads haven't been tested with the offload path.
+
+### Flow tables and the DDR tier
+
+Each NAT session is two flows, one per direction. The DDR bitstream holds 256k flows on chip and 4M in DDR.
+- **Placement.** New flows go on chip until it's 85% full, then to DDR. Idle on-chip flows move to DDR, and busy DDR flows move on chip. Moves don't lose packets. DDR flows have no hardware packet counters, but their activity still keeps their sessions alive.
+- **The session limit.** `NATGW_NAT_SESSIONS` is 1M by default (2M flows). That leaves room to spare in the tables, whose placement can't fill them completely. Above about 2M sessions, not every session can be offloaded: the rest stay in software, which is slower but still works. Each 1M sessions needs about 430 MB of `NATGW_VPP_HEAP`.
+- **When the tier isn't working.** If the DIMM doesn't calibrate, the gateway runs on the on-chip table only (about 128k offloaded sessions) and the monitor raises *DDR present but not calibrated*. `vppctl show hardware-interfaces CndmEthernet0 detail` shows `natgw_ddr_status`: 23 is working, 1 means the memory didn't calibrate, and 3 means the tier is turned off.
+- **Turning it off.** Set `NATGW_CARD_DEVARGS=natgw_ddr=0` and run `natgw-guest-setup.sh --no-build`, then restart VPP.
+- **Tuning.** `NATGW_CARD_DEVARGS` also takes the tier policy's options (`tier_policy=fill`, `onchip_high`, `onchip_low`, `demote_idle`, `promote_k`, `promote_n`, `migrate_budget`, `min_residency`), separated by commas. They're described under *DDR tier* in `sw/README.md`. The defaults are the tested ones.
+- **Bulk transfers.** `NATGW_BULK_UDP_PORTS` lists UDP server ports whose sessions go straight to DDR and stay there, which keeps the on-chip table for other traffic. None by default.
+- **Watching it.** The monitor graphs on-chip and DDR table fill, tier moves and the DDR hit rate. It alerts on DDR read errors, failed tier moves, and the on-chip table above 85% for a minute.
 
 ## 11. Monitoring
 
@@ -359,4 +388,5 @@ The monitor serves a page with the gateway's statistics and the ISPs' state at `
   - binding to an interface name and supplying your own certificate were checked.
 
   The monitor itself is tested against real VPP and the WAN manager by `sw/monitor/tests`.
-- **Not tested (no hardware or Proxmox here):** the hardware steps (vfio, hugepages, kernel command line), `natgw-host-setup.sh` on a real Proxmox host, Pyrite flashing of a U200, and the VM settings.
+- **DDR defaults:** `startup.conf` rendered with and without devargs and bulk ports. VPP started with the 2 GB heap, the derived sync budget and bulk ports, and the 1M-session NAT limit (432 MB used of the heap). The DDR tier itself is tested on the C model and the RTL (`sw/README.md`).
+- **Not tested (no hardware or Proxmox here):** the hardware steps (vfio, hugepages, kernel command line), `natgw-host-setup.sh` on a real Proxmox host, Pyrite flashing of a U200, the VM settings, DDR calibration on a real card, and the sync budget's main-thread cost on the card.

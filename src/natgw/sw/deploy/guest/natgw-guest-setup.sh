@@ -61,6 +61,9 @@ fi
 : "${NATGW_DHCP_RANGE:?}" "${NATGW_DNS_UPSTREAM:?}" "${NATGW_VPP_MAIN_CORE:?}" "${NATGW_NAT_SESSIONS:?}"
 : "${NATGW_HUGEPAGES_2M:?}" "${NATGW_LAN_IF:?}" "${NATGW_WAN1_IF:?}" "${NATGW_WAN2_IF:?}"
 : "${NATGW_IOMMU_MODE:=viommu}"
+# added with the DDR tier: defaults for a deploy.env written before it
+: "${NATGW_DPDK_BRANCH:=natgw}" "${NATGW_VPP_BRANCH:=natgw}" "${NATGW_VPP_HEAP:=2G}"
+: "${NATGW_CARD_DEVARGS:=}" "${NATGW_BULK_UDP_PORTS:=}"
 : "${NATGW_MONITOR_BIND:=$NATGW_MGMT_IF}" "${NATGW_MONITOR_PORT:=8443}" "${NATGW_MONITOR_TLS:=yes}"
 : "${NATGW_MONITOR_CERT:=}" "${NATGW_MONITOR_KEY:=}"
 
@@ -88,15 +91,22 @@ install_packages() {
 # ---------------------------------------------------------------- sources
 
 fetch_sources() {
-	say "sources in $NATGW_SRC (branch $NATGW_BRANCH)"
+	say "sources in $NATGW_SRC (taxi $NATGW_BRANCH, dpdk $NATGW_DPDK_BRANCH, vpp $NATGW_VPP_BRANCH)"
 	install -d "$NATGW_SRC"
+	local r b
 	for r in taxi dpdk vpp; do
+		case "$r" in
+		taxi) b=$NATGW_BRANCH ;;
+		dpdk) b=$NATGW_DPDK_BRANCH ;;
+		vpp) b=$NATGW_VPP_BRANCH ;;
+		esac
 		if [ -d "$NATGW_SRC/$r/.git" ]; then
-			git -C "$NATGW_SRC/$r" fetch -q origin "$NATGW_BRANCH"
-			git -C "$NATGW_SRC/$r" checkout -q -B "$NATGW_BRANCH" "origin/$NATGW_BRANCH"
+			# explicit refspec: the guide's clone is single-branch
+			git -C "$NATGW_SRC/$r" fetch -q origin "+refs/heads/$b:refs/remotes/origin/$b"
+			git -C "$NATGW_SRC/$r" checkout -q -B "$b" "origin/$b"
 		else
 			# shallow: the full DPDK and VPP histories are large
-			git clone -q --depth 50 --branch "$NATGW_BRANCH" "$NATGW_GIT_BASE/$r" "$NATGW_SRC/$r"
+			git clone -q --depth 50 --branch "$b" "$NATGW_GIT_BASE/$r" "$NATGW_SRC/$r"
 		fi
 		echo "$r: $(git -C "$NATGW_SRC/$r" log --oneline -1)"
 	done
@@ -222,6 +232,9 @@ render() { # template -> stdout
 		-e "s|@NATGW_LAN_NET@|$NATGW_LAN_NET|g" \
 		-e "s|@NATGW_LAN_GW@|$NATGW_LAN_GW|g" \
 		-e "s|@NATGW_NAT_SESSIONS@|$NATGW_NAT_SESSIONS|g" \
+		-e "s|@NATGW_VPP_HEAP@|$NATGW_VPP_HEAP|g" \
+		-e "s|@NATGW_CARD_DEV_CONF@|${CARD_DEV_CONF:-}|g" \
+		-e "s|@NATGW_OFFLOAD_CONF@|${OFFLOAD_CONF:-}|g" \
 		-e "s|@NATGW_MGMT_IF@|$NATGW_MGMT_IF|g" \
 		-e "s|@NATGW_MGMT_CIDR@|$NATGW_MGMT_CIDR|g" \
 		-e "s|@NATGW_MGMT_IP@|$NATGW_MGMT_IP|g" \
@@ -245,6 +258,24 @@ configure() {
 		[ -n "$CARD_BDF" ] || die "no natgw card ($CARD_ID) visible: pass the U200 through to this VM first"
 		echo "card: $CARD_BDF"
 	fi
+	# the card's devargs (cndm PMD: natgw_ddr=0, tier policy)
+	CARD_DEV_CONF=""
+	[ -z "$NATGW_CARD_DEVARGS" ] || CARD_DEV_CONF=" { devargs $NATGW_CARD_DEVARGS }"
+	# the offload plugin syncs sync-budget sessions a second: a pass over the
+	# session limit in at most 64 s, well inside the UDP timeout (300 s).
+	# Most of a large table is in DDR, whose flows sync without device reads.
+	local budget=$((NATGW_NAT_SESSIONS / 64))
+	[ "$budget" -ge 4096 ] || budget=4096
+	OFFLOAD_CONF="\\n  sync-budget $budget"
+	# sessions placed straight in the DDR tier
+	local p
+	for p in $NATGW_BULK_UDP_PORTS; do
+		case "$p" in
+		*[!0-9]*) die "NATGW_BULK_UDP_PORTS: '$p' is not a port number" ;;
+		esac
+		[ "$p" -ge 1 ] && [ "$p" -le 65535 ] || die "NATGW_BULK_UDP_PORTS: $p is out of range"
+		OFFLOAD_CONF="${OFFLOAD_CONF}\\n  bulk-udp-port $p"
+	done
 	DNS_SERVERS=""
 	for s in $NATGW_DNS_UPSTREAM; do
 		DNS_SERVERS="${DNS_SERVERS}server=$s\\n"

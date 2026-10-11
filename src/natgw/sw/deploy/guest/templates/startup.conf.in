@@ -12,13 +12,18 @@ socksvr { socket-name /run/vpp/api.sock }
 # update-interval: per-second vector rates for the monitor
 statseg { size 256M update-interval 1 }
 
+# the main heap holds nat44-ed's sessions, preallocated for the session
+# limit (about 0.36 KB each: 1M sessions take 430 MB), and the offload
+# plugin's per-session state
+memory { main-heap-size @NATGW_VPP_HEAP@ }
+
 # main thread only: the natgw offload path is tested without worker threads
 cpu { main-core @NATGW_VPP_MAIN_CORE@ }
 
 buffers { buffers-per-numa 65536 }
 
 dpdk {
-  dev @NATGW_CARD_BDF@
+  dev @NATGW_CARD_BDF@@NATGW_CARD_DEV_CONF@
   uio-driver vfio-pci
   # the device's xstats (FPGA counters, flow tables, DDR tier) reach the
   # stats segment, and the monitor, every second
@@ -38,5 +43,5 @@ plugins {
 natgw-offload {
   enable
   active-packets 4
-  sync-interval 1
+  sync-interval 1@NATGW_OFFLOAD_CONF@
 }
