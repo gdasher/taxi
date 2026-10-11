@@ -1,0 +1,36 @@
+# natgw monitor (installed by natgw-guest-setup.sh): statistics and ISP state
+# on a web page. Reads VPP's stats segment (group vpp) and the WAN manager's
+# status file; writes only its event log in /var/lib/natgw-monitor.
+[Unit]
+Description=natgw monitor (web page of gateway statistics and ISP state)
+After=vpp.service natgw-wanmgr.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=natgw-mon
+Group=natgw-mon
+SupplementaryGroups=vpp
+Environment=PYTHONPATH=@NATGW_PREFIX@/monitor
+ExecStartPre=@NATGW_PREFIX@/venv/bin/python -m natgw_monitor --check -c /etc/natgw/monitor.toml
+ExecStart=@NATGW_PREFIX@/venv/bin/python -m natgw_monitor -c /etc/natgw/monitor.toml
+# reloads the TLS certificate and key (after a renewal)
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+StateDirectory=natgw-monitor
+# ports below 1024 (443) without root
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

@@ -18,7 +18,8 @@ log = logging.getLogger("wanmgr")
 
 FIB_API_PATH_NH_PROTO_IP4 = 0
 _NO_LABEL = {"is_uniform": 0, "label": 0, "ttl": 0, "exp": 0}   # fixed-size array: pass all 16
-DHCP_CLIENT_STATE_BOUND = 2   # vl_api_dhcp_client_state_t: DISCOVER, REQUEST, BOUND
+DHCP_CLIENT_STATE_BOUND = 2
+IF_ADMIN_UP, IF_LINK_UP = 1, 2   # vl_api_if_status_flags_t   # vl_api_dhcp_client_state_t: DISCOVER, REQUEST, BOUND
 
 
 class VppError(RuntimeError):
@@ -85,6 +86,11 @@ class VppApi:
 
     def interfaces(self):
         return {i.interface_name: i.sw_if_index for i in self._call("sw_interface_dump")}
+
+    def link_states(self):
+        """{sw_if_index: (admin_up, link_up)}"""
+        return {i.sw_if_index: (bool(int(i.flags) & IF_ADMIN_UP), bool(int(i.flags) & IF_LINK_UP))
+                for i in self._call("sw_interface_dump")}
 
     def dhcp_clients(self):
         """{sw_if_index: Lease or None} for each configured DHCP client"""

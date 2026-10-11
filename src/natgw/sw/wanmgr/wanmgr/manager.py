@@ -19,8 +19,14 @@ reconnect (VPP may have restarted, losing API routes):
     and re-adding its address, so clients reconnect through a working WAN
 
 Nothing is changed until every WAN with a lease has a health verdict, so a
-restart probes before it steers."""
+restart probes before it steers.
 
+The status file (--status-file) is the manager's view for monitoring: each
+WAN's state with why and since when, its lease, link, recent probe rounds and
+per-target results, and a log of recent events (state and lease changes, VPP
+connection), all with wall-clock times."""
+
+import collections
 import dataclasses
 import json
 import logging
@@ -32,6 +38,8 @@ from .health import Health, State
 log = logging.getLogger("wanmgr")
 
 DEFAULT = "0.0.0.0/0"
+HISTORY = 60     # probe rounds kept per WAN in the status
+EVENTS = 200     # events kept in the status
 
 
 class VppDisconnected(Exception):
@@ -55,6 +63,13 @@ class Wan:
         self.lease = None
         self.pinned = {}          # target -> gateway it is routed via
         self.last_probe = None    # target that answered last, or None
+        # for monitoring (wall-clock times)
+        self.since = None         # when the state last changed
+        self.reason = "starting"  # why it is in that state
+        self.lease_since = None
+        self.link = None          # (admin_up, link_up), None: unknown
+        self.history = collections.deque(maxlen=HISTORY)   # probe rounds: True/False
+        self.targets = {}         # target -> {"ok", "last_ok", "last_fail"}
 
     @property
     def name(self):
@@ -66,13 +81,16 @@ class Wan:
 
 
 class WanManager:
-    def __init__(self, cfg, vpp, alerter, clock=time.monotonic, sleep=time.sleep):
+    def __init__(self, cfg, vpp, alerter, clock=time.monotonic, sleep=time.sleep, wallclock=time.time):
         self.cfg = cfg
         self.vpp = vpp
         self.alerter = alerter
         self.clock = clock
         self.sleep = sleep
+        self.wallclock = wallclock
         self.wans = [Wan(w, cfg.probe) for w in cfg.wans]
+        self.events = collections.deque(maxlen=EVENTS)
+        self.started = wallclock()
         self.connected = False
         self.ever_connected = False
         self.route_applied = None   # None: unknown; [] removed; else paths
@@ -124,7 +142,9 @@ class WanManager:
             raise
         if self.ever_connected:
             self.alerter.alert("VPP reconnected", "Reconnected to VPP; re-probing all WANs before steering.")
+        self._event(None, "vpp", "disconnected", "connected", "reconnected" if self.ever_connected else "")
         self.ever_connected = True
+        self._write_status()
 
     def _lost(self, e):
         self.connected = False
@@ -133,6 +153,11 @@ class WanManager:
         except Exception:
             pass
         self.alerter.alert("VPP connection lost", f"Lost the VPP API connection ({e}); reconnecting.")
+        self._event(None, "vpp", "connected", "disconnected", str(e))
+        try:
+            self._write_status()
+        except OSError:
+            log.exception("status file")
 
     def _on_connect(self):
         ifs = self.vpp.interfaces()
@@ -145,9 +170,11 @@ class WanManager:
             w.lease = None
             w.needs_flush = False
             w.pinned = {}
+            w.since, w.reason = self.wallclock(), "probing after (re)connect"
             w.sw_if_index = ifs.get(w.cfg.interface)
             if w.sw_if_index is None:
                 log.error("wan %s: interface %s not found", w.name, w.cfg.interface)
+                w.reason = f"interface {w.cfg.interface} not found in VPP"
                 continue
             if w.cfg.manage_dhcp and w.sw_if_index not in clients:
                 log.info("wan %s: adding DHCP client on %s", w.name, w.cfg.interface)
@@ -167,7 +194,9 @@ class WanManager:
         self.rounds += 1
         self.rounds_connected += 1
         clients = self.vpp.dhcp_clients()
+        links = self.vpp.link_states()
         for w in self.wans:
+            w.link = links.get(w.sw_if_index) if w.sw_if_index is not None else None
             self._update_lease(w, self._lease_of(w, clients))
         for w in self.wans:
             self._pin_probes(w)
@@ -179,7 +208,9 @@ class WanManager:
                     continue  # DHCP may still be binding
                 prev = w.health.no_lease()
             else:
-                prev = w.health.round(self._probe(w))
+                ok = self._probe(w)
+                w.history.append(ok)
+                prev = w.health.round(ok)
             if prev is not None:
                 self._transition(w, prev)
         self._apply_route()
@@ -190,6 +221,9 @@ class WanManager:
         if lease == w.lease:
             return
         old, w.lease = w.lease, lease
+        w.lease_since = self.wallclock() if lease else None
+        self._event(w.name, "lease", old and old.address, lease and lease.address,
+                    f"via {lease.gateway}" if lease else "lease lost")
         if old is None:
             # a WAN that was down only for want of a lease gets a fresh verdict
             w.health.reset()
@@ -222,20 +256,42 @@ class WanManager:
 
     def _probe(self, w):
         """one round: targets in order until one answers"""
+        now = self.wallclock()
         for t in w.cfg.probe_targets:
-            if self.vpp.ping(t, self.cfg.probe.timeout):
+            r = w.targets.setdefault(t, {"ok": None, "last_ok": None, "last_fail": None})
+            ok = self.vpp.ping(t, self.cfg.probe.timeout)
+            r["ok"] = ok
+            r["last_ok" if ok else "last_fail"] = now
+            if ok:
                 w.last_probe = t
                 return True
         w.last_probe = None
         return False
 
+    def _down_reason(self, w):
+        if w.sw_if_index is None:
+            return f"interface {w.cfg.interface} not found in VPP"
+        if w.link is not None and not w.link[0]:
+            return "interface administratively down"
+        if w.link is not None and not w.link[1]:
+            return "link down"
+        if w.lease is None:
+            return "no DHCP lease"
+        return f"no reply from probe targets ({', '.join(w.cfg.probe_targets)})"
+
     def _transition(self, w, prev):
         new = w.state
-        log.info("wan %s: %s -> %s", w.name, prev.value, new.value)
+        w.since = self.wallclock()
+        if new == State.DOWN:
+            w.reason = self._down_reason(w)
+        elif new == State.UP:
+            w.reason = f"probe target {w.last_probe} answering"
+        self._event(w.name, "state", prev.value, new.value, w.reason)
+        log.info("wan %s: %s -> %s (%s)", w.name, prev.value, new.value, w.reason)
         if prev == State.UNKNOWN and new == State.UP:
             return  # (re)start: nothing an operator needs to hear about
         healthy = [x.name for x in self.wans if x.state == State.UP]
-        detail = (f"{w.name} ({w.cfg.interface}) is {new.value.upper()} (was {prev.value}).\n"
+        detail = (f"{w.name} ({w.cfg.interface}) is {new.value.upper()} (was {prev.value}): {w.reason}.\n"
                   f"Lease: {w.lease.address + ' via ' + w.lease.gateway if w.lease else 'none'}\n"
                   f"Probe targets: {', '.join(w.cfg.probe_targets)}\n"
                   f"Healthy WANs: {', '.join(healthy) or 'none'}")
@@ -302,16 +358,40 @@ class WanManager:
 
     # ---------------------------------------------------------------- status
 
+    def _event(self, wan, kind, old, new, detail=""):
+        self.events.append({"ts": self.wallclock(), "wan": wan, "kind": kind, "from": old, "to": new,
+                            "detail": detail})
+
     def status(self):
+        in_route = {s for s, _, _ in (self.route_applied or [])}
+        p = self.cfg.probe
         return {
+            "updated": self.wallclock(),
+            "started": self.started,
             "connected": self.connected,
             "rounds": self.rounds,
+            "probe": {"interval": p.interval, "timeout": p.timeout, "up_rounds": p.up_rounds,
+                      "down_rounds": p.down_rounds},
             "route": [{"sw_if_index": s, "gateway": g, "weight": wt} for s, g, wt in (self.route_applied or [])],
             "route_applied": self.route_applied is not None,
             "nat_pool": sorted(self.pool_owned),
             "wans": {w.name: {"state": w.state.value,
+                              "since": w.since,
+                              "reason": w.reason,
+                              "interface": w.cfg.interface,
+                              "weight": w.cfg.weight,
+                              "in_route": w.sw_if_index in in_route,
+                              "link": {"admin_up": w.link[0], "link_up": w.link[1]} if w.link else None,
                               "lease": dataclasses.asdict(w.lease) if w.lease else None,
+                              "lease_since": w.lease_since,
+                              "good_rounds": w.health.good,
+                              "bad_rounds": w.health.bad,
+                              "history": "".join("1" if ok else "0" for ok in w.history),
+                              "probe_targets": {t: w.targets.get(t, {"ok": None, "last_ok": None,
+                                                                     "last_fail": None})
+                                                for t in w.cfg.probe_targets},
                               "last_probe": w.last_probe} for w in self.wans},
+            "events": list(self.events),
         }
 
     def _write_status(self):

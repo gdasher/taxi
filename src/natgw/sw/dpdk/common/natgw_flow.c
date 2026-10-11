@@ -1297,7 +1297,7 @@ static const char *const reason_names[NATGW_STAT_COUNT] = {
 
 unsigned natgw_flow_xstats_count(void)
 {
-	return NATGW_STAT_COUNT + 14;
+	return NATGW_STAT_COUNT + 17;
 }
 
 int natgw_flow_xstats_get_names(struct natgw_flow_ctx *ctx, struct rte_eth_xstat_name *names, unsigned size)
@@ -1324,6 +1324,9 @@ int natgw_flow_xstats_get_names(struct natgw_flow_ctx *ctx, struct rte_eth_xstat
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_migrate_failures");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_onchip_load_pct");
 	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_skips_last_sweep");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_onchip_capacity");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_capacity");
+	snprintf(names[i++].name, sizeof(names[0].name), "natgw_ddr_status");
 	return (int)n;
 }
 
@@ -1358,6 +1361,17 @@ int natgw_flow_xstats_get(struct natgw_flow_ctx *ctx, unsigned lane, struct rte_
 	xstats[i].id = i; xstats[i++].value = ctx->migrate_fail;
 	xstats[i].id = i; xstats[i++].value = (uint64_t)onchip_count(ctx) * 100 / natgw_table_size(ctx->t);
 	xstats[i].id = i; xstats[i++].value = ctx->last_skip_delta;
+	/* capacities, and the DDR_STATUS bits (NATGW_DDR_*): monitoring */
+	xstats[i].id = i; xstats[i++].value = natgw_table_size(ctx->t);
+	xstats[i].id = i; xstats[i++].value = ctx->td ? natgw_table_size(ctx->td) : 0;
+	{
+		struct natgw_ddr_status ds;
+		natgw_dev_ddr_status(&ctx->dev, &ds);
+		xstats[i].id = i;
+		xstats[i++].value = (ds.present ? NATGW_DDR_PRESENT : 0) | (ds.calibrated ? NATGW_DDR_CALIBRATED : 0) |
+				    (ds.enabled ? NATGW_DDR_ENABLED : 0) | (ds.clearing ? NATGW_DDR_CLEARING : 0) |
+				    (ds.active ? NATGW_DDR_ACTIVE : 0);
+	}
 	rte_spinlock_unlock(&ctx->lock);
 	return (int)n;
 }

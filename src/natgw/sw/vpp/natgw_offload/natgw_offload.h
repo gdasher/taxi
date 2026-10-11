@@ -114,7 +114,14 @@ typedef struct
   volatile u8 clear_pending;
 
   u64 counters[NGO_N_CTR];
-  u32 stats_offloaded; /* stats segment gauge */
+  u32 stats_offloaded; /* stats segment gauges */
+  u32 stats_pending;
+  u32 stats_enabled;
+  u32 stats_heartbeat; /* +1 per stats update: the monitor's liveness check */
+  u64 heartbeat;
+  u32 stats_ctr[NGO_N_CTR]; /* /natgw/offload/<counter> */
+  u32 *stats_link;          /* by hw_if_index: /natgw/link/<interface>, ~0 none */
+  f64 next_stats;
 
   /* nat44-ed and dpdk plugin symbols */
   snat_main_t *sm;

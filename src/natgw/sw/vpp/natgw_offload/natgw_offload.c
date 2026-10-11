@@ -4,6 +4,8 @@
  * See natgw_offload.h for the design.
  */
 
+#include <ctype.h>
+
 #include <vlib/vlib.h>
 #include <vlib/unix/plugin.h>
 #include <vlib/stats/stats.h>
@@ -33,6 +35,13 @@ VLIB_REGISTER_LOG_CLASS (ngo_log, static) = {
 
 static const char *ngo_counter_names[] = {
 #define _(n, s) s,
+  foreach_ngo_counter
+#undef _
+};
+
+/* stats segment names: /natgw/offload/<enum name in lower case> */
+static const char *ngo_counter_keys[] = {
+#define _(n, s) #n,
   foreach_ngo_counter
 #undef _
 };
@@ -477,6 +486,43 @@ ngo_gauge_update (void)
 			pool_elts (ngm->sessions) - vec_len (ngm->pending));
 }
 
+/* the counters for monitoring, about once a second (main thread) */
+static void
+ngo_stats_update (vlib_main_t *vm)
+{
+  ngo_main_t *ngm = &ngo_main;
+  f64 now = vlib_time_now (vm);
+
+  if (now < ngm->next_stats)
+    return;
+  ngm->next_stats = now + 1.0;
+  ngo_gauge_update ();
+  vlib_stats_set_gauge (ngm->stats_pending, vec_len (ngm->pending));
+  vlib_stats_set_gauge (ngm->stats_enabled, ngm->enabled);
+  vlib_stats_set_gauge (ngm->stats_heartbeat, ++ngm->heartbeat);
+  for (int i = 0; i < NGO_N_CTR; i++)
+    vlib_stats_set_gauge (ngm->stats_ctr[i], ngm->counters[i]);
+
+  /* DPDK ports: bit 0 admin up, bit 1 link up */
+  vnet_main_t *vnm = vnet_get_main ();
+  vnet_hw_interface_t *hw;
+  pool_foreach (hw, vnm->interface_main.hw_interfaces)
+    {
+      vnet_device_class_t *dc =
+	vnet_get_device_class (vnm, hw->dev_class_index);
+      if (!dc->name || strcmp (dc->name, "dpdk"))
+	continue;
+      vec_validate_init_empty (ngm->stats_link, hw->hw_if_index, ~0);
+      if (ngm->stats_link[hw->hw_if_index] == ~0)
+	ngm->stats_link[hw->hw_if_index] =
+	  vlib_stats_add_gauge ("/natgw/link/%v", hw->name);
+      vlib_stats_set_gauge (
+	ngm->stats_link[hw->hw_if_index],
+	vnet_sw_interface_is_admin_up (vnm, hw->sw_if_index) |
+	  (vnet_hw_interface_is_link_up (vnm, hw->hw_if_index) << 1));
+    }
+}
+
 static void
 ngo_session_free (u32 pi)
 {
@@ -844,6 +890,7 @@ ngo_process (vlib_main_t *vm, vlib_node_runtime_t *rt, vlib_frame_t *f)
       vlib_process_wait_for_event_or_clock (vm, ngm->enabled ? 0.01 : 1.0);
       vlib_process_get_events (vm, &event_data);
       vec_reset_length (event_data);
+      ngo_stats_update (vm);
       if (!ngm->enabled)
 	continue;
       ngo_drain_events ();
@@ -952,6 +999,18 @@ ngo_init (vlib_main_t *vm)
   vec_foreach (t, ngm->threads)
     clib_spinlock_init (&t->lock);
   ngm->stats_offloaded = vlib_stats_add_gauge ("/natgw/offloaded");
+  ngm->stats_pending = vlib_stats_add_gauge ("/natgw/offload/pending");
+  ngm->stats_enabled = vlib_stats_add_gauge ("/natgw/offload/enabled");
+  ngm->stats_heartbeat = vlib_stats_add_gauge ("/natgw/heartbeat");
+  for (int i = 0; i < NGO_N_CTR; i++)
+    {
+      char key[64];
+      int j;
+      for (j = 0; ngo_counter_keys[i][j] && j < (int) sizeof (key) - 1; j++)
+	key[j] = tolower (ngo_counter_keys[i][j]);
+      key[j] = 0;
+      ngm->stats_ctr[i] = vlib_stats_add_gauge ("/natgw/offload/%s", key);
+    }
   return 0;
 }
 

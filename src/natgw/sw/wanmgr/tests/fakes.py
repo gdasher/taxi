@@ -32,6 +32,7 @@ class FakeVpp:
         self.connected = False
         self.fail_after = None                   # raise VppDisconnected after n more calls
         self.pings = []
+        self.links = {}                          # sw_if_index -> (admin_up, link_up); default up
 
     # fault injection
     def _check(self):
@@ -63,6 +64,10 @@ class FakeVpp:
     def interfaces(self):
         self._check()
         return dict(self.ifs)
+
+    def link_states(self):
+        self._check()
+        return {s: self.links.get(s, (True, True)) for s in self.ifs.values()}
 
     def dhcp_clients(self):
         self._check()

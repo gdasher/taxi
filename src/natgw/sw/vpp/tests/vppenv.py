@@ -85,7 +85,7 @@ class Vpp:
     net_natgw_model device."""
 
     def __init__(self, name="natgwt", lanes=3, bucket_w=10, offload_conf="enable", extra_plugins=(),
-                 tap_prefix=None, vdev_args=""):
+                 tap_prefix=None, vdev_args="", dpdk_extra=""):
         self.name = name
         self.dir = tempfile.mkdtemp(prefix=f"{name}-")
         os.chmod(self.dir, 0o755)
@@ -94,6 +94,7 @@ class Vpp:
         self.log = os.path.join(self.dir, "vpp.log")
         self.api_sock = os.path.join(self.dir, "api.sock")
         self.cli_sock = os.path.join(self.dir, "cli.sock")
+        self.stats_sock = os.path.join(self.dir, "stats.sock")
         plugins = ["dpdk_plugin.so", "nat_plugin.so", "natgw_offload_plugin.so", "ping_plugin.so"]
         plugins += list(extra_plugins)
         conf = f"""
@@ -101,7 +102,7 @@ unix {{ nodaemon cli-listen {self.cli_sock} log {self.log} gid {os.getgid()} }}
 api-segment {{ prefix {name} gid {os.getgid()} }}
 socksvr {{ socket-name {self.api_sock} }}
 buffers {{ buffers-per-numa 16384 }}
-statseg {{ socket-name {self.dir}/stats.sock }}
+statseg {{ socket-name {self.stats_sock} }}
 plugins {{
   path {PLUGIN_DIR}
   plugin default {{ disable }}
@@ -109,6 +110,7 @@ plugins {{
 }}
 dpdk {{
   no-pci
+  {dpdk_extra}
   vdev net_natgw_model0,lanes={lanes},wire=tap,tap_prefix={self.tap_prefix},bucket_w={bucket_w}{vdev_args}
 }}
 natgw-offload {{ {offload_conf} }}

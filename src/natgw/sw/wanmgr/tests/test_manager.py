@@ -396,3 +396,91 @@ def test_lease_lost_then_back_alerts_both():
     rounds(mgr, 1)
     assert alerts.subjects == ["wan1 lease lost", "wan1 DOWN", "wan1 lease acquired"]
     assert mgr.wans[0].state == State.UP      # a new lease gets a fresh, quick verdict
+
+
+class Wall:
+    """wall clock that follows the fake monotonic clock"""
+
+    def __init__(self, clock):
+        self.clock = clock
+
+    def __call__(self):
+        return 1.7e9 + self.clock.t
+
+
+def detail_env():
+    vpp = FakeVpp({"WAN1": W1, "WAN2": W2}, {W1: lease(A1, GW1), W2: lease(A2, GW2)})
+    vpp.alive_gws = {GW1, GW2}
+    clock = FakeClock()
+    alerts = Alerts()
+    mgr = WanManager(config.parse(CFG), vpp, alerts, clock=clock, sleep=clock.sleep, wallclock=Wall(clock))
+    mgr.connect()
+    return mgr, vpp, clock, alerts
+
+
+def test_status_records_why_and_when_a_wan_is_down(tmp_path):
+    mgr, vpp, clock, alerts = detail_env()
+    mgr.status_file = str(tmp_path / "status.json")
+    rounds(mgr, 2)
+    st = mgr.status()
+    w1 = st["wans"]["wan1"]
+    assert w1["state"] == "up" and w1["in_route"] and w1["link"] == {"admin_up": True, "link_up": True}
+    assert w1["history"] == "11" and w1["probe_targets"]["192.0.2.1"]["ok"] is True
+    assert w1["probe_targets"]["192.0.2.2"]["ok"] is None   # not needed: the first answered
+    assert w1["interface"] == "WAN1" and w1["lease"]["gateway"] == GW1 and w1["lease_since"] == 1.7e9 + 1000.0
+    clock.t += 2
+    vpp.alive_gws = {GW2}
+    rounds(mgr, 3)
+    t_down = 1.7e9 + clock.t
+    st = json.loads((tmp_path / "status.json").read_text())
+    w1, w2 = st["wans"]["wan1"], st["wans"]["wan2"]
+    assert w1["state"] == "down" and not w1["in_route"] and w2["in_route"]
+    assert w1["reason"] == "no reply from probe targets (192.0.2.1, 192.0.2.2)"
+    assert w1["since"] == t_down and w1["bad_rounds"] == 3 and w1["history"] == "11000"
+    for t in ("192.0.2.1", "192.0.2.2"):
+        assert w1["probe_targets"][t]["ok"] is False and w1["probe_targets"][t]["last_fail"] == t_down
+    ev = [e for e in st["events"] if e["kind"] == "state" and e["wan"] == "wan1"]
+    assert ev[-1] == {"ts": t_down, "wan": "wan1", "kind": "state", "from": "up", "to": "down",
+                      "detail": w1["reason"]}
+    assert "no reply from probe targets" in alerts.bodies[-1]
+    assert st["updated"] == t_down and st["probe"]["down_rounds"] == 3
+    # back: the reason says which target answers
+    vpp.alive_gws = {GW1, GW2}
+    rounds(mgr, 5)
+    w1 = mgr.status()["wans"]["wan1"]
+    assert w1["state"] == "up" and w1["reason"] == "probe target 192.0.2.1 answering" and w1["in_route"]
+
+
+@pytest.mark.parametrize("fault, reason", [
+    ("link", "link down"),
+    ("admin", "interface administratively down"),
+    ("lease", "no DHCP lease"),
+])
+def test_down_reason(fault, reason):
+    mgr, vpp, clock, _ = detail_env()
+    rounds(mgr, 1)
+    vpp.alive_gws = {GW2}     # what a dead link or a lost lease also means for probes
+    if fault == "link":
+        vpp.links[W1] = (True, False)
+    elif fault == "admin":
+        vpp.links[W1] = (False, False)
+    else:
+        vpp.clients[W1] = None
+    rounds(mgr, 3)
+    w1 = mgr.status()["wans"]["wan1"]
+    assert w1["state"] == "down" and w1["reason"] == reason
+    if fault == "lease":
+        assert w1["lease"] is None and w1["lease_since"] is None
+        assert [e["to"] for e in mgr.status()["events"] if e["kind"] == "lease"][-1] is None
+
+
+def test_status_written_when_vpp_is_lost(tmp_path):
+    mgr, vpp, clock, _ = detail_env()
+    mgr.status_file = str(tmp_path / "status.json")
+    rounds(mgr, 1)
+    vpp.down = True
+    vpp.fail_after = 0
+    mgr.run(stop=lambda: not mgr.connected or mgr.rounds > 3)
+    st = json.loads((tmp_path / "status.json").read_text())
+    assert st["connected"] is False
+    assert st["events"][-1]["kind"] == "vpp" and st["events"][-1]["to"] == "disconnected"

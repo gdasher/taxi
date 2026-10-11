@@ -4,11 +4,12 @@
 # natgw gateway VM setup (Ubuntu Server 24.04, run as root).
 #
 # Builds and installs DPDK (with the cndm and natgw drivers), VPP (with the
-# nat44-ed hooks and the natgw_offload plugin) and the WAN manager, writes the
-# VPP, WAN manager, dnsmasq and management-network configuration from
-# /etc/natgw/deploy.env, and sets up vfio, hugepages and the systemd services.
-# Safe to run again: sources are updated and rebuilt, existing
-# /etc/natgw/wanmgr.toml is kept.
+# nat44-ed hooks and the natgw_offload plugin), the WAN manager and the
+# monitor, writes the VPP, WAN manager, monitor, dnsmasq and
+# management-network configuration from /etc/natgw/deploy.env, and sets up
+# vfio, hugepages and the systemd services. Safe to run again: sources are
+# updated and rebuilt, existing /etc/natgw/wanmgr.toml and the monitor's
+# certificate are kept (/etc/natgw/monitor.toml is regenerated).
 #
 # Usage: natgw-guest-setup.sh [--apply-network] [--skip-hw] [--no-build]
 #   --apply-network  cut-over: give the VM its static LAN address and start
@@ -30,7 +31,7 @@ for a in "$@"; do
 	--apply-network) APPLY_NETWORK=1 ;;
 	--skip-hw) SKIP_HW=1 ;;
 	--no-build) BUILD=0 ;;
-	-h|--help) sed -n '3,22p' "$0"; exit 0 ;;
+	-h|--help) sed -n '3,23p' "$0"; exit 0 ;;
 	*) echo "unknown option $a" >&2; exit 2 ;;
 	esac
 done
@@ -59,6 +60,8 @@ fi
 : "${NATGW_DHCP_RANGE:?}" "${NATGW_DNS_UPSTREAM:?}" "${NATGW_VPP_MAIN_CORE:?}" "${NATGW_NAT_SESSIONS:?}"
 : "${NATGW_HUGEPAGES_2M:?}" "${NATGW_LAN_IF:?}" "${NATGW_WAN1_IF:?}" "${NATGW_WAN2_IF:?}"
 : "${NATGW_IOMMU_MODE:=viommu}"
+: "${NATGW_MONITOR_BIND:=$NATGW_MGMT_IF}" "${NATGW_MONITOR_PORT:=8443}" "${NATGW_MONITOR_TLS:=yes}"
+: "${NATGW_MONITOR_CERT:=}" "${NATGW_MONITOR_KEY:=}"
 
 NATGW_LAN_GW=${NATGW_LAN_CIDR%/*}
 NATGW_MGMT_IP=${NATGW_MGMT_CIDR%/*}
@@ -74,7 +77,7 @@ install_packages() {
 		build-essential git ca-certificates curl sudo pkg-config \
 		meson ninja-build cmake python3 python3-venv python3-pip python3-pyelftools python3-ply \
 		libnuma-dev libssl-dev libpcap-dev pciutils kmod iproute2 \
-		dnsmasq-base dnsmasq ethtool
+		dnsmasq-base dnsmasq ethtool openssl
 	# dnsmasq must not serve the LAN before the cut-over (--apply-network)
 	if [ "$APPLY_NETWORK" -eq 0 ]; then
 		systemctl disable --now dnsmasq 2>/dev/null || true
@@ -153,6 +156,56 @@ install_wanmgr() {
 	PYTHONPATH="$NATGW_PREFIX/wanmgr" "$NATGW_PREFIX/venv/bin/python" -c "import wanmgr, vpp_papi"
 }
 
+# ---------------------------------------------------------------- monitor
+
+install_monitor() {
+	say "monitor into $NATGW_PREFIX/monitor"
+	install -d "$NATGW_PREFIX/monitor"
+	rm -rf "$NATGW_PREFIX/monitor/natgw_monitor"
+	cp -r "$NATGW_SRC/taxi/src/natgw/sw/monitor/natgw_monitor" "$NATGW_PREFIX/monitor/"
+	find "$NATGW_PREFIX/monitor" -name __pycache__ -prune -exec rm -rf {} +
+	PYTHONPATH="$NATGW_PREFIX/monitor" "$NATGW_PREFIX/venv/bin/python" -c "import natgw_monitor.web, vpp_papi.vpp_stats"
+}
+
+# the monitor's certificate: the one named in deploy.env, else a self-signed
+# one created once (kept on later runs, so browsers' exceptions stay valid)
+monitor_tls() {
+	MON_TLS=false
+	MON_CERT=/etc/natgw/tls/monitor.crt
+	MON_KEY=/etc/natgw/tls/monitor.key
+	case "$NATGW_MONITOR_TLS" in
+	no) echo "monitor: plain HTTP (NATGW_MONITOR_TLS=no)"; return ;;
+	yes) ;;
+	*) die "NATGW_MONITOR_TLS must be yes or no" ;;
+	esac
+	MON_TLS=true
+	if [ -n "$NATGW_MONITOR_CERT" ] || [ -n "$NATGW_MONITOR_KEY" ]; then
+		[ -r "$NATGW_MONITOR_CERT" ] && [ -r "$NATGW_MONITOR_KEY" ] \
+			|| die "NATGW_MONITOR_CERT and NATGW_MONITOR_KEY must both name readable files"
+		MON_CERT=$NATGW_MONITOR_CERT
+		MON_KEY=$NATGW_MONITOR_KEY
+		echo "monitor: certificate $MON_CERT"
+	elif [ ! -s "$MON_CERT" ] || [ ! -s "$MON_KEY" ]; then
+		local name
+		name=$(hostname)
+		install -d -m 0750 -g natgw-mon /etc/natgw/tls
+		openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+			-keyout "$MON_KEY" -out "$MON_CERT" -subj "/CN=$name natgw monitor" \
+			-addext "subjectAltName=DNS:$name,DNS:localhost,IP:$NATGW_MGMT_IP,IP:127.0.0.1" 2>/dev/null
+		echo "monitor: created a self-signed certificate ($MON_CERT), SHA-256 fingerprint:"
+		openssl x509 -in "$MON_CERT" -noout -fingerprint -sha256 | sed 's/^/  /'
+	else
+		echo "monitor: keeping $MON_CERT"
+	fi
+	if [ "$MON_KEY" = /etc/natgw/tls/monitor.key ]; then
+		chgrp natgw-mon "$MON_KEY"
+		chmod 0640 "$MON_KEY"
+	fi
+	# the service runs as natgw-mon: it must be able to read both
+	runuser -u natgw-mon -- test -r "$MON_CERT" && runuser -u natgw-mon -- test -r "$MON_KEY" \
+		|| die "natgw-mon cannot read $MON_CERT and $MON_KEY (give its group read access)"
+}
+
 # ---------------------------------------------------------------- configuration
 
 render() { # template -> stdout
@@ -171,6 +224,11 @@ render() { # template -> stdout
 		-e "s|@NATGW_MGMT_IP@|$NATGW_MGMT_IP|g" \
 		-e "s|@NATGW_DHCP_RANGE@|$NATGW_DHCP_RANGE|g" \
 		-e "s|@NATGW_DNS_SERVERS@|$DNS_SERVERS|g" \
+		-e "s|@NATGW_MONITOR_BIND_TOML@|${MON_BIND_TOML:-}|g" \
+		-e "s|@NATGW_MONITOR_PORT@|$NATGW_MONITOR_PORT|g" \
+		-e "s|@NATGW_MONITOR_TLS@|${MON_TLS:-true}|g" \
+		-e "s|@NATGW_MONITOR_CERT@|${MON_CERT:-}|g" \
+		-e "s|@NATGW_MONITOR_KEY@|${MON_KEY:-}|g" \
 		"$HERE/templates/$1"
 }
 
@@ -205,11 +263,33 @@ configure() {
 	render dnsmasq-lan.conf.in | sed 's/\\n/\n/g' > /etc/dnsmasq.d/natgw-lan.conf
 	render 60-natgw-mgmt.yaml.in > /etc/natgw/60-natgw-mgmt.yaml
 
+	getent group natgw-mon >/dev/null || groupadd --system natgw-mon
+	id natgw-mon >/dev/null 2>&1 || useradd --system --gid natgw-mon --groups vpp \
+		--home-dir /var/lib/natgw-monitor --no-create-home --shell /usr/sbin/nologin natgw-mon
+	usermod -a -G vpp natgw-mon
+	monitor_tls
+	MON_BIND_TOML=""
+	for b in $NATGW_MONITOR_BIND; do
+		MON_BIND_TOML="${MON_BIND_TOML:+$MON_BIND_TOML, }\"$b\""
+	done
+	[ -n "$MON_BIND_TOML" ] || die "NATGW_MONITOR_BIND is empty"
+	render monitor.toml.in > /etc/natgw/monitor.toml
+	chgrp natgw-mon /etc/natgw/monitor.toml
+	chmod 0640 /etc/natgw/monitor.toml
+	if [ -d "$NATGW_PREFIX/monitor/natgw_monitor" ]; then
+		PYTHONPATH="$NATGW_PREFIX/monitor" "$NATGW_PREFIX/venv/bin/python" -m natgw_monitor --check \
+			-c /etc/natgw/monitor.toml
+	fi
+
 	install -m 0755 "$HERE/natgw-card-check" /usr/local/sbin/natgw-card-check
 	install -m 0755 "$HERE/natgw-fpga" /usr/local/sbin/natgw-fpga
 	render vpp.service > /etc/systemd/system/vpp.service
 	render natgw-wanmgr.service > /etc/systemd/system/natgw-wanmgr.service
+	render natgw-monitor.service > /etc/systemd/system/natgw-monitor.service
 	systemctl daemon-reload
+	systemctl enable natgw-monitor.service
+	# a running monitor picks up a new configuration or certificate
+	systemctl try-restart natgw-monitor.service 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- kernel, vfio, hugepages
@@ -265,6 +345,7 @@ if [ "$BUILD" -eq 1 ]; then
 	build_dpdk
 	build_vpp
 	install_wanmgr
+	install_monitor
 fi
 configure
 if [ "$SKIP_HW" -eq 0 ]; then
@@ -277,6 +358,7 @@ fi
 say "done"
 echo "VPP:          $NATGW_PREFIX/vpp (config /etc/vpp/startup.conf, /etc/vpp/natgw.cli)"
 echo "WAN manager:  /etc/natgw/wanmgr.toml (add SMTP settings for email alerts)"
+echo "Monitor:      $([ "$MON_TLS" = true ] && echo https || echo http)://<$NATGW_MONITOR_BIND>:$NATGW_MONITOR_PORT/ (/etc/natgw/monitor.toml, from deploy.env)"
 if [ "$APPLY_NETWORK" -eq 0 ]; then
 	echo "Network:      staged in /etc/natgw/60-natgw-mgmt.yaml and /etc/dnsmasq.d/natgw-lan.conf;"
 	echo "              apply at cut-over with: $0 --no-build --apply-network"

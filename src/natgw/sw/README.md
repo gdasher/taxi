@@ -33,6 +33,8 @@ VPP nat44-ed ──session events──▶ natgw_offload plugin (vpp/natgw_offlo
 | `vpp/natgw_offload` | VPP plugin that mirrors nat44-ed sessions into the FPGA. |
 | `vpp/setup_vpp.sh` | Applies the patches, links the plugin in, and builds VPP against the system DPDK. |
 | `wanmgr` | WAN manager daemon (Python, `vpp_papi`): DHCP leases, health probes, default-route steering, NAT pool and session flushing, and email and syslog alerts. Includes a systemd unit and an example configuration. |
+| `monitor` | Monitor daemon (Python, stdlib plus `vpp_papi`'s stats reader): a web page and JSON API over HTTPS with the gateway's statistics and the ISPs' state, alerts, and a persistent log of ISP outages. |
+| `deploy` | Deployment on Proxmox VE: host and guest setup scripts, templates, switch configuration. See `deploy/README.md`. |
 
 ## Building
 
@@ -56,7 +58,8 @@ The second option matters for shared builds. A shared DPDK autoloads every mempo
 | libnatgw and C model | `make test` (`tests/test_{layout,table,model,dev,ddr}.py`) | <ul><li>Layouts are bit-exact with the Python data types; hashes match the CRC written out from the spec.</li><li>Cuckoo placement stays relocation-safe after every write, for both the on-chip and the DDR table geometry.</li><li>The C model's forwarded frames, decoded with scapy, carry exactly the rewrite of the entry and next hop that hit (addresses, ports, MACs, VLAN, TTL, valid checksums), also with flows split between the two tiers; punts are unchanged; every punt reason is reachable.</li><li>Registers, events, aging and overflow; DDR status when absent, present without a DIMM and working; DDR entry access, clear and the activity bitmap.</li></ul> |
 | DPDK rte_flow | `tests/test_dpdk_pmd.py`, which runs `dpdk/tests/test_natgw_pmd.c` on `net_natgw_model` | <ul><li>Validate rejects.</li><li>SNAT and DNAT rewrite, TTL and checksums, including UDP with a zero checksum.</li><li>Punt metadata.</li><li>COUNT, AGE and the aged-flow event.</li><li>Duplicates, filling the table to capacity, host TX, and devices without punt headers.</li><li>A concurrent datapath.</li><li>DDR tier: spill to DDR once on-chip is full, DDR punts carry the DDR index flag, no counters for DDR flows, DDR aging from the activity bitmap; with no DIMM or `no_ddr=1`, ENOSPC at on-chip capacity and no DDR lookups.</li><li>Tier policy: admission at the high-water mark and bulk flows to DDR; idle flows demoted and busy DDR flows promoted, with a probe frame run through the model after every single table command forwarding unchanged throughout; no ping-pong once settled; counters monotonic across demote and promote; `fill` ignores the watermark.</li><li>The flow context lock under load (`lock_stress`, three threads for 3 s): the main thread creates, destroys and queries flows (about 370k each of creates and destroys) while a poll thread runs the policy (over 1,000 promotions and demotions) and a traffic thread checks that every frame of a rotating set of busy flows is forwarded with its exact rewrite (about 2.7M frames). Then flow accounting, no migration failures, every flow forwarding, and a create never waiting more than 20 ms (about 0.2–0.3 ms seen). Moving without the lock crashes it; leaving destroyed flows on the candidate queues hangs it.</li></ul> |
 | VPP integration | `pytest vpp/tests` (VPP and passwordless sudo; skipped otherwise) | Kernel TCP/UDP from namespaces on the model's TAP lanes, through VPP and the model. See below. |
-| WAN manager | `pytest wanmgr/tests` | <ul><li>Unit tests against a fake VPP that models routing and NAT for probes: thresholds, flapping, target fallback, steering, flushing, lease changes, restarts, alert rate limiting and SMTP.</li><li>Integration tests with real VPP, the offload plugin, dnsmasq "modems" and an SMTP sink: startup, an ISP outage, all WANs down, and a VPP restart.</li></ul> |
+| WAN manager | `pytest wanmgr/tests` | <ul><li>Unit tests against a fake VPP that models routing and NAT for probes: thresholds, flapping, target fallback, steering, flushing, lease changes, restarts, alert rate limiting and SMTP; the status file's per-WAN detail (why and since when a WAN is down: probe failure, link down, admin down, no lease; probe history and per-target results; event log; written on VPP loss).</li><li>Integration tests with real VPP, the offload plugin, dnsmasq "modems" and an SMTP sink (`tests/site_env.py`, shared with the monitor's tests): startup, an ISP outage, all WANs down, and a VPP restart.</li></ul> |
+| Monitor | `pytest monitor/tests` | <ul><li>Collector against fake sources: rates (32-bit wrap, counter resets), offload ratio and punt reasons, table fill and DDR state, every alert (raise, hold, clear), ISP outages with their evidence snapshot, the event log and outage history across monitor restarts, a stale or missing WAN manager; the stats reader (interface names with slashes, a hung VPP, a restarted VPP whose socket reuses the inode, a segment stuck mid-update).</li><li>The HTTPS server: TLS 1.2 minimum, plain HTTP refused, certificate reload, security headers, read-only methods, binding to an address only, to an interface name, waiting for an interface's address, a stalled client not blocking others, `--check`.</li><li>Integration with real VPP, the WAN manager and two ISPs: counters equal VPP's own (`show natgw offload`, xstats), per-ISP traffic, an ISP outage captured with its reason and evidence and kept across a monitor restart, all ISPs down, a VPP restart, and the page rendered in headless Chromium (light and dark, desktop and phone width: no script errors, no horizontal scrolling) when Playwright is installed.</li></ul> |
 
 The VPP integration tests run VPP with `net_natgw_model,wire=tap`. Each lane's TAP is moved into a namespace: one LAN and two WANs, each WAN with a server behind it. A test decides whether traffic was offloaded from what it can observe. Once a flow is offloaded, VPP's interface counters stop growing while its session counters keep growing, because they are synced back from the hardware.
 
@@ -69,7 +72,7 @@ The tests cover:
 - **ECMP:** across two WANs the hardware picks the same WAN as VPP, which the replies prove.
 - **Table full:** sessions that don't fit stay in software and keep working.
 - **DDR tier** (`test_offload_ddr.py`): with a working DDR tier every session is offloaded beyond the on-chip capacity; hardware-only traffic on DDR flows (which have no counters) keeps their sessions alive, and idle ones expire; with the tier present but no DIMM, extra sessions stay in software; `bulk-udp-port` sessions go to DDR; a busy session arriving while the chip is full of idle ones is promoted without losing a packet.
-- **Observability:** the CLI and the stats segment gauge.
+- **Observability:** the CLI and the stats segment gauges.
 
 Fault-injection checks confirm the suites detect real bugs:
 
@@ -192,3 +195,27 @@ The WAN manager adds the pool addresses: it keeps each WAN's current lease in th
 - **Flushing.** When a WAN goes down and another WAN is healthy, its sessions and offloaded flows are flushed by removing its address and re-adding it at once. A changed lease replaces the old address, which also deletes the sessions using it.
 - **Alerts.** Email is sent for DOWN and UP changes, lease loss and changes, and VPP disconnects. Mail is rate-limited, and alerts held back are summarised in the next mail. Every alert also goes to syslog.
 - **Recovery after a VPP restart.** The manager reconnects with backoff, relearns the leases quietly, and probes before re-applying anything.
+
+## Monitor in brief
+
+`python3 -m natgw_monitor -c /etc/natgw/monitor.toml` (see `monitor/natgw_monitor/config.py`; the deployment installs it as `natgw-monitor.service`). It only reads, so it can't disturb the datapath or rule installs:
+
+- **VPP's stats segment** (`/run/vpp/stats.sock`, group `vpp`):
+  - the device's xstats, which VPP's dpdk plugin copies there every `stats-poll-interval` (1 s in the deployment): per-port forwarded and punt-reason counters, flow counts and capacities, DDR status and counters, tier moves, events;
+  - the offload plugin's counters (`/natgw/offload/*`), the port link states (`/natgw/link/<if>`), and a heartbeat (`/natgw/heartbeat`);
+  - VPP's interface, NAT and vector-rate counters.
+- **The WAN manager's status file** (`/run/natgw-wanmgr.json`): each ISP's state, why and since when, lease, link, probe history and per-target results, whether it is in the default route, and recent events.
+
+Every second it computes rates, keeps an hour of history for the graphs, and evaluates alerts. When an ISP goes down it records an outage with the evidence at that moment, and closes it when the ISP is back. Outages, state changes and alerts go to `/var/lib/natgw-monitor/events.jsonl`, so the history survives restarts.
+
+The page shows:
+- the ISPs, with a banner while one is down;
+- alerts and status tiles;
+- graphs: forwarded vs sent to VPP, offload ratio, punt reasons, per-ISP inbound traffic with outages shaded, table fill, tier moves and DDR hit rate;
+- the outage history, the ports, every raw counter, and the event log.
+
+The JSON API (`/api/stats`, `/api/history`, `/api/events`, `/healthz`) serves the same data.
+
+What it can't see: frames the FPGA forwards are counted per ingress lane, so an ISP's inbound traffic includes the hardware path but its outbound traffic is VPP's only.
+
+Like VPP's own CLI, `vpp_papi` can't tell a gauge changed without a directory refresh. Its reads also wait without limit while VPP updates the segment, so the monitor refreshes on every read and bounds every read. A segment that stays unreadable (VPP died mid-update) counts as VPP down and is remapped.

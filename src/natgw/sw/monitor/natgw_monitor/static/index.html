@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>natgw monitor</title>
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <h1>natgw monitor</h1>
+    <span class="host" id="host"></span>
+  </div>
+  <div class="status-line">
+    <span class="pill" id="overall">connecting</span>
+    <span class="muted" id="updated"></span>
+  </div>
+  <nav class="window" id="window" aria-label="graph window">
+    <button data-s="60">1 min</button>
+    <button data-s="600" class="on">10 min</button>
+    <button data-s="3600">1 h</button>
+  </nav>
+</header>
+
+<main>
+  <div class="banner" id="banner" hidden></div>
+
+  <section aria-labelledby="h-isp">
+    <h2 id="h-isp">Internet (ISPs)</h2>
+    <div class="isp-meta muted" id="isp-meta"></div>
+    <div class="wans" id="wans"></div>
+  </section>
+
+  <section aria-labelledby="h-alerts">
+    <h2 id="h-alerts">Alerts</h2>
+    <ul class="alerts" id="alerts"></ul>
+  </section>
+
+  <section aria-labelledby="h-now">
+    <h2 id="h-now">Now</h2>
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <section aria-labelledby="h-graphs">
+    <h2 id="h-graphs">Graphs</h2>
+    <div class="charts">
+      <figure class="chart"><figcaption>Packets: forwarded by the FPGA vs sent to VPP</figcaption>
+        <canvas id="c-traffic"></canvas><div class="legend" id="l-traffic"></div></figure>
+      <figure class="chart"><figcaption>Offload ratio (% of packets the FPGA forwarded)</figcaption>
+        <canvas id="c-ratio"></canvas><div class="legend" id="l-ratio"></div></figure>
+      <figure class="chart"><figcaption>Why packets went to VPP (packets/s, stacked)</figcaption>
+        <canvas id="c-reasons"></canvas><div class="legend" id="l-reasons"></div></figure>
+      <figure class="chart"><figcaption>ISP inbound traffic (packets/s; shaded: down)</figcaption>
+        <canvas id="c-wans"></canvas><div class="legend" id="l-wans"></div></figure>
+      <figure class="chart"><figcaption>Flow table fill (%)</figcaption>
+        <canvas id="c-fill"></canvas><div class="legend" id="l-fill"></div></figure>
+      <figure class="chart"><figcaption>Tier moves (per second) and DDR hit rate (%)</figcaption>
+        <canvas id="c-tier"></canvas><div class="legend" id="l-tier"></div></figure>
+    </div>
+  </section>
+
+  <section aria-labelledby="h-outages">
+    <h2 id="h-outages">ISP outages</h2>
+    <div class="scroll"><table class="grid" id="outages">
+      <thead><tr><th>ISP</th><th>Started</th><th>Ended</th><th>Duration</th><th>Reason</th><th>Evidence at the start</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <section aria-labelledby="h-ports">
+    <h2 id="h-ports">Ports</h2>
+    <div class="scroll"><table class="grid num" id="ports">
+      <thead><tr><th>Port</th><th>Link</th><th>Forwarded/s</th><th>To VPP/s</th><th>Dropped/s</th>
+        <th>VPP rx/s</th><th>VPP tx/s</th><th>VPP drops</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <section aria-labelledby="h-detail">
+    <h2 id="h-detail">All counters</h2>
+    <div id="detail"></div>
+  </section>
+
+  <section aria-labelledby="h-events">
+    <h2 id="h-events">Events</h2>
+    <div class="scroll"><table class="grid" id="events">
+      <thead><tr><th>Time</th><th>What</th><th>Detail</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+</main>
+</body>
+</html>

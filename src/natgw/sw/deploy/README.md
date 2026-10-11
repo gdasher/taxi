@@ -2,7 +2,7 @@
 
 This guide takes a Proxmox VE server with an Alveo U200 to a running gateway. The target server is a Dell PowerEdge R7515 (single AMD EPYC).
 
-The gateway runs as one VM that owns the U200 through PCI passthrough. Inside the VM run VPP with FPGA offload, the WAN manager, and dnsmasq, which serves the LAN's DHCP and DNS. Other VMs on the host use the gateway like any LAN client.
+The gateway runs as one VM that owns the U200 through PCI passthrough. Inside the VM run VPP with FPGA offload, the WAN manager, the monitor (a web page of statistics and the ISPs' state), and dnsmasq, which serves the LAN's DHCP and DNS. Other VMs on the host use the gateway like any LAN client.
 
 For the cabling, VLANs and every address, see the [wiring diagram and configuration reference](https://claude.ai/artifact/ND6dAJem8HD2SyUbQYS8a2).
 
@@ -11,7 +11,7 @@ For the cabling, VLANs and every address, see the [wiring diagram and configurat
 | `host/natgw-host-setup.sh` | Proxmox host preparation (IOMMU, vfio, hugepages, CPU isolation, the pyrite flash tool), a readiness check, and creation of the gateway VM |
 | `host/natgw-fpga-hook.sh` | Proxmox hookscript. Before the VM starts, it flashes a staged bitstream and reloads the FPGA |
 | `host/natgw-fpga-update` | Stages a bitstream and restarts the VM through Proxmox |
-| `guest/natgw-guest-setup.sh` | Builds and installs DPDK, VPP and the WAN manager in the VM, and writes their configuration and services |
+| `guest/natgw-guest-setup.sh` | Builds and installs DPDK, VPP, the WAN manager and the monitor in the VM, and writes their configuration and services |
 | `guest/natgw-fpga` | Stages a bitstream on the host and applies it, from inside the VM |
 | `switch/nexus-93108tc-fx.conf` | Site switch configuration (Cisco Nexus 93108TC-FX) |
 | `tests/` | Tests of the host scripts against a fake host (`pytest tests`) |
@@ -179,6 +179,7 @@ The first run writes `/etc/natgw/deploy.env` and stops. Edit it:
 - LAN addresses and DHCP range;
 - DNS upstreams;
 - the CPU VPP polls on (a vCPU other than 0);
+- where the monitor's page is served (`NATGW_MONITOR_BIND`, `NATGW_MONITOR_PORT`; see step 11);
 - the Proxmox host's address and this VM's ID, used for FPGA updates.
 
 Then run the script again. It takes 30–60 minutes, mostly building VPP:
@@ -195,13 +196,19 @@ What the script does:
    - Only the drivers the gateway uses are included: the PCI, vdev and VMBus buses (VPP needs all three), ring and stack mempools, `common_natgw`, `net_cndm` and `net_natgw_model`.
    - It's built for generic x86-64 (`platform=generic`), never for the build machine's CPU, so the same build runs on any server.
 4. **VPP:** builds it with the nat44-ed hooks and the `natgw_offload` plugin into `/opt/natgw/vpp`.
-5. **WAN manager:** installs it into `/opt/natgw/wanmgr`, with a virtualenv holding `vpp_papi`.
-6. **Configuration:** writes it from templates: `/etc/vpp/startup.conf` (with the card's PCI address detected), `/etc/vpp/natgw.cli`, `/etc/natgw/wanmgr.toml` (only if missing), `/etc/dnsmasq.d/natgw-lan.conf` and `/etc/natgw/60-natgw-mgmt.yaml`.
+5. **WAN manager and monitor:** installs them into `/opt/natgw/wanmgr` and `/opt/natgw/monitor`, with a virtualenv holding `vpp_papi`.
+6. **Configuration:** writes it from templates:
+   - `/etc/vpp/startup.conf`, with the card's PCI address detected. The device's counters reach the stats segment every second.
+   - `/etc/vpp/natgw.cli`.
+   - `/etc/natgw/wanmgr.toml`, only if missing.
+   - `/etc/natgw/monitor.toml`, regenerated from `deploy.env` on every run.
+   - The monitor's HTTPS certificate: yours, or a self-signed one created once in `/etc/natgw/tls`.
+   - `/etc/dnsmasq.d/natgw-lan.conf` and `/etc/natgw/60-natgw-mgmt.yaml`.
 7. **Kernel and devices:**
    - vfio for the card (`natgw-card-check` also rebinds it before VPP starts);
    - 2 MiB hugepages for VPP;
    - `intel_iommu=on iommu=pt` on the kernel command line for the virtual IOMMU.
-8. **Services:** installs and enables `vpp.service` and `natgw-wanmgr.service`.
+8. **Services:** installs and enables `vpp.service`, `natgw-wanmgr.service` and `natgw-monitor.service`. The monitor runs as the unprivileged user `natgw-mon`, which is in the `vpp` group so it can read the stats socket.
 
 The script can be run again at any time: it updates and rebuilds, and keeps an edited `wanmgr.toml`.
 
@@ -213,6 +220,7 @@ vppctl show interface                     # CndmEthernet0..7, LAN, WAN1 and WAN2
 vppctl show hardware-interfaces CndmEthernet0 detail | grep natgw_   # shim counters
 vppctl show natgw offload
 cat /run/natgw-wanmgr.json                # WAN states and leases
+systemctl status natgw-monitor            # then open https://192.168.1.2:8443/ (step 11)
 ```
 
 ## 8. Cut-over
@@ -228,8 +236,12 @@ cat /run/natgw-wanmgr.json                # WAN states and leases
    - Clients renew to 192.168.1.100–199, with gateway 192.168.1.1 and DNS 192.168.1.2.
    - `/run/natgw-wanmgr.json` shows both WANs up with leases.
    - `vppctl show ip fib 0.0.0.0/0` shows the API-sourced route with both gateways.
-5. Test failover: unplug one modem's upstream link. Within about 6 s that WAN goes down, the route keeps only the other WAN, and an alert is mailed.
-6. Plug it back in. About 10 s later, the WAN is back up.
+   - The monitor page shows both ISPs up and no alerts.
+5. Test failover: unplug one modem's upstream link. Within about 6 s:
+   - that WAN goes down and the route keeps only the other WAN;
+   - an alert is mailed;
+   - the monitor shows the ISP down with the reason (no reply from its probe targets), and its outage starts.
+6. Plug it back in. About 10 s later, the WAN is back up, and the outage appears in the monitor's history with its duration.
 
 ## 9. Updating the FPGA
 
@@ -274,6 +286,55 @@ Expect about a minute of gateway outage per update. If a new image doesn't enume
 - **CPU load.** VPP polls, so one of the VM's cores shows 100% all the time. That's expected; don't overcommit the pinned cores.
 - **Worker threads.** VPP runs on its main thread only. Worker threads haven't been tested with the offload path.
 
+## 11. Monitoring
+
+The monitor serves a page with the gateway's statistics and the ISPs' state at `https://<NATGW_MONITOR_BIND>:<NATGW_MONITOR_PORT>/`, by default `https://192.168.1.2:8443/`. It only reads VPP's statistics and the WAN manager's status, so it can't affect forwarding.
+
+**What it shows:**
+- **ISPs.** Each WAN's state, for how long, and why. The reason is one of: no reply from its probe targets, link down, administratively down, no DHCP lease, or interface missing. The page also shows the lease, link, whether it's in the default route, inbound and outbound traffic, the last 60 probe rounds and each target's last reply. A banner appears while an ISP is down.
+- **Outage history.** Start, end, duration, reason, and the evidence when it started: probe results, lease, link, the other ISPs, and the traffic just before.
+- **Alerts:**
+  - an ISP down, critical when no ISP is working;
+  - VPP not running;
+  - the WAN manager not reporting;
+  - a port's link down;
+  - offload disabled;
+  - DDR present but not calibrated;
+  - the on-chip table above 85% for a minute;
+  - NAT sessions near the maximum;
+  - any rise in: frames with bad FCS, DDR read errors, lost device events, failed tier moves, table-full installs, install queue overflow, given-up installs, rte_flow errors.
+- **Now** tiles:
+  - offload ratio;
+  - packets forwarded by the FPGA and sent to VPP;
+  - on-chip and DDR table fill;
+  - offloaded and NAT sessions;
+  - VPP.
+- **Graphs** over 1 minute, 10 minutes or an hour, the ports, every raw counter, and the event log.
+- **The same data as JSON:**
+  - `/api/stats`;
+  - `/api/history?seconds=600`;
+  - `/api/events?limit=200`;
+  - `/healthz`, for an external check.
+
+**Where it listens.** `NATGW_MONITOR_BIND` takes addresses and interface names, separated by spaces. An interface name serves on each address the interface has, and waits for one if it has none yet. The default is the management interface (`enp1s0`).
+- There is no login: anyone who can reach the address can read the page.
+- To restrict it, set `NATGW_MONITOR_BIND=127.0.0.1` and use an SSH tunnel: `ssh -L 8443:127.0.0.1:8443 root@192.168.1.2`, then open `https://localhost:8443/`.
+- If the Proxmox firewall is on for the VM, allow TCP 8443 from the LAN.
+- For port 443, set `NATGW_MONITOR_PORT=443`. The service holds only the capability to bind low ports.
+
+**HTTPS.** HTTPS is the only protocol served; TLS 1.2 is the minimum.
+- **Default certificate.** Without a certificate of your own, the setup script creates a self-signed one for the VM's name and management address. It prints the SHA-256 fingerprint so you can check it when the browser asks.
+- **Your own certificate.** Set `NATGW_MONITOR_CERT` and `NATGW_MONITOR_KEY` to PEM files that the `natgw-mon` user can read, then run the script with `--no-build`.
+- **Renewals.** After a renewal, `systemctl reload natgw-monitor` loads the new files without a restart.
+- **Plain HTTP.** `NATGW_MONITOR_TLS=no` turns HTTPS off. That's only sensible on 127.0.0.1.
+
+**Changing settings.** Edit `NATGW_MONITOR_*` in `/etc/natgw/deploy.env` and run `natgw-guest-setup.sh --no-build`. That rewrites `/etc/natgw/monitor.toml` and restarts the monitor. Alert thresholds are in that file, but the script overwrites it.
+
+**Troubleshooting:**
+- `journalctl -u natgw-monitor` shows the monitor's log.
+- `kill -USR1 $(systemctl show -p MainPID --value natgw-monitor)` writes every thread's stack to the journal.
+- The event log is `/var/lib/natgw-monitor/events.jsonl`. It's trimmed at 8 MB to the last 20,000 events.
+
 ## What has been tested
 
 - **Host scripts:** `tests/` runs the hook and `natgw-fpga-update` against a fake host. It covers update, failure, strict mode, wrong card ID, rebinding and restart.
@@ -283,4 +344,10 @@ Expect about a minute of gateway outage per update. If a new image doesn't enume
   - DPDK built for generic x86-64 (`-march=corei7`) with exactly the intended drivers;
   - all plugin libraries resolve;
   - the installed VPP starts with the FPGA model device (`net_natgw_model`), creates `NatgwModel0–2`, and enables the natgw offload and nat44.
+- **Monitor deployment:** in a fresh Ubuntu 24.04 container booted with systemd, with the virtualenv, WAN manager and monitor pre-installed instead of built, `natgw-guest-setup.sh --skip-hw --no-build` was run, and then:
+  - the `natgw-mon` user, the self-signed certificate and its permissions, and the rendered `monitor.toml` were checked;
+  - the hardened `natgw-monitor.service` started and served HTTPS on the configured address, reporting VPP down (there was no VPP);
+  - binding to an interface name and supplying your own certificate were checked.
+
+  The monitor itself is tested against real VPP and the WAN manager by `sw/monitor/tests`.
 - **Not tested (no hardware or Proxmox here):** the hardware steps (vfio, hugepages, kernel command line), `natgw-host-setup.sh` on a real Proxmox host, Pyrite flashing of a U200, and the VM settings.

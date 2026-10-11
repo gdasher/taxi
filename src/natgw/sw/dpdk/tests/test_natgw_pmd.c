@@ -650,6 +650,12 @@ static void test_no_punt_header(void)
 /* ------------------------------------------------------------------ */
 /* DDR tier */
 
+/* natgw_ddr_status bits (NATGW_DDR_* in natgw.h) */
+#define DDR_ST_PRESENT    (1u << 0)
+#define DDR_ST_CALIBRATED (1u << 1)
+#define DDR_ST_ENABLED    (1u << 2)
+#define DDR_ST_ACTIVE     (1u << 4)
+
 static uint64_t xstat(uint16_t port, const char *name)
 {
 	uint64_t id, v = ~0ull;
@@ -692,6 +698,10 @@ static void test_ddr_spill(void)
 	uint64_t ddr_flows = xstat(PC0, "natgw_ddr_flows");
 
 	/* up to 32 on chip, up to 256 in DDR */
+	CHECK(xstat(PC0, "natgw_onchip_capacity") == 32 && xstat(PC0, "natgw_ddr_capacity") == 256,
+	      "capacities %" PRIu64 "/%" PRIu64, xstat(PC0, "natgw_onchip_capacity"), xstat(PC0, "natgw_ddr_capacity"));
+	CHECK(xstat(PC0, "natgw_ddr_status") == (DDR_ST_PRESENT | DDR_ST_CALIBRATED | DDR_ST_ENABLED |
+						 DDR_ST_ACTIVE), "DDR status %#" PRIx64, xstat(PC0, "natgw_ddr_status"));
 	CHECK(created > 26 + 180 && created <= 32 + 256 && created < RTE_DIM(t), "created %u", created);
 	CHECK(ddr_flows >= created - 32 && ddr_flows <= created - 26, "DDR flows %" PRIu64 " of %u", ddr_flows,
 	      created);
@@ -833,12 +843,15 @@ static void check_no_ddr_use(uint16_t port)
 	CHECK(created >= 26 && created <= 32, "created %u (on-chip table of 32)", created);
 	CHECK(xstat(port, "natgw_ddr_flows") == 0, "DDR flows %" PRIu64, xstat(port, "natgw_ddr_flows"));
 	CHECK(xstat(port, "natgw_ddr_lookups") == 0, "DDR lookups");
+	CHECK(xstat(port, "natgw_ddr_capacity") == 0, "DDR capacity %" PRIu64, xstat(port, "natgw_ddr_capacity"));
+	CHECK(!(xstat(port, "natgw_ddr_status") & DDR_ST_ACTIVE), "DDR not active");
 	rte_flow_flush(port, &err);
 	drain();
 }
 
 static void test_ddr_no_dimm(void)
 {
+	CHECK(xstat(PD0, "natgw_ddr_status") == DDR_ST_PRESENT, "DDR status %#" PRIx64, xstat(PD0, "natgw_ddr_status"));
 	check_no_ddr_use(PD0);
 }
 

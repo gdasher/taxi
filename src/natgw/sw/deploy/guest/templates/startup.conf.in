@@ -9,7 +9,8 @@ unix {
 }
 api-segment { gid vpp }
 socksvr { socket-name /run/vpp/api.sock }
-statseg { size 256M }
+# update-interval: per-second vector rates for the monitor
+statseg { size 256M update-interval 1 }
 
 # main thread only: the natgw offload path is tested without worker threads
 cpu { main-core @NATGW_VPP_MAIN_CORE@ }
@@ -19,6 +20,9 @@ buffers { buffers-per-numa 65536 }
 dpdk {
   dev @NATGW_CARD_BDF@
   uio-driver vfio-pci
+  # the device's xstats (FPGA counters, flow tables, DDR tier) reach the
+  # stats segment, and the monitor, every second
+  stats-poll-interval 1
 }
 
 plugins {
